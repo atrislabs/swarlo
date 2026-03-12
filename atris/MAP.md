@@ -30,6 +30,7 @@ Last updated: 2026-03-12
 - `atris/atris.md:1` — repo workflow contract for agents
 - `atris/TODO.md:1` — active work queue
 - `atris/experiments/README.md:1` — experiment pack schema and keep/revert rules
+- `atris/experiments/summary-quality/program.md:1` — first live summary-quality experiment against `sqlite_backend.py`
 - `atris/experiments/validate.py:1` — experiment structure validator
 - `atris/experiments/benchmark_validate.py:1` — validator benchmark
 - `atris/experiments/benchmark_runtime.py:1` — runtime benchmark

@@ -256,6 +256,7 @@ class SQLiteBackend(SwarloBackend):
 
             if kind == "claim" and r["status"] == "open":
                 open_claims.append(f"  - {name}: {content}")
+                continue
 
             kind_tag = kind.upper() if kind in ("claim", "result", "failed", "escalation") else ""
             lines.append(f"  #{ch} {name}: {kind_tag + ' ' if kind_tag else ''}{content}")

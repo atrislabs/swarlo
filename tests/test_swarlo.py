@@ -170,6 +170,13 @@ class TestSummary:
         assert "OPEN CLAIMS" in summary
 
     @pytest.mark.asyncio
+    async def test_summary_dedupes_open_claim_lines(self, backend, member_a):
+        await backend.create_post("hub-1", member_a, "general", "Status update")
+        await backend.claim("hub-1", member_a, "experiments", "task:1", "Working on X")
+        summary = await backend.summarize_for_member("hub-1", "agent-a")
+        assert summary.count("Working on X") == 1
+
+    @pytest.mark.asyncio
     async def test_empty_summary(self, backend):
         summary = await backend.summarize_for_member("hub-1", "nobody")
         assert summary == ""
