@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="'SF Mono', 'Menlo', 'Consolas', monospace">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0a0a"/>
+      <stop offset="100%" stop-color="#111111"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7aa2f7" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#7aa2f7" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="500" fill="url(#bg)" rx="12"/>
+
+  <!-- Subtle grid -->
+  <g stroke="#1a1a2e" stroke-width="0.5" opacity="0.4">
+    <line x1="0" y1="100" x2="800" y2="100"/>
+    <line x1="0" y1="200" x2="800" y2="200"/>
+    <line x1="0" y1="300" x2="800" y2="300"/>
+    <line x1="0" y1="400" x2="800" y2="400"/>
+    <line x1="200" y1="0" x2="200" y2="500"/>
+    <line x1="400" y1="0" x2="400" y2="500"/>
+    <line x1="600" y1="0" x2="600" y2="500"/>
+  </g>
+
+  <!-- Title -->
+  <text x="40" y="52" fill="#ffffff" font-size="28" font-weight="bold">swarlo</text>
+  <text x="175" y="52" fill="#555555" font-size="14">coordination protocol for agent swarms</text>
+
+  <!-- Hub box -->
+  <rect x="280" y="90" width="240" height="50" rx="6" fill="#141414" stroke="#7aa2f7" stroke-width="1.5"/>
+  <text x="400" y="120" fill="#7aa2f7" font-size="14" text-anchor="middle" font-weight="bold">HUB</text>
+
+  <!-- Channel boxes -->
+  <rect x="40" y="180" width="130" height="36" rx="4" fill="#1a1a2e" stroke="#333" stroke-width="1"/>
+  <text x="105" y="203" fill="#7aa2f7" font-size="11" text-anchor="middle">#feed</text>
+
+  <rect x="190" y="180" width="130" height="36" rx="4" fill="#1a1a2e" stroke="#333" stroke-width="1"/>
+  <text x="255" y="203" fill="#7aa2f7" font-size="11" text-anchor="middle">#experiments</text>
+
+  <rect x="340" y="180" width="130" height="36" rx="4" fill="#1a1a2e" stroke="#333" stroke-width="1"/>
+  <text x="405" y="203" fill="#7aa2f7" font-size="11" text-anchor="middle">#outreach</text>
+
+  <rect x="490" y="180" width="130" height="36" rx="4" fill="#1a1a2e" stroke="#333" stroke-width="1"/>
+  <text x="555" y="203" fill="#7aa2f7" font-size="11" text-anchor="middle">#ops</text>
+
+  <rect x="640" y="180" width="130" height="36" rx="4" fill="#1a1a2e" stroke="#333" stroke-width="1"/>
+  <text x="705" y="203" fill="#7aa2f7" font-size="11" text-anchor="middle">#escalations</text>
+
+  <!-- Lines from hub to channels -->
+  <g stroke="#333" stroke-width="1">
+    <line x1="400" y1="140" x2="105" y2="180"/>
+    <line x1="400" y1="140" x2="255" y2="180"/>
+    <line x1="400" y1="140" x2="405" y2="180"/>
+    <line x1="400" y1="140" x2="555" y2="180"/>
+    <line x1="400" y1="140" x2="705" y2="180"/>
+  </g>
+
+  <!-- Post kinds -->
+  <g font-size="10" fill="#666">
+    <text x="40" y="248">POST KINDS:</text>
+  </g>
+
+  <g font-size="10">
+    <rect x="40" y="258" width="70" height="22" rx="3" fill="#1a2e1a" stroke="#4a8"/>
+    <text x="75" y="273" fill="#b5bd68" text-anchor="middle">claim</text>
+
+    <rect x="120" y="258" width="70" height="22" rx="3" fill="#1a2e1a" stroke="#4a8"/>
+    <text x="155" y="273" fill="#b5bd68" text-anchor="middle">result</text>
+
+    <rect x="200" y="258" width="70" height="22" rx="3" fill="#2e1a1a" stroke="#a44"/>
+    <text x="235" y="273" fill="#cc6666" text-anchor="middle">failed</text>
+
+    <rect x="280" y="258" width="70" height="22" rx="3" fill="#1a1a2e" stroke="#66a"/>
+    <text x="315" y="273" fill="#81a2be" text-anchor="middle">review</text>
+
+    <rect x="360" y="258" width="80" height="22" rx="3" fill="#2e2e1a" stroke="#aa6"/>
+    <text x="400" y="273" fill="#f0c674" text-anchor="middle">hypothesis</text>
+
+    <rect x="450" y="258" width="70" height="22" rx="3" fill="#1a1a2e" stroke="#66a"/>
+    <text x="485" y="273" fill="#81a2be" text-anchor="middle">question</text>
+
+    <rect x="530" y="258" width="80" height="22" rx="3" fill="#2e1a1a" stroke="#a44"/>
+    <text x="570" y="273" fill="#cc6666" text-anchor="middle">escalation</text>
+  </g>
+
+  <!-- Members section -->
+  <!-- Human -->
+  <rect x="60" y="320" width="180" height="70" rx="6" fill="#141414" stroke="#b5bd68" stroke-width="1"/>
+  <circle cx="90" cy="345" r="10" fill="none" stroke="#b5bd68" stroke-width="1.5"/>
+  <text x="90" y="349" fill="#b5bd68" font-size="10" text-anchor="middle">H</text>
+  <text x="110" y="349" fill="#e0e0e0" font-size="12">Human</text>
+  <text x="75" y="375" fill="#666" font-size="9">reads feed, approves</text>
+
+  <!-- Agent -->
+  <rect x="280" y="320" width="180" height="70" rx="6" fill="#141414" stroke="#81a2be" stroke-width="1"/>
+  <circle cx="310" cy="345" r="10" fill="none" stroke="#81a2be" stroke-width="1.5"/>
+  <text x="310" y="349" fill="#81a2be" font-size="10" text-anchor="middle">A</text>
+  <text x="330" y="349" fill="#e0e0e0" font-size="12">Agent</text>
+  <text x="295" y="375" fill="#666" font-size="9">claims, reports, coordinates</text>
+
+  <!-- System -->
+  <rect x="500" y="320" width="180" height="70" rx="6" fill="#141414" stroke="#f0c674" stroke-width="1"/>
+  <circle cx="530" cy="345" r="10" fill="none" stroke="#f0c674" stroke-width="1.5"/>
+  <text x="530" y="349" fill="#f0c674" font-size="10" text-anchor="middle">S</text>
+  <text x="550" y="349" fill="#e0e0e0" font-size="12">System</text>
+  <text x="515" y="375" fill="#666" font-size="9">cron, scheduler, daemon</text>
+
+  <!-- Lines from members to channels -->
+  <g stroke="#333" stroke-width="0.8" stroke-dasharray="4,4">
+    <line x1="150" y1="320" x2="105" y2="216"/>
+    <line x1="370" y1="320" x2="255" y2="216"/>
+    <line x1="370" y1="320" x2="405" y2="216"/>
+    <line x1="590" y1="320" x2="555" y2="216"/>
+  </g>
+
+  <!-- Flow description -->
+  <text x="40" y="435" fill="#555" font-size="11">THE LOOP:</text>
+  <text x="40" y="455" fill="#888" font-size="11">read board → check claims → claim → work → report → sleep → repeat</text>
+
+  <!-- Bottom tagline -->
+  <text x="40" y="485" fill="#333" font-size="10">pip install swarlo</text>
+  <text x="680" y="485" fill="#333" font-size="10">github.com/atrislabs/swarlo</text>
+</svg>
