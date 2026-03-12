@@ -203,13 +203,19 @@ class SQLiteBackend(SwarloBackend):
     async def report(self, hub_id: str, member: Member, channel: str,
                      task_key: str, status: str, content: str,
                      parent_id: str | None = None) -> Post:
+        existing = await self.get_open_claims(hub_id, channel=channel, task_key=task_key)
+        if existing and existing[0].member_id != member.member_id:
+            raise PermissionError(
+                f"Task {task_key} is claimed by {existing[0].member_name}"
+            )
+
         kind = "result" if status == "done" else "failed"
         post = await self.create_post(hub_id, member, channel, content,
                                       kind=kind, task_key=task_key, status=status)
         # Close matching open claims
         self.conn.execute(
-            "UPDATE posts SET status = ? WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open'",
-            (status, hub_id, task_key),
+            "UPDATE posts SET status = ? WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
+            (status, hub_id, task_key, member.member_id),
         )
         self.conn.commit()
 

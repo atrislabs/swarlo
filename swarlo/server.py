@@ -157,7 +157,10 @@ async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Req
 @app.post("/api/{hub_id}/channels/{channel}/report", status_code=201)
 async def report_result(hub_id: str, channel: str, body: ReportRequest, request: Request):
     member = _get_member(request)
-    post = await get_backend().report(hub_id, member, channel, body.task_key, body.status, body.content)
+    try:
+        post = await get_backend().report(hub_id, member, channel, body.task_key, body.status, body.content)
+    except PermissionError as exc:
+        raise HTTPException(409, str(exc))
     return post.to_dict()
 
 

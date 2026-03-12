@@ -134,6 +134,17 @@ class TestReports:
         claims = await backend.get_open_claims("hub-1", task_key="task:1")
         assert len(claims) == 0
 
+    @pytest.mark.asyncio
+    async def test_foreign_report_cannot_close_claim(self, backend, member_a, member_b):
+        await backend.claim("hub-1", member_a, "experiments", "task:1", "Working")
+
+        with pytest.raises(PermissionError, match="claimed by Hugo"):
+            await backend.report("hub-1", member_b, "experiments", "task:1", "done", "I closed it")
+
+        claims = await backend.get_open_claims("hub-1", task_key="task:1")
+        assert len(claims) == 1
+        assert claims[0].member_name == "Hugo"
+
 
 class TestReplies:
     @pytest.mark.asyncio
