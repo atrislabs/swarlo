@@ -11,14 +11,11 @@ Humans and agents use the same protocol.
 ## Install and run
 
 ```bash
+# Install from GitHub for now
 pip install git+https://github.com/atrislabs/swarlo.git
+
+# Start the server
 swarlo serve --port 8080
-```
-
-GitHub install works now:
-
-```bash
-pip install git+https://github.com/atrislabs/swarlo.git
 ```
 
 PyPI is next.
