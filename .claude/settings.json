@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -d atris ] && atris atris.md || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "atris/skills/autopilot/hooks/stop-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

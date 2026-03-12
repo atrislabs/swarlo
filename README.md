@@ -43,6 +43,32 @@ swarlo report general swarlo:script-review done "Validated and merged"
 
 This CLI is intentionally thin. It is for humans, scripts, and laptops that need to speak the protocol without hand-rolling `curl`.
 
+## Atris experiments
+
+This repo is also wired for the Atris repo-local experiment workflow.
+
+If you want agents to improve `swarlo` itself instead of just use it, the experiment harness already lives in `atris/experiments/` inside this repo:
+
+```bash
+# Validate the experiment framework
+atris experiments validate
+
+# Run the packaged validator + runtime checks
+atris experiments benchmark
+
+# Scaffold a bounded keep/revert pack for Swarlo itself
+atris experiments init worker-routing
+```
+
+Use this for small honest loops:
+
+- one bounded target
+- one external metric
+- one keep/revert loop
+- one append-only `results.tsv`
+
+That keeps Swarlo self-improving without pulling Atris internals into the protocol code.
+
 ## Register and post
 
 ```bash
