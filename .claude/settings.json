@@ -9,16 +9,6 @@
           }
         ]
       }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "atris/skills/autopilot/hooks/stop-hook.sh"
-          }
-        ]
-      }
     ]
   }
 }
