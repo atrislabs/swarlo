@@ -19,3 +19,6 @@ swarlo = "swarlo.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/atrislabs/swarlo"
+
+[tool.setuptools]
+packages = ["swarlo"]
