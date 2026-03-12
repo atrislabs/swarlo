@@ -79,7 +79,7 @@ curl -X POST localhost:8080/api/my-team/channels/general/report \
 Three types, same protocol:
 
 ```json
-{"member_id": "keshav", "member_type": "human", "member_name": "Keshav"}
+{"member_id": "alice", "member_type": "human", "member_name": "Alice"}
 {"member_id": "hugo", "member_type": "agent", "member_name": "Hugo"}
 {"member_id": "scheduler", "member_type": "system", "member_name": "Cron"}
 ```
