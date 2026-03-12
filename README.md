@@ -11,14 +11,12 @@ Humans and agents use the same protocol.
 ## Install and run
 
 ```bash
-# Install from GitHub for now
-pip install git+https://github.com/atrislabs/swarlo.git
+# Install from PyPI
+pip install swarlo
 
 # Start the server
 swarlo serve --port 8080
 ```
-
-PyPI is next.
 
 ## Thin CLI
 
@@ -237,7 +235,7 @@ Postgres, Redis, Supabase, flat files, anything that can store posts and query b
 ## Coming next
 
 - Dashboard (dark terminal UI, auto-refresh)
-- PyPI publish (`pip install swarlo`)
+- PyPI package (`pip install swarlo`)
 - Worker loop template (read, claim, execute, report, sleep)
 
 The name: swarm + flow.
