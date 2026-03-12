@@ -49,10 +49,23 @@ CREATE TABLE IF NOT EXISTS replies (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS commits (
+    hash TEXT PRIMARY KEY,
+    parent_hash TEXT,
+    hub_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    member_name TEXT NOT NULL,
+    message TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_posts_hub_channel ON posts(hub_id, channel);
 CREATE INDEX IF NOT EXISTS idx_posts_hub_task_key ON posts(hub_id, task_key);
 CREATE INDEX IF NOT EXISTS idx_posts_kind_status ON posts(kind, status);
 CREATE INDEX IF NOT EXISTS idx_replies_post ON replies(post_id);
+CREATE INDEX IF NOT EXISTS idx_commits_hub ON commits(hub_id);
+CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_hash);
+CREATE INDEX IF NOT EXISTS idx_commits_member ON commits(member_id);
 """
 
 
@@ -254,6 +267,67 @@ class SQLiteBackend(SwarloBackend):
             parts.extend(open_claims)
 
         return "\n".join(parts)
+
+    # ── DAG ─────────────────────────────────────────────────
+
+    def index_commit(self, hub_id: str, hash: str, parent_hash: str,
+                     member_id: str, member_name: str, message: str) -> None:
+        """Index a commit in the metadata store."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO commits (hash, parent_hash, hub_id, member_id, member_name, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (hash, parent_hash or None, hub_id, member_id, member_name, message, _utcnow()),
+        )
+        self.conn.commit()
+
+    def get_commit(self, hub_id: str, hash: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM commits WHERE hash = ? AND hub_id = ?", (hash, hub_id)
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+    def list_commits(self, hub_id: str, member_id: str | None = None, limit: int = 50) -> list[dict]:
+        if member_id:
+            rows = self.conn.execute(
+                "SELECT * FROM commits WHERE hub_id = ? AND member_id = ? ORDER BY created_at DESC LIMIT ?",
+                (hub_id, member_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM commits WHERE hub_id = ? ORDER BY created_at DESC LIMIT ?",
+                (hub_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_children(self, hub_id: str, hash: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM commits WHERE hub_id = ? AND parent_hash = ? ORDER BY created_at DESC",
+            (hub_id, hash),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_leaves(self, hub_id: str) -> list[dict]:
+        rows = self.conn.execute("""
+            SELECT c.* FROM commits c
+            LEFT JOIN commits child ON child.parent_hash = c.hash AND child.hub_id = c.hub_id
+            WHERE c.hub_id = ? AND child.hash IS NULL
+            ORDER BY c.created_at DESC
+        """, (hub_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_lineage(self, hub_id: str, hash: str) -> list[dict]:
+        lineage = []
+        current = hash
+        while current:
+            row = self.conn.execute(
+                "SELECT * FROM commits WHERE hash = ? AND hub_id = ?", (current, hub_id)
+            ).fetchone()
+            if not row:
+                break
+            lineage.append(dict(row))
+            current = row["parent_hash"]
+        return lineage
 
     # ── Helpers ─────────────────────────────────────────────
 

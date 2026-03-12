@@ -15,11 +15,13 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .sqlite_backend import SQLiteBackend
+from .git_dag import GitDAG
 from .types import Member
 
 app = FastAPI(title="Swarlo", description="Open coordination protocol for AI agent swarms")
 
 _backend: SQLiteBackend | None = None
+_git_dag: GitDAG | None = None
 
 
 def get_backend() -> SQLiteBackend:
@@ -29,9 +31,22 @@ def get_backend() -> SQLiteBackend:
     return _backend
 
 
+def get_dag() -> GitDAG:
+    global _git_dag
+    if _git_dag is None:
+        _git_dag = GitDAG("swarlo.git")
+        _git_dag.init()
+    return _git_dag
+
+
 def set_backend(backend: SQLiteBackend):
     global _backend
     _backend = backend
+
+
+def set_dag(dag: GitDAG):
+    global _git_dag
+    _git_dag = dag
 
 
 # ── Auth ────────────────────────────────────────────────────
@@ -180,3 +195,80 @@ async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: R
     member = _get_member(request)
     reply = await get_backend().reply(hub_id, member, post_id, body.content)
     return reply.to_dict()
+
+
+# ── Git DAG ─────────────────────────────────────────────────
+
+@app.post("/api/{hub_id}/git/push", status_code=201)
+async def git_push(hub_id: str, request: Request):
+    member = _get_member(request)
+    body = await request.body()
+    if len(body) > 50 * 1024 * 1024:
+        raise HTTPException(413, "Bundle too large (max 50MB)")
+
+    dag = get_dag()
+    hashes = await dag.unbundle(body)
+
+    # Index each commit in SQLite
+    backend = get_backend()
+    for h in hashes:
+        existing = backend.get_commit(hub_id, h)
+        if existing:
+            continue
+        parent_hash, message = dag.get_commit_info(h)
+        backend.index_commit(hub_id, h, parent_hash, member.member_id, member.member_name, message)
+
+    return {"hashes": hashes}
+
+
+@app.get("/api/{hub_id}/git/fetch/{hash}")
+async def git_fetch(hub_id: str, hash: str, request: Request):
+    _get_member(request)
+    dag = get_dag()
+    if not dag.commit_exists(hash):
+        raise HTTPException(404, "Commit not found")
+    from fastapi.responses import Response
+    bundle_bytes = dag.create_bundle(hash)
+    return Response(content=bundle_bytes, media_type="application/octet-stream",
+                    headers={"Content-Disposition": f"attachment; filename={hash[:12]}.bundle"})
+
+
+@app.get("/api/{hub_id}/git/commits")
+async def git_list_commits(hub_id: str, request: Request, member_filter: Optional[str] = None, limit: int = 50):
+    _get_member(request)
+    return get_backend().list_commits(hub_id, member_id=member_filter, limit=min(limit, 200))
+
+
+@app.get("/api/{hub_id}/git/commits/{hash}")
+async def git_get_commit(hub_id: str, hash: str, request: Request):
+    _get_member(request)
+    commit = get_backend().get_commit(hub_id, hash)
+    if not commit:
+        raise HTTPException(404, "Commit not found")
+    return commit
+
+
+@app.get("/api/{hub_id}/git/commits/{hash}/children")
+async def git_children(hub_id: str, hash: str, request: Request):
+    _get_member(request)
+    return get_backend().get_children(hub_id, hash)
+
+
+@app.get("/api/{hub_id}/git/leaves")
+async def git_leaves(hub_id: str, request: Request):
+    _get_member(request)
+    return get_backend().get_leaves(hub_id)
+
+
+@app.get("/api/{hub_id}/git/commits/{hash}/lineage")
+async def git_lineage(hub_id: str, hash: str, request: Request):
+    _get_member(request)
+    return get_backend().get_lineage(hub_id, hash)
+
+
+@app.get("/api/{hub_id}/git/diff/{hash_a}/{hash_b}")
+async def git_diff(hub_id: str, hash_a: str, hash_b: str, request: Request):
+    _get_member(request)
+    dag = get_dag()
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(dag.diff(hash_a, hash_b))
