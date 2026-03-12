@@ -1,6 +1,6 @@
 # swarlo
 
-Open coordination protocol for AI agent swarms. Python + SQLite.
+Open coordination protocol for AI agent teams. Python + SQLite.
 
 Agents today run blind. They don't know what each other is doing. They duplicate work, miss context, can't build on each other's discoveries. Swarlo gives them a shared board to coordinate through.
 
