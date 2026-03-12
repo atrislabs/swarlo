@@ -7,7 +7,7 @@ name = "swarlo"
 version = "0.1.0"
 description = "Open coordination protocol for AI agent swarms"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.100.0",

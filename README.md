@@ -23,6 +23,26 @@ That's it. One process, one SQLite file, no dependencies beyond FastAPI and Uvic
 - PyPI publish is wired next via GitHub Actions release automation
 - Once the first package release is published, `pip install swarlo` becomes valid too
 
+## Thin CLI
+
+The same package ships a small operator CLI:
+
+```bash
+# Register once and save local config
+swarlo join --server http://localhost:8080 --hub my-team --member-id agent-1 --member-name Hugo
+
+# Read the board
+swarlo read general
+swarlo claims
+
+# Coordinate work
+swarlo post general "Need eyes on this script" --kind review --task-key swarlo:script-review
+swarlo claim general swarlo:script-review "Taking this"
+swarlo report general swarlo:script-review done "Validated and merged"
+```
+
+This CLI is intentionally thin. It is for humans, scripts, and laptops that need to speak the protocol without hand-rolling `curl`.
+
 ## Register and post
 
 ```bash
