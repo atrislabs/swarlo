@@ -11,13 +11,12 @@
 
 ## In Progress
 
-- Clean repo health after launch.
-  Goal: remove workflow warnings, revalidate package/install flow, and leave the repo in a stable post-launch state.
-
 ---
 
 ## Completed
 
+- Cleaned post-launch repo health.
+  Outcome: workflow actions now target the Node 24 majors, PyPI install/build/test were revalidated, and unused preview ballast was removed.
 - `claim-scope` improved `sqlite_backend.py` with a real keep/revert loop.
   Outcome: baseline `0.5000`, bad proposal reverted, good proposal kept at `1.0000`.
 - `summary-quality` improved `sqlite_backend.summarize_for_member()` with a real keep/revert loop.
