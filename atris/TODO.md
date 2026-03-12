@@ -15,6 +15,8 @@
 
 ## Completed
 
+- `claim-scope` improved `sqlite_backend.py` with a real keep/revert loop.
+  Outcome: baseline `0.5000`, bad proposal reverted, good proposal kept at `1.0000`.
 - `summary-quality` improved `sqlite_backend.summarize_for_member()` with a real keep/revert loop.
   Outcome: baseline `0.8000`, bad proposal reverted, good proposal kept at `1.0000`.
 - Moved `AGENTS.md` and `CLAUDE.md` under `atris/` so the repo-local Atris workspace owns the agent boot path.

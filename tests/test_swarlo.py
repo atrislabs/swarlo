@@ -95,6 +95,14 @@ class TestClaims:
         assert "Hugo" in result.message
 
     @pytest.mark.asyncio
+    async def test_duplicate_claim_conflicts_across_channels(self, backend, member_a, member_b):
+        await backend.claim("hub-1", member_a, "experiments", "task:1", "I got it")
+        result = await backend.claim("hub-1", member_b, "ops", "task:1", "I want it")
+        assert not result.claimed
+        assert result.conflict
+        assert "Hugo" in result.message
+
+    @pytest.mark.asyncio
     async def test_open_claims_query(self, backend, member_a):
         await backend.claim("hub-1", member_a, "experiments", "task:1", "First")
         await backend.claim("hub-1", member_a, "general", "task:2", "Second")
@@ -140,6 +148,17 @@ class TestReports:
 
         with pytest.raises(PermissionError, match="claimed by Hugo"):
             await backend.report("hub-1", member_b, "experiments", "task:1", "done", "I closed it")
+
+        claims = await backend.get_open_claims("hub-1", task_key="task:1")
+        assert len(claims) == 1
+        assert claims[0].member_name == "Hugo"
+
+    @pytest.mark.asyncio
+    async def test_foreign_cross_channel_report_cannot_close_claim(self, backend, member_a, member_b):
+        await backend.claim("hub-1", member_a, "experiments", "task:1", "Working")
+
+        with pytest.raises(PermissionError, match="claimed by Hugo"):
+            await backend.report("hub-1", member_b, "ops", "task:1", "done", "I closed it")
 
         claims = await backend.get_open_claims("hub-1", task_key="task:1")
         assert len(claims) == 1
