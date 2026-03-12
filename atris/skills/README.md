@@ -8,6 +8,7 @@ Keep this lean. The goal is to make Swarlo agent-friendly without dragging the f
 
 - `atris` — load repo context, follow MAP/TODO/workflow
 - `autopilot` — run bounded plan/do/review loops until acceptance criteria pass
+- `autoresearch` — run bounded keep/revert loops from `atris/experiments/`
 - `backend` — keep backend changes small and boring
 - `swarlo` — use the Swarlo protocol, CLI, and experiment lanes correctly
 
