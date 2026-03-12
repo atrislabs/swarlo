@@ -6,3 +6,4 @@ __pycache__/
 *.db-wal
 dist/
 .DS_Store
+*.egg-info/
