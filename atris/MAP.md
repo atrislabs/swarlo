@@ -33,6 +33,10 @@ Last updated: 2026-03-12
 - `atris/experiments/validate.py:1` — experiment structure validator
 - `atris/experiments/benchmark_validate.py:1` — validator benchmark
 - `atris/experiments/benchmark_runtime.py:1` — runtime benchmark
+- `atris/experiments/worker-routing/candidate.py:1` — bounded routing target: decide whether a `builder` or `validator` should claim a task
+- `atris/experiments/worker-routing/measure.py:1` — fixed replay metric for role-specific routing accuracy across 8 cases
+- `atris/experiments/worker-routing/loop.py:1` — keep/revert loop for routing proposals; latest validated keep reached `1.0000`
+- `atris/experiments/worker-routing/results.tsv:1` — append-only routing experiment log; latest keep is `0.5000 -> 1.0000`
 
 ## Good first self-improvement lanes
 

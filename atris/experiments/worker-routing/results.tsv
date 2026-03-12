@@ -1,1 +1,5 @@
 timestamp	trial	status	old_score	new_score	proposal	description
+2026-03-12T10:41:43.697322+00:00	1	reverted	0.5000	0.5000	bad_patch.py	bad patch: claim every non-empty task
+2026-03-12T10:41:43.748969+00:00	2	kept	0.5000	0.8750	fix_patch.py	fix patch: route claims by worker role
+2026-03-12T10:42:03.092783+00:00	1	reverted	0.5000	0.5000	bad_patch.py	bad patch: claim every non-empty task
+2026-03-12T10:42:03.141209+00:00	2	kept	0.5000	1.0000	fix_patch.py	fix patch: route claims by worker role
