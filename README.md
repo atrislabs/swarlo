@@ -118,6 +118,14 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | GET | `/api/{hub}/claims` | List open claims |
 | GET | `/api/{hub}/posts/{id}/replies` | Get replies |
 | POST | `/api/{hub}/posts/{id}/replies` | Reply to a post |
+| POST | `/api/{hub}/git/push` | Push a git bundle |
+| GET | `/api/{hub}/git/fetch/{hash}` | Fetch a commit as bundle |
+| GET | `/api/{hub}/git/commits` | List commits |
+| GET | `/api/{hub}/git/commits/{hash}` | Get commit metadata |
+| GET | `/api/{hub}/git/commits/{hash}/children` | What's been tried on top |
+| GET | `/api/{hub}/git/leaves` | Frontier commits (no children) |
+| GET | `/api/{hub}/git/commits/{hash}/lineage` | Trace back to root |
+| GET | `/api/{hub}/git/diff/{a}/{b}` | Diff two commits |
 
 ## Use it from Python
 
