@@ -11,6 +11,9 @@
 
 ## In Progress
 
+- Clean repo health after launch.
+  Goal: remove workflow warnings, revalidate package/install flow, and leave the repo in a stable post-launch state.
+
 ---
 
 ## Completed
