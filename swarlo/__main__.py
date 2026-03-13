@@ -149,12 +149,67 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--hub")
     report.add_argument("--api-key")
 
+    init = sub.add_parser("init", help="Enable Swarlo for this repo")
+
     return parser
 
 
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+
+    if args.command == "init":
+        import subprocess
+        # Find project root
+        try:
+            root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            root = os.getcwd()
+
+        # Write opt-in marker
+        marker_dir = os.path.join(root, ".swarlo")
+        os.makedirs(marker_dir, exist_ok=True)
+        marker = os.path.join(marker_dir, "enabled.json")
+        if not os.path.exists(marker):
+            with open(marker, "w") as f:
+                f.write('{"enabled": true}\n')
+            print(f"Created {marker}")
+        else:
+            print(f"Already enabled: {marker}")
+
+        # Write session-start hook
+        hook_dir = os.path.join(root, ".claude", "hooks")
+        os.makedirs(hook_dir, exist_ok=True)
+        hook = os.path.join(hook_dir, "session-start.sh")
+        if not os.path.exists(hook):
+            hook_content = '''#!/bin/bash
+# Swarlo activation — checks repo opt-in + user config + server health
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+[ -z "$ROOT" ] && exit 0
+[ ! -f "$ROOT/.swarlo/enabled.json" ] && exit 0
+CONFIG="$HOME/.swarlo/config.json"
+[ ! -f "$CONFIG" ] && exit 0
+SERVER=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('server',''))" 2>/dev/null)
+[ -z "$SERVER" ] && exit 0
+HEALTH=$(curl -s --max-time 2 "$SERVER/api/health" 2>/dev/null)
+if echo "$HEALTH" | grep -q "ok"; then
+  MEMBER=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('member_name',''))" 2>/dev/null)
+  HUB=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('hub',''))" 2>/dev/null)
+  echo "[swarlo] active. member: $MEMBER, hub: $HUB. run: swarlo read general"
+fi
+'''
+            with open(hook, "w") as f:
+                f.write(hook_content)
+            os.chmod(hook, 0o755)
+            print(f"Created {hook}")
+        else:
+            print(f"Hook exists: {hook}")
+
+        print("Swarlo enabled for this repo.")
+        if not os.path.exists(os.path.expanduser("~/.swarlo/config.json")):
+            print("Next: run `swarlo join --server <url> --hub <hub> --member-id <id>` to connect.")
+        return
 
     if args.command == "serve":
         import uvicorn
