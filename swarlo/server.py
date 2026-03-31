@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from typing import Optional
 
@@ -275,37 +276,48 @@ import ipaddress
 from urllib.parse import urlparse
 
 
-def _is_safe_webhook_url(url: str) -> bool:
-    """Validate webhook URL: must be HTTPS (or localhost for dev), no private/reserved IPs."""
+_LOCALHOST = ("localhost", "127.0.0.1", "::1")
+
+
+def _is_safe_webhook_url(url: str, at_dispatch: bool = False) -> bool:
+    """Validate webhook URL against SSRF.
+
+    Rules:
+    - localhost: always allowed (server itself is local)
+    - External: must be HTTPS, must resolve to a globally-routable IP
+    - at_dispatch=True: DNS must resolve (blocks rebinding attacks)
+    """
     try:
         parsed = urlparse(url)
     except Exception:
         return False
 
-    # Must have scheme and host
     if not parsed.scheme or not parsed.hostname:
         return False
 
-    # Allow HTTP only for localhost (dev mode)
-    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1"):
-        return False
-
-    # Block non-HTTP schemes
     if parsed.scheme not in ("http", "https"):
         return False
 
-    # Block private/reserved IPs (SSRF protection)
-    # Skip DNS check for non-localhost — validate at dispatch time when DNS is available
-    if parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
-        try:
-            import socket
-            resolved = socket.getaddrinfo(parsed.hostname, parsed.port or 443)
-            for _, _, _, _, addr in resolved:
-                ip = ipaddress.ip_address(addr[0])
-                if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
-                    return False
-        except (socket.gaierror, ValueError):
-            pass  # DNS not available — allow registration, block at dispatch
+    # Localhost is always allowed (the server runs locally)
+    if parsed.hostname in _LOCALHOST:
+        return True
+
+    # External: require HTTPS
+    if parsed.scheme != "https":
+        return False
+
+    # Resolve DNS and require globally-routable IPs
+    try:
+        import socket
+        resolved = socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+        for _, _, _, _, addr in resolved:
+            ip = ipaddress.ip_address(addr[0])
+            if not ip.is_global:
+                return False
+    except (socket.gaierror, ValueError):
+        if at_dispatch:
+            return False  # Must resolve at dispatch time
+        # Registration: allow — will re-check at dispatch
 
     return True
 
@@ -318,8 +330,8 @@ async def _dispatch_webhooks(hub_id: str, post):
         for m in members:
             if not m.webhook_url:
                 continue
-            if not _is_safe_webhook_url(m.webhook_url):
-                logger.warning(f"Blocked unsafe webhook URL for {m.member_id}: {m.webhook_url}")
+            if not _is_safe_webhook_url(m.webhook_url, at_dispatch=True):
+                logger.warning(f"Blocked unsafe webhook for member {m.member_id}")
                 continue
             try:
                 await client.post(m.webhook_url, json={
