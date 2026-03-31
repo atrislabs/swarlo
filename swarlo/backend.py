@@ -18,7 +18,8 @@ class SwarloBackend(ABC):
     @abstractmethod
     async def create_post(self, hub_id: str, member: Member, channel: str,
                           content: str, kind: str = "message",
-                          task_key: Optional[str] = None, status: Optional[str] = None) -> Post: ...
+                          task_key: Optional[str] = None, status: Optional[str] = None,
+                          metadata: Optional[dict] = None, priority: int = 0) -> Post: ...
 
     @abstractmethod
     async def reply(self, hub_id: str, member: Member, post_id: str, content: str) -> Reply: ...
@@ -35,6 +36,9 @@ class SwarloBackend(ABC):
     @abstractmethod
     async def get_open_claims(self, hub_id: str, channel: Optional[str] = None,
                               task_key: Optional[str] = None) -> list[Post]: ...
+
+    @abstractmethod
+    async def get_replies(self, hub_id: str, post_id: str) -> list[Reply]: ...
 
     @abstractmethod
     async def summarize_for_member(self, hub_id: str, member_id: str, limit: int = 10) -> str: ...

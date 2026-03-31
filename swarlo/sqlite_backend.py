@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +21,9 @@ CREATE TABLE IF NOT EXISTS members (
     member_type TEXT NOT NULL,
     member_name TEXT NOT NULL,
     api_key TEXT,
+    webhook_url TEXT,
     created_at TEXT NOT NULL,
+    last_seen TEXT,
     PRIMARY KEY (member_id, hub_id)
 );
 
@@ -35,6 +38,10 @@ CREATE TABLE IF NOT EXISTS posts (
     kind TEXT NOT NULL DEFAULT 'message',
     task_key TEXT,
     status TEXT,
+    priority INTEGER DEFAULT 0,
+    retry_count INTEGER DEFAULT 0,
+    metadata TEXT,
+    mentions TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -62,6 +69,7 @@ CREATE TABLE IF NOT EXISTS commits (
 CREATE INDEX IF NOT EXISTS idx_posts_hub_channel ON posts(hub_id, channel);
 CREATE INDEX IF NOT EXISTS idx_posts_hub_task_key ON posts(hub_id, task_key);
 CREATE INDEX IF NOT EXISTS idx_posts_kind_status ON posts(kind, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_open_claim ON posts(hub_id, task_key) WHERE kind = 'claim' AND status = 'open';
 CREATE INDEX IF NOT EXISTS idx_replies_post ON replies(post_id);
 CREATE INDEX IF NOT EXISTS idx_commits_hub ON commits(hub_id);
 CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_hash);
@@ -86,11 +94,20 @@ class SQLiteBackend(SwarloBackend):
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path)
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            # Migrations for existing DBs
+            try:
+                self._conn.execute("ALTER TABLE posts ADD COLUMN priority INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            try:
+                self._conn.execute("ALTER TABLE posts ADD COLUMN retry_count INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         return self._conn
 
     @property
@@ -99,15 +116,18 @@ class SQLiteBackend(SwarloBackend):
 
     def close(self):
         if self._conn:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except Exception:
+                pass  # cross-thread close in test teardown
             self._conn = None
 
     # ── Members ─────────────────────────────────────────────
 
     def register_member(self, member: Member, api_key: str | None = None) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO members (member_id, hub_id, member_type, member_name, api_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (member.member_id, member.hub_id, member.member_type, member.member_name, api_key, _utcnow()),
+            "INSERT OR REPLACE INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (member.member_id, member.hub_id, member.member_type, member.member_name, api_key, member.webhook_url, _utcnow()),
         )
         self.conn.commit()
 
@@ -118,12 +138,7 @@ class SQLiteBackend(SwarloBackend):
         ).fetchone()
         if not row:
             return None
-        return Member(
-            member_id=row["member_id"],
-            member_type=row["member_type"],
-            member_name=row["member_name"],
-            hub_id=row["hub_id"],
-        )
+        return self._row_to_member(row)
 
     def authenticate(self, api_key: str) -> Member | None:
         row = self.conn.execute(
@@ -131,11 +146,40 @@ class SQLiteBackend(SwarloBackend):
         ).fetchone()
         if not row:
             return None
+        return self._row_to_member(row)
+
+    def resolve_mentions(self, hub_id: str, names: list[str]) -> list[str]:
+        """Resolve @mention names to member_ids. Case-insensitive match on member_name or member_id."""
+        if not names:
+            return []
+        resolved = []
+        for name in names:
+            row = self.conn.execute(
+                "SELECT member_id FROM members WHERE hub_id = ? AND (LOWER(member_name) = LOWER(?) OR LOWER(member_id) = LOWER(?))",
+                (hub_id, name, name),
+            ).fetchone()
+            if row:
+                resolved.append(row["member_id"])
+        return resolved
+
+    def get_members_by_ids(self, hub_id: str, member_ids: list[str]) -> list[Member]:
+        """Get members by IDs. Used for webhook dispatch."""
+        if not member_ids:
+            return []
+        placeholders = ",".join("?" for _ in member_ids)
+        rows = self.conn.execute(
+            f"SELECT * FROM members WHERE hub_id = ? AND member_id IN ({placeholders})",
+            [hub_id, *member_ids],
+        ).fetchall()
+        return [self._row_to_member(r) for r in rows]
+
+    def _row_to_member(self, row) -> Member:
         return Member(
             member_id=row["member_id"],
             member_type=row["member_type"],
             member_name=row["member_name"],
             hub_id=row["hub_id"],
+            webhook_url=row["webhook_url"] if "webhook_url" in row.keys() else None,
         )
 
     # ── SwarloBackend ───────────────────────────────────────
@@ -156,19 +200,57 @@ class SQLiteBackend(SwarloBackend):
 
     async def create_post(self, hub_id: str, member: Member, channel: str,
                           content: str, kind: str = "message",
-                          task_key: str | None = None, status: str | None = None) -> Post:
+                          task_key: str | None = None, status: str | None = None,
+                          metadata: dict | None = None, priority: int = 0) -> Post:
+        from .types import extract_mentions
         post_id = _uid()
         now = _utcnow()
+
+        # Extract and resolve @mentions
+        mention_names = extract_mentions(content)
+        mention_ids = self.resolve_mentions(hub_id, mention_names) if mention_names else []
+
+        metadata_json = json.dumps(metadata) if metadata is not None else None
+        mentions_json = json.dumps(mention_ids) if mention_ids else None
+
         self.conn.execute(
-            "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, now),
+            "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now),
         )
         self.conn.commit()
         return Post(
             post_id=post_id, content=content, kind=kind, channel=channel,
             member_id=member.member_id, member_name=member.member_name,
-            member_type=member.member_type, task_key=task_key, status=status, created_at=now,
+            member_type=member.member_type, task_key=task_key, status=status,
+            metadata=metadata, mentions=mention_ids or None, created_at=now,
         )
+
+    async def retry_failed(self, hub_id: str, max_retries: int = 3) -> list[str]:
+        """Re-queue failed tasks that haven't exceeded max_retries. Returns retried task_keys."""
+        rows = self.conn.execute(
+            "SELECT post_id, task_key, channel, member_id, member_name, member_type, content, priority, retry_count "
+            "FROM posts WHERE hub_id = ? AND kind IN ('failed', 'result') AND status = 'failed' "
+            "AND retry_count < ? ORDER BY priority DESC, created_at ASC",
+            (hub_id, max_retries),
+        ).fetchall()
+
+        retried = []
+        for r in rows:
+            task_key = r["task_key"]
+            if not task_key:
+                continue
+            # Check no open claim exists for this task
+            existing = await self.get_open_claims(hub_id, task_key=task_key)
+            if existing:
+                continue
+            # Mark old failure as retried
+            self.conn.execute(
+                "UPDATE posts SET retry_count = retry_count + 1 WHERE post_id = ?",
+                (r["post_id"],),
+            )
+            retried.append(task_key)
+        self.conn.commit()
+        return retried
 
     async def reply(self, hub_id: str, member: Member, post_id: str, content: str) -> Reply:
         reply_id = _uid()
@@ -186,19 +268,39 @@ class SQLiteBackend(SwarloBackend):
 
     async def claim(self, hub_id: str, member: Member, channel: str,
                     task_key: str, content: str) -> ClaimResult:
-        existing = await self.get_open_claims(hub_id, task_key=task_key)
-        if existing:
+        # Auto-expire stale claims first
+        await self.force_expire_claims(hub_id, stale_minutes=30)
+
+        # Atomic claim via unique index — no TOCTOU race condition
+        from .types import extract_mentions
+        post_id = _uid()
+        now = _utcnow()
+        mention_names = extract_mentions(content)
+        mention_ids = self.resolve_mentions(hub_id, mention_names) if mention_names else []
+        metadata_json = json.dumps({"heartbeat_at": now})
+        mentions_json = json.dumps(mention_ids) if mention_ids else None
+
+        try:
+            self.conn.execute(
+                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+                "content, kind, task_key, status, metadata, mentions, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?)",
+                (post_id, hub_id, channel, member.member_id, member.member_name,
+                 member.member_type, content, task_key, metadata_json, mentions_json, now),
+            )
+            self.conn.commit()
+            return ClaimResult(
+                claimed=True, conflict=False,
+                post_id=post_id, channel=channel, kind="claim",
+            )
+        except sqlite3.IntegrityError:
+            # Unique index violation — someone else claimed first
+            existing = await self.get_open_claims(hub_id, task_key=task_key)
             return ClaimResult(
                 claimed=False, conflict=True,
-                existing_claim=existing[0],
-                message=f"Already claimed by {existing[0].member_name}",
+                existing_claim=existing[0] if existing else None,
+                message=f"Already claimed by {existing[0].member_name}" if existing else "Claim conflict",
             )
-        post = await self.create_post(hub_id, member, channel, content,
-                                      kind="claim", task_key=task_key, status="open")
-        return ClaimResult(
-            claimed=True, conflict=False,
-            post_id=post.post_id, channel=channel, kind="claim",
-        )
 
     async def report(self, hub_id: str, member: Member, channel: str,
                      task_key: str, status: str, content: str,
@@ -209,7 +311,7 @@ class SQLiteBackend(SwarloBackend):
                 f"Task {task_key} is claimed by {existing[0].member_name}"
             )
 
-        kind = "result" if status == "done" else "failed"
+        kind = "result" if status == "done" else "failed" if status == "failed" else status
         post = await self.create_post(hub_id, member, channel, content,
                                       kind=kind, task_key=task_key, status=status)
         self.conn.execute(
@@ -223,8 +325,43 @@ class SQLiteBackend(SwarloBackend):
 
         return post
 
+    async def touch_claim(self, hub_id: str, member_id: str, task_key: str) -> bool:
+        """Refresh a claim's heartbeat to prevent stale expiry."""
+        now = _utcnow()
+        meta_patch = json.dumps({"heartbeat_at": now})
+        cur = self.conn.execute(
+            "UPDATE posts SET metadata = json_patch(COALESCE(metadata, '{}'), ?) "
+            "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
+            (meta_patch, hub_id, task_key, member_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    async def force_expire_claims(self, hub_id: str, stale_minutes: int = 30) -> list[str]:
+        """Expire all claims older than stale_minutes with no heartbeat. Returns expired task_keys."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
+        # A claim is stale if: no heartbeat and created_at < cutoff, OR heartbeat_at < cutoff
+        rows = self.conn.execute(
+            "SELECT post_id, task_key FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open' "
+            "AND (COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) < ?)",
+            (hub_id, cutoff),
+        ).fetchall()
+        expired_keys = [r["task_key"] for r in rows]
+        if rows:
+            post_ids = [r["post_id"] for r in rows]
+            placeholders = ",".join("?" for _ in post_ids)
+            self.conn.execute(
+                f"UPDATE posts SET status = 'stale' WHERE post_id IN ({placeholders})",
+                post_ids,
+            )
+            self.conn.commit()
+        return expired_keys
+
     async def get_open_claims(self, hub_id: str, channel: str | None = None,
                               task_key: str | None = None) -> list[Post]:
+        # Auto-expire stale claims (30 min without heartbeat)
+        await self.force_expire_claims(hub_id, stale_minutes=30)
+
         query = "SELECT * FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open'"
         params: list = [hub_id]
         if channel:
@@ -237,6 +374,19 @@ class SQLiteBackend(SwarloBackend):
 
         rows = self.conn.execute(query, params).fetchall()
         return [self._row_to_post(r) for r in rows]
+
+    async def get_replies(self, hub_id: str, post_id: str) -> list[Reply]:
+        rows = self.conn.execute(
+            "SELECT * FROM replies WHERE post_id = ? ORDER BY created_at ASC", (post_id,)
+        ).fetchall()
+        return [
+            Reply(
+                reply_id=r["reply_id"], post_id=r["post_id"], content=r["content"],
+                member_id=r["member_id"], member_name=r["member_name"],
+                member_type=r["member_type"], created_at=r["created_at"],
+            )
+            for r in rows
+        ]
 
     async def summarize_for_member(self, hub_id: str, member_id: str, limit: int = 10) -> str:
         rows = self.conn.execute(
@@ -338,6 +488,9 @@ class SQLiteBackend(SwarloBackend):
     # ── Helpers ─────────────────────────────────────────────
 
     def _row_to_post(self, row: sqlite3.Row) -> Post:
+        metadata_raw = row["metadata"] if "metadata" in row.keys() else None
+        mentions_raw = row["mentions"] if "mentions" in row.keys() else None
+        keys = row.keys()
         return Post(
             post_id=row["post_id"],
             content=row["content"],
@@ -348,5 +501,8 @@ class SQLiteBackend(SwarloBackend):
             member_type=row["member_type"],
             task_key=row["task_key"],
             status=row["status"],
+            priority=row["priority"] if "priority" in keys else 0,
+            metadata=json.loads(metadata_raw) if metadata_raw else None,
+            mentions=json.loads(mentions_raw) if mentions_raw else None,
             created_at=row["created_at"],
         )

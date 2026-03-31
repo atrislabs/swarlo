@@ -8,15 +8,19 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import secrets
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .sqlite_backend import SQLiteBackend
 from .git_dag import GitDAG
 from .types import Member
+
+logger = logging.getLogger("swarlo.server")
 
 app = FastAPI(title="Swarlo", description="Open coordination protocol for AI agent swarms")
 
@@ -56,9 +60,20 @@ def _get_member(request: Request) -> Member:
     if not auth.startswith("Bearer "):
         raise HTTPException(401, "Missing Authorization: Bearer <api_key>")
     api_key = auth[7:]
-    member = get_backend().authenticate(api_key)
+    be = get_backend()
+    member = be.authenticate(api_key)
     if not member:
         raise HTTPException(401, "Invalid API key")
+    # Bump last_seen on every authenticated call
+    try:
+        from datetime import datetime, timezone
+        be.conn.execute(
+            "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
+            (datetime.now(timezone.utc).isoformat(), member.member_id, member.hub_id),
+        )
+        be.conn.commit()
+    except Exception:
+        pass  # best-effort, don't break auth
     return member
 
 
@@ -69,12 +84,15 @@ class RegisterRequest(BaseModel):
     member_type: str = "agent"
     member_name: str = ""
     hub_id: str = "default"
+    webhook_url: Optional[str] = None
 
 
 class PostRequest(BaseModel):
     content: str
     kind: str = "message"
     task_key: Optional[str] = None
+    priority: int = 0
+    metadata: Optional[dict] = None
 
 
 class ClaimRequest(BaseModel):
@@ -102,6 +120,7 @@ async def register(body: RegisterRequest):
         member_type=body.member_type,
         member_name=body.member_name or body.member_id,
         hub_id=body.hub_id,
+        webhook_url=body.webhook_url,
     )
     get_backend().register_member(member, api_key=api_key)
     return {"member_id": member.member_id, "api_key": api_key, "hub_id": member.hub_id}
@@ -135,9 +154,11 @@ async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 1
 # ── Post ────────────────────────────────────────────────────
 
 @app.post("/api/{hub_id}/channels/{channel}/posts", status_code=201)
-async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request):
+async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request, background_tasks: BackgroundTasks):
     member = _get_member(request)
-    post = await get_backend().create_post(hub_id, member, channel, body.content, body.kind, body.task_key)
+    post = await get_backend().create_post(hub_id, member, channel, body.content, body.kind, body.task_key, metadata=body.metadata, priority=body.priority)
+    if post.mentions:
+        background_tasks.add_task(_dispatch_webhooks, hub_id, post)
     return post.to_dict()
 
 
@@ -164,6 +185,50 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
     return post.to_dict()
 
 
+# ── Touch (keepalive) ──────────────────────────────────────
+
+class TouchRequest(BaseModel):
+    task_key: str
+
+
+@app.post("/api/{hub_id}/channels/{channel}/touch")
+async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Request):
+    member = _get_member(request)
+    task_key = body.task_key
+    ok = await get_backend().touch_claim(hub_id, member.member_id, task_key)
+    if not ok:
+        raise HTTPException(404, f"No open claim for {task_key}")
+    return {"touched": True, "task_key": task_key}
+
+
+# ── Force-expire stale claims ─────────────────────────────
+
+@app.post("/api/{hub_id}/claims/expire")
+async def expire_stale_claims(hub_id: str, request: Request):
+    _get_member(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    stale_minutes = body.get("stale_minutes", 30) if isinstance(body, dict) else 30
+    expired = await get_backend().force_expire_claims(hub_id, stale_minutes=stale_minutes)
+    return {"expired": expired, "count": len(expired)}
+
+
+# ── Retry failed tasks ─────────────────────────────────────
+
+@app.post("/api/{hub_id}/claims/retry")
+async def retry_failed_tasks(hub_id: str, request: Request):
+    _get_member(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    max_retries = body.get("max_retries", 3) if isinstance(body, dict) else 3
+    retried = await get_backend().retry_failed(hub_id, max_retries=max_retries)
+    return {"retried": retried, "count": len(retried)}
+
+
 # ── Claims ──────────────────────────────────────────────────
 
 @app.get("/api/{hub_id}/claims")
@@ -173,23 +238,25 @@ async def list_claims(hub_id: str, request: Request, channel: Optional[str] = No
     return {"count": len(claims), "claims": [c.to_dict() for c in claims]}
 
 
+# ── Summary ────────────────────────────────────────────────
+
+@app.get("/api/{hub_id}/summary")
+async def get_summary(hub_id: str, request: Request, limit: int = 10):
+    member = _get_member(request)
+    text = await get_backend().summarize_for_member(hub_id, member.member_id, limit=min(limit, 50))
+    return {"summary": text}
+
+
 # ── Replies ─────────────────────────────────────────────────
 
 @app.get("/api/{hub_id}/posts/{post_id}/replies")
 async def list_replies(hub_id: str, post_id: str, request: Request):
     _get_member(request)
-    rows = get_backend().conn.execute(
-        "SELECT * FROM replies WHERE post_id = ? ORDER BY created_at ASC", (post_id,)
-    ).fetchall()
+    replies = await get_backend().get_replies(hub_id, post_id)
     return {
         "post_id": post_id,
-        "count": len(rows),
-        "replies": [{
-            "reply_id": r["reply_id"], "post_id": r["post_id"],
-            "content": r["content"], "member_id": r["member_id"],
-            "member_name": r["member_name"], "member_type": r["member_type"],
-            "created_at": r["created_at"],
-        } for r in rows],
+        "count": len(replies),
+        "replies": [r.to_dict() for r in replies],
     }
 
 
@@ -198,6 +265,83 @@ async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: R
     member = _get_member(request)
     reply = await get_backend().reply(hub_id, member, post_id, body.content)
     return reply.to_dict()
+
+
+# ── Webhooks ───────────────────────────────────────────────
+
+async def _dispatch_webhooks(hub_id: str, post):
+    """Fire webhook callbacks for @mentioned members. Best-effort, no retries."""
+    backend = get_backend()
+    members = backend.get_members_by_ids(hub_id, post.mentions)
+    async with httpx.AsyncClient(timeout=10) as client:
+        for m in members:
+            if not m.webhook_url:
+                continue
+            try:
+                await client.post(m.webhook_url, json={
+                    "event": "mention",
+                    "hub_id": hub_id,
+                    "post": post.to_dict(),
+                    "mentioned_member_id": m.member_id,
+                })
+            except Exception as e:
+                logger.debug(f"Webhook to {m.member_id} failed: {e}")
+
+
+# ── Members ────────────────────────────────────────────────
+
+@app.get("/api/{hub_id}/members")
+async def list_members(hub_id: str, request: Request):
+    _get_member(request)
+    rows = get_backend().conn.execute(
+        "SELECT member_id, member_name, member_type, created_at, last_seen FROM members WHERE hub_id = ?",
+        (hub_id,),
+    ).fetchall()
+    return {"count": len(rows), "members": [dict(r) for r in rows]}
+
+
+@app.delete("/api/{hub_id}/members/{member_id}")
+async def delete_member(hub_id: str, member_id: str, request: Request):
+    caller = _get_member(request)
+    be = get_backend()
+    row = be.conn.execute(
+        "SELECT member_id FROM members WHERE hub_id = ? AND member_id = ?",
+        (hub_id, member_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, f"Member {member_id} not found")
+    be.conn.execute(
+        "DELETE FROM members WHERE hub_id = ? AND member_id = ?",
+        (hub_id, member_id),
+    )
+    be.conn.commit()
+    return {"deleted": member_id}
+
+
+@app.post("/api/{hub_id}/prune")
+async def prune_members(hub_id: str, request: Request):
+    """Remove members not seen in `stale_minutes` (default 60)."""
+    caller = _get_member(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    stale_minutes = body.get("stale_minutes", 60) if isinstance(body, dict) else 60
+    be = get_backend()
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
+    rows = be.conn.execute(
+        "SELECT member_id FROM members WHERE hub_id = ? AND (last_seen IS NOT NULL AND last_seen < ?) AND member_type != 'human'",
+        (hub_id, cutoff),
+    ).fetchall()
+    pruned = [r["member_id"] for r in rows]
+    if pruned:
+        be.conn.execute(
+            f"DELETE FROM members WHERE hub_id = ? AND member_id IN ({','.join('?' * len(pruned))})",
+            (hub_id, *pruned),
+        )
+        be.conn.commit()
+    return {"pruned": pruned, "count": len(pruned)}
 
 
 # ── Git DAG ─────────────────────────────────────────────────
