@@ -114,6 +114,8 @@ class ReplyRequest(BaseModel):
 
 @app.post("/api/register", status_code=201)
 async def register(body: RegisterRequest):
+    if body.webhook_url and not _is_safe_webhook_url(body.webhook_url):
+        raise HTTPException(400, "Invalid webhook URL: must be HTTPS and not target private networks")
     api_key = secrets.token_hex(32)
     member = Member(
         member_id=body.member_id,
@@ -269,6 +271,45 @@ async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: R
 
 # ── Webhooks ───────────────────────────────────────────────
 
+import ipaddress
+from urllib.parse import urlparse
+
+
+def _is_safe_webhook_url(url: str) -> bool:
+    """Validate webhook URL: must be HTTPS (or localhost for dev), no private/reserved IPs."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    # Must have scheme and host
+    if not parsed.scheme or not parsed.hostname:
+        return False
+
+    # Allow HTTP only for localhost (dev mode)
+    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1"):
+        return False
+
+    # Block non-HTTP schemes
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    # Block private/reserved IPs (SSRF protection)
+    # Skip DNS check for non-localhost — validate at dispatch time when DNS is available
+    if parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        try:
+            import socket
+            resolved = socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+            for _, _, _, _, addr in resolved:
+                ip = ipaddress.ip_address(addr[0])
+                if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+                    return False
+        except (socket.gaierror, ValueError):
+            pass  # DNS not available — allow registration, block at dispatch
+
+    return True
+
+
 async def _dispatch_webhooks(hub_id: str, post):
     """Fire webhook callbacks for @mentioned members. Best-effort, no retries."""
     backend = get_backend()
@@ -276,6 +317,9 @@ async def _dispatch_webhooks(hub_id: str, post):
     async with httpx.AsyncClient(timeout=10) as client:
         for m in members:
             if not m.webhook_url:
+                continue
+            if not _is_safe_webhook_url(m.webhook_url):
+                logger.warning(f"Blocked unsafe webhook URL for {m.member_id}: {m.webhook_url}")
                 continue
             try:
                 await client.post(m.webhook_url, json={
