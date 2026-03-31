@@ -279,7 +279,7 @@ class SQLiteBackend(SwarloBackend):
 
     async def assign(self, hub_id: str, assigner: Member, channel: str,
                      task_key: str, assignee_id: str, content: str) -> ClaimResult:
-        """Push-assign a task to a specific member. Creates a claim on their behalf."""
+        """Push-assign a task to a specific member. Claims first, then posts assignment message."""
         # Look up assignee
         assignee = self.get_member(hub_id, assignee_id)
         if not assignee:
@@ -288,14 +288,18 @@ class SQLiteBackend(SwarloBackend):
                 message=f"Member {assignee_id} not found in hub",
             )
 
-        # Post the assignment (visible to everyone)
-        await self.create_post(
+        # Claim first — no orphan assign posts on conflict
+        result = await self.claim(hub_id, assignee, channel, task_key, content)
+        if not result.claimed:
+            return result
+
+        # Claim succeeded — post the visible assignment message
+        assign_post = await self.create_post(
             hub_id, assigner, channel, f"Assigned {task_key} to @{assignee.member_name}: {content}",
-            kind="assign", task_key=task_key, metadata={"assignee_id": assignee_id},
+            kind="assign", task_key=task_key, metadata={"assignee_id": assignee_id, "claim_post_id": result.post_id},
         )
 
-        # Create the claim on behalf of the assignee
-        return await self.claim(hub_id, assignee, channel, task_key, content)
+        return result
 
     async def claim(self, hub_id: str, member: Member, channel: str,
                     task_key: str, content: str) -> ClaimResult:

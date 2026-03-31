@@ -195,14 +195,15 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
             raise HTTPException(409, result.to_dict())
         raise HTTPException(400, result.message or "Assignment failed")
 
-    # Fire webhook to assignee
+    # Fire webhook to assignee — post_id is the claim (what assignee acts on)
     assignee = be.get_member(hub_id, body.assignee_id)
     if assignee and assignee.webhook_url:
         from .types import Post
         notify_post = Post(
-            post_id=result.post_id or "", content=body.content, kind="assign",
-            channel=channel, member_id=assigner.member_id, member_name=assigner.member_name,
-            member_type=assigner.member_type, task_key=body.task_key, status="open",
+            post_id=result.post_id or "", content=body.content, kind="claim",
+            channel=channel, member_id=body.assignee_id, member_name=assignee.member_name,
+            member_type=assignee.member_type, task_key=body.task_key, status="open",
+            metadata={"assigned_by": assigner.member_id},
             mentions=[body.assignee_id],
         )
         background_tasks.add_task(_dispatch_webhooks, hub_id, notify_post)
