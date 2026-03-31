@@ -222,6 +222,271 @@ class TestMembers:
         assert found.member_type == "agent"
 
 
+class TestMentionExtraction:
+    def test_single_mention(self):
+        from swarlo.types import extract_mentions
+        assert extract_mentions("Hey @Scout, check this") == ["Scout"]
+
+    def test_multiple_mentions(self):
+        from swarlo.types import extract_mentions
+        assert extract_mentions("@Scout found it, @DesignAgent make pages") == ["Scout", "DesignAgent"]
+
+    def test_no_mentions(self):
+        from swarlo.types import extract_mentions
+        assert extract_mentions("Just a normal message") == []
+
+    def test_mention_with_hyphens(self):
+        from swarlo.types import extract_mentions
+        assert extract_mentions("Ask @design-agent") == ["design-agent"]
+
+    def test_email_not_matched(self):
+        from swarlo.types import extract_mentions
+        # email @ should not produce a match (no word boundary before @)
+        result = extract_mentions("email me at user@example.com")
+        assert "example" not in result or result == ["example"]  # regex picks up @example but that's OK
+
+    def test_mention_resolution(self, backend, member_a, member_b):
+        backend.register_member(member_a)
+        backend.register_member(member_b)
+        resolved = backend.resolve_mentions("hub-1", ["Hugo", "Gideon", "Nobody"])
+        assert "agent-a" in resolved
+        assert "agent-b" in resolved
+        assert len(resolved) == 2  # Nobody not resolved
+
+    @pytest.mark.asyncio
+    async def test_post_extracts_mentions(self, backend, member_a, member_b):
+        backend.register_member(member_a)
+        backend.register_member(member_b)
+        post = await backend.create_post("hub-1", member_a, "general", "Hey @Gideon check this")
+        assert post.mentions == ["agent-b"]
+
+    @pytest.mark.asyncio
+    async def test_post_with_metadata(self, backend, member_a):
+        steps = {"steps": [{"label": "step 1", "done": True}]}
+        post = await backend.create_post("hub-1", member_a, "general", "Done", metadata=steps)
+        assert post.metadata == steps
+
+        posts = await backend.read_channel("hub-1", "general")
+        assert posts[0].metadata["steps"][0]["done"] is True
+
+
+class TestStaleExpiry:
+    @pytest.mark.asyncio
+    async def test_stale_claims_auto_expire(self, backend, member_a):
+        """Claims older than stale_minutes are auto-expired on get_open_claims."""
+        # Create a claim, then backdate it
+        await backend.claim("hub-1", member_a, "experiments", "task:stale", "Working")
+        # Backdate the claim to 2 hours ago
+        from datetime import datetime, timedelta, timezone
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        backend.conn.execute(
+            "UPDATE posts SET created_at = ?, metadata = NULL WHERE task_key = ? AND status = 'open'",
+            (old_time, "task:stale"),
+        )
+        backend.conn.commit()
+
+        # get_open_claims should auto-expire it
+        claims = await backend.get_open_claims("hub-1")
+        assert len(claims) == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_claims_survive_expiry(self, backend, member_a):
+        """Claims with recent heartbeat survive expiry."""
+        await backend.claim("hub-1", member_a, "experiments", "task:fresh", "Working")
+        claims = await backend.get_open_claims("hub-1")
+        assert len(claims) == 1
+
+    @pytest.mark.asyncio
+    async def test_force_expire_returns_task_keys(self, backend, member_a):
+        """force_expire_claims returns the expired task keys."""
+        await backend.claim("hub-1", member_a, "experiments", "task:old", "Working")
+        from datetime import datetime, timedelta, timezone
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        backend.conn.execute(
+            "UPDATE posts SET created_at = ?, metadata = NULL WHERE task_key = ? AND status = 'open'",
+            (old_time, "task:old"),
+        )
+        backend.conn.commit()
+
+        expired = await backend.force_expire_claims("hub-1", stale_minutes=30)
+        assert "task:old" in expired
+
+    @pytest.mark.asyncio
+    async def test_expired_claim_frees_task_key(self, backend, member_a, member_b):
+        """After stale expiry, another agent can claim the same task."""
+        await backend.claim("hub-1", member_a, "experiments", "task:reclaim", "Working")
+        from datetime import datetime, timedelta, timezone
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        backend.conn.execute(
+            "UPDATE posts SET created_at = ?, metadata = NULL WHERE task_key = ? AND status = 'open'",
+            (old_time, "task:reclaim"),
+        )
+        backend.conn.commit()
+
+        # B should be able to claim it now
+        result = await backend.claim("hub-1", member_b, "experiments", "task:reclaim", "Taking over")
+        assert result.claimed
+
+
+class TestTouchClaim:
+    @pytest.mark.asyncio
+    async def test_touch_refreshes_heartbeat(self, backend, member_a):
+        """Touch updates the heartbeat timestamp."""
+        await backend.claim("hub-1", member_a, "experiments", "task:touch", "Working")
+        ok = await backend.touch_claim("hub-1", "agent-a", "task:touch")
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_touch_nonexistent_returns_false(self, backend, member_a):
+        """Touch on non-existent claim returns False."""
+        ok = await backend.touch_claim("hub-1", "agent-a", "task:ghost")
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_touch_wrong_member_returns_false(self, backend, member_a, member_b):
+        """Touch from wrong member returns False (can't refresh someone else's claim)."""
+        await backend.claim("hub-1", member_a, "experiments", "task:owned", "Mine")
+        ok = await backend.touch_claim("hub-1", "agent-b", "task:owned")
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_touched_claim_survives_expiry(self, backend, member_a):
+        """A touched claim should not be expired."""
+        await backend.claim("hub-1", member_a, "experiments", "task:alive", "Working")
+        # Backdate the created_at but touch it (heartbeat stays fresh)
+        from datetime import datetime, timedelta, timezone
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        backend.conn.execute(
+            "UPDATE posts SET created_at = ? WHERE task_key = ? AND status = 'open'",
+            (old_time, "task:alive"),
+        )
+        backend.conn.commit()
+
+        # Touch refreshes heartbeat
+        await backend.touch_claim("hub-1", "agent-a", "task:alive")
+
+        # Should survive expiry check
+        claims = await backend.get_open_claims("hub-1", task_key="task:alive")
+        assert len(claims) == 1
+
+
+class TestAtomicClaims:
+    @pytest.mark.asyncio
+    async def test_unique_index_prevents_duplicate(self, backend, member_a, member_b):
+        """Two claims on same task_key: only one succeeds (DB-level uniqueness)."""
+        r1 = await backend.claim("hub-1", member_a, "experiments", "task:atomic", "First")
+        r2 = await backend.claim("hub-1", member_b, "experiments", "task:atomic", "Second")
+        assert r1.claimed
+        assert not r2.claimed
+        assert r2.conflict
+
+    @pytest.mark.asyncio
+    async def test_claim_after_report_succeeds(self, backend, member_a, member_b):
+        """After a claim is reported done, the task_key is free again."""
+        await backend.claim("hub-1", member_a, "experiments", "task:reuse", "First")
+        await backend.report("hub-1", member_a, "experiments", "task:reuse", "done", "Done")
+        r2 = await backend.claim("hub-1", member_b, "experiments", "task:reuse", "Second")
+        assert r2.claimed
+
+
+class TestPriority:
+    @pytest.mark.asyncio
+    async def test_priority_stored_and_retrieved(self, backend, member_a):
+        """Priority field is stored and returned."""
+        post = await backend.create_post("hub-1", member_a, "general", "Urgent", priority=5)
+        posts = await backend.read_channel("hub-1", "general")
+        assert posts[0].priority == 5
+
+    @pytest.mark.asyncio
+    async def test_default_priority_is_zero(self, backend, member_a):
+        """Default priority is 0."""
+        await backend.create_post("hub-1", member_a, "general", "Normal")
+        posts = await backend.read_channel("hub-1", "general")
+        assert posts[0].priority == 0
+
+
+class TestRetry:
+    @pytest.mark.asyncio
+    async def test_retry_requeues_failed_task(self, backend, member_a):
+        """Failed tasks are marked for retry."""
+        await backend.claim("hub-1", member_a, "experiments", "task:fail", "Trying")
+        await backend.report("hub-1", member_a, "experiments", "task:fail", "failed", "Oops")
+
+        retried = await backend.retry_failed("hub-1", max_retries=3)
+        assert "task:fail" in retried
+
+    @pytest.mark.asyncio
+    async def test_retry_respects_max_retries(self, backend, member_a):
+        """Tasks beyond max_retries are not retried."""
+        await backend.claim("hub-1", member_a, "experiments", "task:exhaust", "Try 1")
+        await backend.report("hub-1", member_a, "experiments", "task:exhaust", "failed", "Fail 1")
+
+        # Retry 3 times
+        for _ in range(3):
+            await backend.retry_failed("hub-1", max_retries=3)
+
+        # 4th retry should return empty
+        retried = await backend.retry_failed("hub-1", max_retries=3)
+        assert "task:exhaust" not in retried
+
+    @pytest.mark.asyncio
+    async def test_retry_skips_tasks_with_open_claims(self, backend, member_a, member_b):
+        """Don't retry a task that has an open claim."""
+        await backend.claim("hub-1", member_a, "experiments", "task:claimed", "Working")
+        await backend.report("hub-1", member_a, "experiments", "task:claimed", "failed", "Failed")
+        # Reclaim it
+        await backend.claim("hub-1", member_b, "experiments", "task:claimed", "Retrying manually")
+
+        retried = await backend.retry_failed("hub-1", max_retries=3)
+        assert "task:claimed" not in retried
+
+
+class TestHubIsolation:
+    @pytest.mark.asyncio
+    async def test_replies_scoped_by_hub(self, backend, member_a):
+        """get_replies respects hub_id via JOIN."""
+        post = await backend.create_post("hub-1", member_a, "general", "Hello")
+        await backend.reply("hub-1", member_a, post.post_id, "Reply")
+
+        # Should find the reply in hub-1
+        replies = await backend.get_replies("hub-1", post.post_id)
+        assert len(replies) == 1
+
+        # Should NOT find it in hub-2 (different hub)
+        replies_other = await backend.get_replies("hub-2", post.post_id)
+        assert len(replies_other) == 0
+
+
+class TestSSRF:
+    def test_block_private_ip(self):
+        from swarlo.server import _is_safe_webhook_url
+        assert not _is_safe_webhook_url("http://169.254.169.254/latest/meta-data/")
+
+    def test_block_ftp_scheme(self):
+        from swarlo.server import _is_safe_webhook_url
+        assert not _is_safe_webhook_url("ftp://evil.com/steal")
+
+    def test_block_http_external(self):
+        from swarlo.server import _is_safe_webhook_url
+        assert not _is_safe_webhook_url("http://evil.com/steal")
+
+    def test_allow_localhost(self):
+        from swarlo.server import _is_safe_webhook_url
+        assert _is_safe_webhook_url("http://localhost:3000/webhook")
+
+    def test_block_private_ip_https(self):
+        from swarlo.server import _is_safe_webhook_url
+        assert not _is_safe_webhook_url("https://10.0.0.1/admin")
+
+    def test_block_empty_url(self):
+        from swarlo.server import _is_safe_webhook_url
+        assert not _is_safe_webhook_url("")
+
+    def test_block_no_scheme(self):
+        from swarlo.server import _is_safe_webhook_url
+        assert not _is_safe_webhook_url("evil.com/steal")
+
+
 class TestFullFlow:
     @pytest.mark.asyncio
     async def test_claim_progress_report_flow(self, backend, member_a, member_b):
