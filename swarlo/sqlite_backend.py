@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -91,6 +92,7 @@ class SQLiteBackend(SwarloBackend):
     def __init__(self, db_path: str = "swarlo.db"):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -125,11 +127,12 @@ class SQLiteBackend(SwarloBackend):
     # ── Members ─────────────────────────────────────────────
 
     def register_member(self, member: Member, api_key: str | None = None) -> None:
-        self.conn.execute(
-            "INSERT OR REPLACE INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (member.member_id, member.hub_id, member.member_type, member.member_name, api_key, member.webhook_url, _utcnow()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (member.member_id, member.hub_id, member.member_type, member.member_name, api_key, member.webhook_url, _utcnow()),
+            )
+            self.conn.commit()
 
     def get_member(self, hub_id: str, member_id: str) -> Member | None:
         row = self.conn.execute(
@@ -213,11 +216,12 @@ class SQLiteBackend(SwarloBackend):
         metadata_json = json.dumps(metadata) if metadata is not None else None
         mentions_json = json.dumps(mention_ids) if mention_ids else None
 
-        self.conn.execute(
-            "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now),
+            )
+            self.conn.commit()
         return Post(
             post_id=post_id, content=content, kind=kind, channel=channel,
             member_id=member.member_id, member_name=member.member_name,
@@ -227,39 +231,46 @@ class SQLiteBackend(SwarloBackend):
 
     async def retry_failed(self, hub_id: str, max_retries: int = 3) -> list[str]:
         """Re-queue failed tasks that haven't exceeded max_retries. Returns retried task_keys."""
-        rows = self.conn.execute(
-            "SELECT post_id, task_key, channel, member_id, member_name, member_type, content, priority, retry_count "
-            "FROM posts WHERE hub_id = ? AND kind IN ('failed', 'result') AND status = 'failed' "
-            "AND retry_count < ? ORDER BY priority DESC, created_at ASC",
-            (hub_id, max_retries),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT post_id, task_key, channel, member_id, member_name, member_type, content, priority, retry_count "
+                "FROM posts WHERE hub_id = ? AND kind IN ('failed', 'result') AND status = 'failed' "
+                "AND retry_count < ? ORDER BY priority DESC, created_at ASC",
+                (hub_id, max_retries),
+            ).fetchall()
 
+        # Check claims outside lock (involves await)
         retried = []
+        update_ids = []
         for r in rows:
             task_key = r["task_key"]
             if not task_key:
                 continue
-            # Check no open claim exists for this task
             existing = await self.get_open_claims(hub_id, task_key=task_key)
             if existing:
                 continue
-            # Mark old failure as retried
-            self.conn.execute(
-                "UPDATE posts SET retry_count = retry_count + 1 WHERE post_id = ?",
-                (r["post_id"],),
-            )
+            update_ids.append(r["post_id"])
             retried.append(task_key)
-        self.conn.commit()
+
+        if update_ids:
+            with self._lock:
+                for pid in update_ids:
+                    self.conn.execute(
+                        "UPDATE posts SET retry_count = retry_count + 1 WHERE post_id = ?",
+                        (pid,),
+                    )
+                self.conn.commit()
         return retried
 
     async def reply(self, hub_id: str, member: Member, post_id: str, content: str) -> Reply:
         reply_id = _uid()
         now = _utcnow()
-        self.conn.execute(
-            "INSERT INTO replies (reply_id, post_id, hub_id, member_id, member_name, member_type, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (reply_id, post_id, hub_id, member.member_id, member.member_name, member.member_type, content, now),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO replies (reply_id, post_id, hub_id, member_id, member_name, member_type, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (reply_id, post_id, hub_id, member.member_id, member.member_name, member.member_type, content, now),
+            )
+            self.conn.commit()
         return Reply(
             reply_id=reply_id, post_id=post_id, content=content,
             member_id=member.member_id, member_name=member.member_name,
@@ -281,14 +292,15 @@ class SQLiteBackend(SwarloBackend):
         mentions_json = json.dumps(mention_ids) if mention_ids else None
 
         try:
-            self.conn.execute(
-                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
-                "content, kind, task_key, status, metadata, mentions, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?)",
-                (post_id, hub_id, channel, member.member_id, member.member_name,
-                 member.member_type, content, task_key, metadata_json, mentions_json, now),
-            )
-            self.conn.commit()
+            with self._lock:
+                self.conn.execute(
+                    "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+                    "content, kind, task_key, status, metadata, mentions, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?)",
+                    (post_id, hub_id, channel, member.member_id, member.member_name,
+                     member.member_type, content, task_key, metadata_json, mentions_json, now),
+                )
+                self.conn.commit()
             return ClaimResult(
                 claimed=True, conflict=False,
                 post_id=post_id, channel=channel, kind="claim",
@@ -314,11 +326,12 @@ class SQLiteBackend(SwarloBackend):
         kind = "result" if status == "done" else "failed" if status == "failed" else status
         post = await self.create_post(hub_id, member, channel, content,
                                       kind=kind, task_key=task_key, status=status)
-        self.conn.execute(
-            "UPDATE posts SET status = ? WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
-            (status, hub_id, task_key, member.member_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE posts SET status = ? WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
+                (status, hub_id, task_key, member.member_id),
+            )
+            self.conn.commit()
 
         if parent_id:
             await self.reply(hub_id, member, parent_id, content)
@@ -329,32 +342,33 @@ class SQLiteBackend(SwarloBackend):
         """Refresh a claim's heartbeat to prevent stale expiry."""
         now = _utcnow()
         meta_patch = json.dumps({"heartbeat_at": now})
-        cur = self.conn.execute(
-            "UPDATE posts SET metadata = json_patch(COALESCE(metadata, '{}'), ?) "
-            "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
-            (meta_patch, hub_id, task_key, member_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE posts SET metadata = json_patch(COALESCE(metadata, '{}'), ?) "
+                "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
+                (meta_patch, hub_id, task_key, member_id),
+            )
+            self.conn.commit()
         return cur.rowcount > 0
 
     async def force_expire_claims(self, hub_id: str, stale_minutes: int = 30) -> list[str]:
         """Expire all claims older than stale_minutes with no heartbeat. Returns expired task_keys."""
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
-        # A claim is stale if: no heartbeat and created_at < cutoff, OR heartbeat_at < cutoff
-        rows = self.conn.execute(
-            "SELECT post_id, task_key FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open' "
-            "AND (COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) < ?)",
-            (hub_id, cutoff),
-        ).fetchall()
-        expired_keys = [r["task_key"] for r in rows]
-        if rows:
-            post_ids = [r["post_id"] for r in rows]
-            placeholders = ",".join("?" for _ in post_ids)
-            self.conn.execute(
-                f"UPDATE posts SET status = 'stale' WHERE post_id IN ({placeholders})",
-                post_ids,
-            )
-            self.conn.commit()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT post_id, task_key FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open' "
+                "AND (COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) < ?)",
+                (hub_id, cutoff),
+            ).fetchall()
+            expired_keys = [r["task_key"] for r in rows]
+            if rows:
+                post_ids = [r["post_id"] for r in rows]
+                placeholders = ",".join("?" for _ in post_ids)
+                self.conn.execute(
+                    f"UPDATE posts SET status = 'stale' WHERE post_id IN ({placeholders})",
+                    post_ids,
+                )
+                self.conn.commit()
         return expired_keys
 
     async def get_open_claims(self, hub_id: str, channel: str | None = None,
@@ -377,7 +391,9 @@ class SQLiteBackend(SwarloBackend):
 
     async def get_replies(self, hub_id: str, post_id: str) -> list[Reply]:
         rows = self.conn.execute(
-            "SELECT * FROM replies WHERE post_id = ? ORDER BY created_at ASC", (post_id,)
+            "SELECT r.* FROM replies r JOIN posts p ON r.post_id = p.post_id "
+            "WHERE r.post_id = ? AND p.hub_id = ? ORDER BY r.created_at ASC",
+            (post_id, hub_id),
         ).fetchall()
         return [
             Reply(
@@ -429,11 +445,12 @@ class SQLiteBackend(SwarloBackend):
     def index_commit(self, hub_id: str, hash: str, parent_hash: str,
                      member_id: str, member_name: str, message: str) -> None:
         """Index a commit in the metadata store."""
-        self.conn.execute(
-            "INSERT OR IGNORE INTO commits (hash, parent_hash, hub_id, member_id, member_name, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (hash, parent_hash or None, hub_id, member_id, member_name, message, _utcnow()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO commits (hash, parent_hash, hub_id, member_id, member_name, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (hash, parent_hash or None, hub_id, member_id, member_name, message, _utcnow()),
+            )
+            self.conn.commit()
 
     def get_commit(self, hub_id: str, hash: str) -> dict | None:
         row = self.conn.execute(
