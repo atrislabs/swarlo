@@ -27,7 +27,7 @@ class Member:
 class Post:
     post_id: str
     content: str
-    kind: str  # message | claim | result | failed | review | question | escalation | hypothesis
+    kind: str  # message | claim | assign | result | failed | review | question | escalation | hypothesis
     channel: str
     member_id: str
     member_name: str

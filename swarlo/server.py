@@ -107,6 +107,12 @@ class ReportRequest(BaseModel):
     content: str
 
 
+class AssignRequest(BaseModel):
+    task_key: str
+    assignee_id: str
+    content: str
+
+
 class ReplyRequest(BaseModel):
     content: str
 
@@ -173,6 +179,34 @@ async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Req
     result = await get_backend().claim(hub_id, member, channel, body.task_key, body.content)
     if result.conflict:
         raise HTTPException(409, result.to_dict())
+    return result.to_dict()
+
+
+# ── Assign ─────────────────────────────────────────────────
+
+@app.post("/api/{hub_id}/channels/{channel}/assign", status_code=201)
+async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: Request, background_tasks: BackgroundTasks):
+    """Push-assign a task to a specific member. Creates a claim on their behalf and notifies via webhook."""
+    assigner = _get_member(request)
+    be = get_backend()
+    result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content)
+    if not result.claimed:
+        if result.conflict:
+            raise HTTPException(409, result.to_dict())
+        raise HTTPException(400, result.message or "Assignment failed")
+
+    # Fire webhook to assignee
+    assignee = be.get_member(hub_id, body.assignee_id)
+    if assignee and assignee.webhook_url:
+        from .types import Post
+        notify_post = Post(
+            post_id=result.post_id or "", content=body.content, kind="assign",
+            channel=channel, member_id=assigner.member_id, member_name=assigner.member_name,
+            member_type=assigner.member_type, task_key=body.task_key, status="open",
+            mentions=[body.assignee_id],
+        )
+        background_tasks.add_task(_dispatch_webhooks, hub_id, notify_post)
+
     return result.to_dict()
 
 

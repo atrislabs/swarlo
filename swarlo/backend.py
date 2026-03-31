@@ -29,6 +29,12 @@ class SwarloBackend(ABC):
                     task_key: str, content: str) -> ClaimResult: ...
 
     @abstractmethod
+    async def assign(self, hub_id: str, assigner: Member, channel: str,
+                     task_key: str, assignee_id: str, content: str) -> ClaimResult:
+        """Push-assign a task to a specific member. Creates a claim on their behalf."""
+        ...
+
+    @abstractmethod
     async def report(self, hub_id: str, member: Member, channel: str,
                      task_key: str, status: str, content: str,
                      parent_id: Optional[str] = None) -> Post: ...

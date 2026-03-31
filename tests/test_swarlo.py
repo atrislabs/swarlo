@@ -487,6 +487,66 @@ class TestSSRF:
         assert not _is_safe_webhook_url("evil.com/steal")
 
 
+class TestAssign:
+    @pytest.mark.asyncio
+    async def test_assign_creates_claim_for_assignee(self, backend, member_a, member_b):
+        """Assign creates a claim owned by the assignee, not the assigner."""
+        backend.register_member(member_a)
+        backend.register_member(member_b)
+
+        result = await backend.assign("hub-1", member_a, "experiments", "task:assigned", "agent-b", "Do this")
+        assert result.claimed
+
+        claims = await backend.get_open_claims("hub-1", task_key="task:assigned")
+        assert len(claims) == 1
+        assert claims[0].member_id == "agent-b"  # owned by assignee
+
+    @pytest.mark.asyncio
+    async def test_assign_posts_visible_message(self, backend, member_a, member_b):
+        """Assign posts an assignment message visible to the channel."""
+        backend.register_member(member_a)
+        backend.register_member(member_b)
+
+        await backend.assign("hub-1", member_a, "experiments", "task:visible", "agent-b", "Review PR")
+        posts = await backend.read_channel("hub-1", "experiments")
+        assign_posts = [p for p in posts if p.kind == "assign"]
+        assert len(assign_posts) == 1
+        assert "Assigned" in assign_posts[0].content
+
+    @pytest.mark.asyncio
+    async def test_assign_unknown_member_fails(self, backend, member_a):
+        """Assigning to a non-existent member returns failure."""
+        result = await backend.assign("hub-1", member_a, "experiments", "task:ghost", "nobody", "Do this")
+        assert not result.claimed
+        assert "not found" in result.message
+
+    @pytest.mark.asyncio
+    async def test_assign_conflict_if_already_claimed(self, backend, member_a, member_b):
+        """Can't assign a task that's already claimed."""
+        backend.register_member(member_a)
+        backend.register_member(member_b)
+
+        await backend.claim("hub-1", member_a, "experiments", "task:taken", "I got it")
+        result = await backend.assign("hub-1", member_b, "experiments", "task:taken", "agent-a", "Take this")
+        assert not result.claimed
+        assert result.conflict
+
+    @pytest.mark.asyncio
+    async def test_assignee_can_report(self, backend, member_a, member_b):
+        """The assignee (not the assigner) can report the task done."""
+        backend.register_member(member_a)
+        backend.register_member(member_b)
+
+        await backend.assign("hub-1", member_a, "experiments", "task:report-test", "agent-b", "Build it")
+
+        # Assignee (member_b) reports done
+        report = await backend.report("hub-1", member_b, "experiments", "task:report-test", "done", "Done")
+        assert report.status == "done"
+
+        claims = await backend.get_open_claims("hub-1", task_key="task:report-test")
+        assert len(claims) == 0
+
+
 class TestFullFlow:
     @pytest.mark.asyncio
     async def test_claim_progress_report_flow(self, backend, member_a, member_b):
