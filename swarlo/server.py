@@ -280,6 +280,112 @@ async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Re
     return {"touched": True, "task_key": task_key}
 
 
+# ── Latent Briefing (task-guided context filtering) ────────
+
+class BriefingRequest(BaseModel):
+    task: str  # what the agent is about to work on
+    limit: int = 15
+
+
+@app.post("/api/{hub_id}/briefing")
+async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
+    """Return board posts ranked by relevance to a task description.
+
+    Extracts file paths and keywords from the task, scores all posts
+    by overlap, returns the most relevant ones. This is the text-level
+    analog of KV-cache compaction from Latent Briefing (Geist 2026):
+    the task prompt determines what's relevant from shared context.
+
+    Same API shape upgrades to attention-based filtering when running
+    on a local model (Sovereign/Qwen).
+    """
+    import re
+    member = _get_member(request)
+    be = get_backend()
+
+    # --- Extract signals from task description ---
+    # File paths: anything that looks like a/b.py or a/b/c
+    file_pats = re.findall(r'[\w./]+\.(?:py|ts|js|md|json|yaml|sql)\b', body.task)
+    # Also match directory-style paths
+    dir_pats = re.findall(r'(?:backend|atris|swarlo|scripts|tests)/[\w/]+', body.task)
+    all_paths = list(set(file_pats + dir_pats))
+
+    # Keywords: split, lowercase, drop short/common words
+    stopwords = {'the','a','an','is','are','was','were','be','been','and','or','but',
+                 'in','on','at','to','for','of','with','by','from','this','that','it',
+                 'not','no','do','does','did','will','would','should','can','could',
+                 'has','have','had','all','each','every','any','some','into','about',
+                 'up','out','if','then','than','so','as','just','also','how','what',
+                 'when','where','which','who','why','may','must','shall','very','too',
+                 'only','own','same','few','more','most','other','such','test','tests',
+                 'file','files','code','add','fix','bug','new','run','check','make',
+                 'write','read','use','get','set','put','update','create','delete'}
+    words = set(w.lower() for w in re.findall(r'\b\w{3,}\b', body.task)) - stopwords
+
+    # --- Score all recent posts ---
+    rows = be.conn.execute(
+        "SELECT * FROM posts WHERE hub_id = ? ORDER BY created_at DESC LIMIT 200",
+        (hub_id,),
+    ).fetchall()
+
+    scored = []
+    for r in rows:
+        score = 0.0
+        content_lower = (r["content"] or "").lower()
+        task_key = r["task_key"] or ""
+
+        # File path matches (strongest signal — like attention to specific keys)
+        for fp in all_paths:
+            if fp.lower() in content_lower or fp.lower() in task_key.lower():
+                score += 3.0
+
+        # Keyword matches (weaker signal — like distributed attention)
+        matches = sum(1 for w in words if w in content_lower)
+        if words:
+            score += min(matches / len(words) * 2.0, 2.0)  # cap at 2.0
+
+        # Metadata file overlap
+        if r["metadata"]:
+            try:
+                meta = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
+                meta_files = meta.get("affected_files", [])
+                for fp in all_paths:
+                    if any(fp in mf for mf in meta_files):
+                        score += 3.0
+            except Exception:
+                pass
+
+        # Result/claim posts get slight boost (more actionable than messages)
+        if r["kind"] in ("result", "claim", "assign"):
+            score += 0.5
+
+        if score > 0.5:  # threshold — like MAD normalization in the paper
+            scored.append((score, r))
+
+    # Sort by score descending, take top N
+    scored.sort(key=lambda x: -x[0])
+    top = scored[:body.limit]
+
+    return {
+        "task": body.task,
+        "extracted_paths": all_paths,
+        "extracted_keywords": sorted(words)[:20],
+        "count": len(top),
+        "posts": [
+            {
+                "score": round(s, 2),
+                "member_name": r["member_name"],
+                "kind": r["kind"],
+                "task_key": r["task_key"],
+                "content": r["content"][:300],
+                "channel": r["channel"],
+                "created_at": r["created_at"],
+            }
+            for s, r in top
+        ],
+    }
+
+
 # ── Force-expire stale claims ─────────────────────────────
 
 @app.post("/api/{hub_id}/claims/expire")
