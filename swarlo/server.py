@@ -182,6 +182,47 @@ async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Req
     return result.to_dict()
 
 
+# ── File Claims ────────────────────────────────────────────
+
+class FileClaimRequest(BaseModel):
+    file_path: str
+    content: str = ""
+
+
+@app.post("/api/{hub_id}/channels/{channel}/claim-file", status_code=201)
+async def claim_file(hub_id: str, channel: str, body: FileClaimRequest, request: Request):
+    """Claim a file to prevent two agents editing it simultaneously.
+    Uses task_key = 'file:<path>' convention on the existing claim system."""
+    member = _get_member(request)
+    task_key = f"file:{body.file_path}"
+    desc = body.content or f"Editing {body.file_path}"
+    result = await get_backend().claim(hub_id, member, channel, task_key, desc)
+    if result.conflict:
+        raise HTTPException(409, result.to_dict())
+    return result.to_dict()
+
+
+@app.get("/api/{hub_id}/file-claims")
+async def list_file_claims(hub_id: str, request: Request):
+    """List all currently claimed files across all channels."""
+    _get_member(request)
+    claims = await get_backend().get_open_claims(hub_id)
+    file_claims = [c for c in claims if c.task_key and c.task_key.startswith("file:")]
+    return {
+        "count": len(file_claims),
+        "files": [
+            {
+                "file_path": c.task_key[5:],  # strip "file:" prefix
+                "claimed_by": c.member_name,
+                "member_id": c.member_id,
+                "channel": c.channel,
+                "claimed_at": c.created_at,
+            }
+            for c in file_claims
+        ],
+    }
+
+
 # ── Assign ─────────────────────────────────────────────────
 
 @app.post("/api/{hub_id}/channels/{channel}/assign", status_code=201)
@@ -433,6 +474,108 @@ async def prune_members(hub_id: str, request: Request):
         )
         be.conn.commit()
     return {"pruned": pruned, "count": len(pruned)}
+
+
+# ── Orchestrator Scoring ────────────────────────────────────
+
+@app.post("/api/{hub_id}/score")
+async def compute_score(hub_id: str, request: Request):
+    """Compute orchestrator performance metrics.
+
+    Returns:
+        agents_active: members with activity in last hour
+        tasks_claimed: open claims
+        tasks_shipped: completed results
+        avg_time_to_claim: average seconds from task post to claim
+    """
+    _get_member(request)  # Auth check
+    be = get_backend()
+    from datetime import datetime, timezone, timedelta
+
+    # Active agents (seen in last 60 minutes)
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+    agents_active = be.conn.execute(
+        "SELECT COUNT(*) FROM members WHERE hub_id = ? AND last_seen > ? AND member_type = 'agent'",
+        (hub_id, cutoff),
+    ).fetchone()[0]
+
+    # Open claims
+    tasks_claimed = be.conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open'",
+        (hub_id,),
+    ).fetchone()[0]
+
+    # Completed results
+    tasks_shipped = be.conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND kind = 'result'",
+        (hub_id,),
+    ).fetchone()[0]
+
+    # Avg time to claim: find task posts that have matching claims
+    # A claim references a task_key; find pairs and compute time diff
+    rows = be.conn.execute(
+        """
+        SELECT
+            t.created_at as task_time,
+            c.created_at as claim_time
+        FROM posts t
+        JOIN posts c ON t.task_key = c.task_key AND t.hub_id = c.hub_id
+        WHERE t.hub_id = ?
+          AND t.kind = 'message'
+          AND t.task_key IS NOT NULL
+          AND c.kind = 'claim'
+        ORDER BY c.created_at DESC
+        LIMIT 100
+        """,
+        (hub_id,),
+    ).fetchall()
+
+    avg_time_to_claim = None
+    if rows:
+        total_seconds = 0
+        count = 0
+        for row in rows:
+            try:
+                task_dt = datetime.fromisoformat(row["task_time"].replace("Z", "+00:00"))
+                claim_dt = datetime.fromisoformat(row["claim_time"].replace("Z", "+00:00"))
+                diff = (claim_dt - task_dt).total_seconds()
+                if diff >= 0:  # Sanity check
+                    total_seconds += diff
+                    count += 1
+            except Exception:
+                continue
+        if count > 0:
+            avg_time_to_claim = round(total_seconds / count, 1)
+
+    # Store score in SQLite for history (create table if needed)
+    try:
+        be.conn.execute("""
+            CREATE TABLE IF NOT EXISTS scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hub_id TEXT NOT NULL,
+                agents_active INTEGER,
+                tasks_claimed INTEGER,
+                tasks_shipped INTEGER,
+                avg_time_to_claim REAL,
+                computed_at TEXT NOT NULL
+            )
+        """)
+        be.conn.execute(
+            "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, datetime.now(timezone.utc).isoformat()),
+        )
+        be.conn.commit()
+    except Exception:
+        pass  # Non-critical
+
+    return {
+        "hub_id": hub_id,
+        "agents_active": agents_active,
+        "tasks_claimed": tasks_claimed,
+        "tasks_shipped": tasks_shipped,
+        "avg_time_to_claim": avg_time_to_claim,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ── Git DAG ─────────────────────────────────────────────────
