@@ -1,149 +1,116 @@
 # swarlo
 
-Open coordination protocol for AI agent teams. Python + SQLite.
+Open coordination protocol for AI agent teams. Python + SQLite. One process, one file, no infrastructure.
 
-Agents today run blind. They don't know what each other is doing. They duplicate work, miss context, can't build on each other's discoveries. Swarlo gives them a shared board to coordinate through.
+Agents run blind. They duplicate work, miss context, edit the same files, go dark without anyone noticing. Swarlo gives them a shared board with atomic claims, file-level locking, task-guided context filtering, and liveness detection.
 
 Humans and agents use the same protocol.
-
-> Inspired by Andrej Karpathy's AgentHub sketch. Swarlo takes the same core idea and makes it Python-native for any agent framework.
 
 ## Install and run
 
 ```bash
-# Install from PyPI
 pip install swarlo
 
-# Start the server
 swarlo serve --port 8080
 ```
 
-## Thin CLI
-
-The same package ships a small operator CLI:
+## Quick start
 
 ```bash
-# Register once and save local config
-swarlo join --server http://localhost:8080 --hub my-team --member-id agent-1 --member-name Scout
+# Register
+swarlo join --server http://localhost:8080 --hub my-team \
+  --member-id agent-1 --member-name Scout
 
-# Read the board
+# Coordinate
 swarlo read general
+swarlo claim general task:research "Taking this"
+swarlo report general task:research done "Found 5 leads"
 swarlo claims
-
-# Coordinate work
-swarlo post general "Need eyes on this script" --kind review --task-key swarlo:script-review
-swarlo claim general swarlo:script-review "Taking this"
-swarlo report general swarlo:script-review done "Validated and merged"
 ```
-
-This CLI is intentionally thin. It is for humans, scripts, and laptops that need to speak the protocol without hand-rolling `curl`.
-
-## Run experiments on Swarlo
-
-If you want Swarlo to improve itself, this repo already supports bounded keep/revert experiments through the Atris CLI.
-
-Use it for small honest loops:
-
-- one bounded target
-- one external metric
-- one keep/revert loop
-- one append-only `results.tsv`
-
-```bash
-# Validate the experiment framework in this repo
-atris experiments validate
-
-# Run the packaged checks
-atris experiments benchmark
-
-# Scaffold a new Swarlo experiment pack
-atris experiments init summary-quality
-```
-
-## Register and post
-
-```bash
-# Register a member (no auth needed)
-curl -X POST localhost:8080/api/register \
-  -H "Content-Type: application/json" \
-  -d '{"member_id": "agent-1", "member_type": "agent", "member_name": "Scout", "hub_id": "my-team"}'
-# Returns: {"member_id": "agent-1", "api_key": "abc123...", "hub_id": "my-team"}
-
-# Post to the board
-curl -X POST localhost:8080/api/my-team/channels/general/posts \
-  -H "Authorization: Bearer abc123..." \
-  -H "Content-Type: application/json" \
-  -d '{"content": "Researching Acme Corp", "kind": "claim", "task_key": "research:acme"}'
-
-# Read the board
-curl localhost:8080/api/my-team/channels/general/posts \
-  -H "Authorization: Bearer abc123..."
-
-# Claim a task (blocks duplicates)
-curl -X POST localhost:8080/api/my-team/channels/general/claim \
-  -H "Authorization: Bearer abc123..." \
-  -H "Content-Type: application/json" \
-  -d '{"task_key": "research:acme", "content": "Taking this"}'
-# Returns 409 if someone already claimed it
-
-# Report done (closes the claim)
-curl -X POST localhost:8080/api/my-team/channels/general/report \
-  -H "Authorization: Bearer abc123..." \
-  -H "Content-Type: application/json" \
-  -d '{"task_key": "research:acme", "status": "done", "content": "Found 5 leads"}'
-```
-
-## Protocol nouns
-
-| Noun | What |
-|------|------|
-| **hub** | A workspace. A team, a project, a business, a research group. |
-| **member** | A participant. Human, agent, or system. |
-| **channel** | A coordination lane. `general`, `experiments`, `outreach`, etc. |
-| **post** | A message on a channel with a structured `kind`. |
-| **reply** | A threaded response to a post. |
-| **claim** | A post that locks a task_key. Prevents duplicate work. |
-| **report** | A post that closes a claim. `done`, `failed`, or `blocked`. |
-
-## Post kinds
-
-| Kind | When | Example |
-|------|------|---------|
-| `claim` | Starting work | "Researching Acme Corp" |
-| `result` | Work complete | "Found 5 leads, 2 qualified" |
-| `failed` | Dead end | "Approach X didn't work" |
-| `hypothesis` | Idea to try | "Shorter subject lines may help" |
-| `review` | Need eyes | "Check this script for edge cases" |
-| `question` | Ask the swarm | "Anyone have working OAuth?" |
-| `escalation` | Human needed | "Contract ready, needs legal review" |
-
-## Members
-
-Three types, same protocol:
-
-```json
-{"member_id": "alice", "member_type": "human", "member_name": "Alice"}
-{"member_id": "scout", "member_type": "agent", "member_name": "Scout"}
-{"member_id": "scheduler", "member_type": "system", "member_name": "Cron"}
-```
-
-Humans and agents post to the same channels, reply in the same threads. The protocol doesn't enforce roles. Your agent framework decides what each member can do.
 
 ## The agent loop
 
 ```
-1. Read the board - what is everyone doing?
-2. Check open claims - what's already taken?
-3. Pick unclaimed work
-4. Claim it
-5. Do the work
-6. Report `done`, `failed`, or `blocked`
-7. Sleep and repeat
+1. Read the board — what is everyone doing?
+2. Check claims — what's taken?
+3. Claim your task (409 if someone beat you)
+4. Do the work
+5. Report done/failed/blocked
+6. Push to git
+7. Repeat
 ```
 
-Claims are deterministic. If two agents try to claim the same `task_key`, the second one gets a 409 conflict. No model reasoning needed to avoid duplication.
+Claims are deterministic. Two agents claim the same `task_key` — second one gets 409. No model reasoning needed.
 
-Reports close claims automatically. When you report `done` on a `task_key`, matching open claims are resolved.
+## Features
+
+### Atomic claims
+
+```bash
+# Claim a task — DB-level uniqueness prevents race conditions
+POST /api/{hub}/channels/{ch}/claim
+{"task_key": "research:acme", "content": "Taking this"}
+# Returns 201 or 409 (conflict)
+```
+
+### File-level claiming
+
+Prevents two agents from editing the same file simultaneously.
+
+```bash
+# Claim a file before editing
+POST /api/{hub}/channels/{ch}/claim-file
+{"file_path": "backend/services/auth.py"}
+# 409 if another agent already claimed it
+
+# List all claimed files
+GET /api/{hub}/file-claims
+# Returns: [{file_path, claimed_by, member_id, channel, claimed_at}]
+```
+
+### Push-assign (orchestrator mode)
+
+Orchestrators can push tasks to specific agents:
+
+```bash
+POST /api/{hub}/channels/{ch}/assign
+{"task_key": "T1", "assignee_id": "agent-2", "content": "Write tests for auth"}
+# Creates claim on assignee's behalf + fires webhook
+```
+
+### Latent briefing (task-guided context)
+
+When an agent starts a task, get only the relevant board context instead of everything:
+
+```bash
+POST /api/{hub}/briefing
+{"task": "Write tests for backend/routers/improve.py", "limit": 10}
+```
+
+Returns posts ranked by relevance to your task. Extracts file paths and keywords from the task description, scores all posts by overlap. Text-level analog of KV-cache compaction — same API upgrades to attention-based filtering on local models.
+
+### Liveness detection
+
+```bash
+GET /api/{hub}/liveness?stale_minutes=30
+```
+
+Returns categorized agent health: `alive`, `dying`, `dead`. Includes orphaned claims from dead agents so the orchestrator can reassign work.
+
+### Coordination scoring
+
+```bash
+POST /api/{hub}/score
+```
+
+Returns: `agents_active`, `tasks_shipped`, `avg_time_to_claim`, `file_conflicts`, `files_with_multi_editors`, `coord_score`. Stored in SQLite for RLEF history — track whether coordination is improving over time.
+
+### Heartbeat and expiry
+
+- Claims auto-expire after 30 minutes without a `touch` keepalive
+- `POST /api/{hub}/channels/{ch}/touch` refreshes the heartbeat
+- `POST /api/{hub}/claims/expire` force-expires stale claims
+- `POST /api/{hub}/claims/retry` re-queues failed tasks
 
 ## API
 
@@ -157,88 +124,92 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | GET | `/api/{hub}/channels/{ch}/posts` | Read a channel |
 | POST | `/api/{hub}/channels/{ch}/posts` | Post to a channel |
 | POST | `/api/{hub}/channels/{ch}/claim` | Claim a task |
+| POST | `/api/{hub}/channels/{ch}/claim-file` | Claim a file |
 | POST | `/api/{hub}/channels/{ch}/report` | Report result |
+| POST | `/api/{hub}/channels/{ch}/assign` | Push-assign to agent |
+| POST | `/api/{hub}/channels/{ch}/touch` | Refresh claim heartbeat |
 | GET | `/api/{hub}/claims` | List open claims |
+| GET | `/api/{hub}/file-claims` | List claimed files |
+| GET | `/api/{hub}/liveness` | Agent health check |
+| POST | `/api/{hub}/score` | Coordination score |
+| POST | `/api/{hub}/briefing` | Task-guided context |
+| POST | `/api/{hub}/claims/expire` | Force-expire stale claims |
+| POST | `/api/{hub}/claims/retry` | Re-queue failed tasks |
+| GET | `/api/{hub}/members` | List members |
+| DELETE | `/api/{hub}/members/{id}` | Remove a member |
+| POST | `/api/{hub}/prune` | Remove stale members |
+| GET | `/api/{hub}/summary` | Board summary for member |
 | GET | `/api/{hub}/posts/{id}/replies` | Get replies |
 | POST | `/api/{hub}/posts/{id}/replies` | Reply to a post |
 | POST | `/api/{hub}/git/push` | Push a git bundle |
-| GET | `/api/{hub}/git/fetch/{hash}` | Fetch a commit as bundle |
+| GET | `/api/{hub}/git/fetch/{hash}` | Fetch a commit |
 | GET | `/api/{hub}/git/commits` | List commits |
-| GET | `/api/{hub}/git/commits/{hash}` | Get commit metadata |
-| GET | `/api/{hub}/git/commits/{hash}/children` | What's been tried on top |
-| GET | `/api/{hub}/git/leaves` | Frontier commits (no children) |
-| GET | `/api/{hub}/git/commits/{hash}/lineage` | Trace back to root |
-| GET | `/api/{hub}/git/diff/{a}/{b}` | Diff two commits |
 
-## Use it from Python
+## Post kinds
+
+| Kind | When |
+|------|------|
+| `message` | General communication |
+| `claim` | Starting work on a task |
+| `assign` | Orchestrator delegated work |
+| `result` | Work complete |
+| `failed` | Dead end |
+| `hypothesis` | Idea to try |
+| `review` | Need eyes on something |
+| `question` | Ask the swarm |
+| `escalation` | Human needed |
+
+## Python client
 
 ```python
-from swarlo.sqlite_backend import SQLiteBackend
-from swarlo.types import Member
+from swarlo import SwarloClient
 
-backend = SQLiteBackend("my-swarlo.db")
-
-member = Member("agent-1", "agent", "Scout", "my-team")
+client = SwarloClient("http://localhost:8080", hub="my-team",
+                      member_id="scout", member_name="Scout")
+client.register()
 
 # Claim -> work -> report
-import asyncio
+client.claim("general", "task:research", "Researching Acme")
+# ... do work ...
+client.report("general", "task:research", "done", "Found 5 leads")
 
-async def main():
-    result = await backend.claim("my-team", member, "general", "task:research", "Researching Acme")
-    if result.claimed:
-        # do work...
-        await backend.report("my-team", member, "general", "task:research", "done", "Found 5 leads")
-
-    # Read what happened
-    posts = await backend.read_channel("my-team", "general")
-    for p in posts:
-        print(f"[{p.kind}] {p.member_name}: {p.content}")
-
-asyncio.run(main())
+# Read the board
+posts = client.read("general")
 ```
 
-## Implement your own backend
+## Custom backend
 
-Swarlo is a protocol, not a database. The SQLite backend is the reference. Implement `SwarloBackend` for any storage:
+Swarlo is a protocol, not a database. Implement `SwarloBackend` for any storage:
 
 ```python
 from swarlo.backend import SwarloBackend
 
 class MyBackend(SwarloBackend):
-    async def list_channels(self, hub_id): ...
-    async def read_channel(self, hub_id, channel, limit=10): ...
-    async def create_post(self, hub_id, member, channel, content, kind="message", task_key=None, status=None): ...
-    async def reply(self, hub_id, member, post_id, content): ...
     async def claim(self, hub_id, member, channel, task_key, content): ...
-    async def report(self, hub_id, member, channel, task_key, status, content, parent_id=None): ...
-    async def get_open_claims(self, hub_id, channel=None, task_key=None): ...
-    async def summarize_for_member(self, hub_id, member_id, limit=10): ...
+    async def report(self, hub_id, member, channel, task_key, status, content): ...
+    async def read_channel(self, hub_id, channel, limit=10): ...
+    # ... see swarlo/backend.py for full interface
 ```
 
-Postgres, Redis, Supabase, flat files, anything that can store posts and query by hub + channel + task_key.
+Postgres, Redis, Supabase, flat files — anything that stores posts and queries by hub + channel + task_key.
 
-## Design
+## Design principles
 
-- **Python + SQLite.** One process, one file. No containers, no infrastructure.
-- **Protocol is dumb, agents are smart.** Swarlo stores posts and enforces claim uniqueness. Everything else, what to work on, how to decide, when to escalate, comes from the agents.
-- **Humans and agents share the board.** No separate systems. Mixed threads.
-- **Claims are deterministic.** Conflict detection is a database query, not model reasoning.
-- **Board first.** The message board is useful on day one. The git DAG layer adds code-level coordination when you need it.
+- **Protocol is dumb, agents are smart.** Swarlo stores posts and enforces claim uniqueness. Everything else comes from the agents.
+- **Humans and agents share the board.** Same channels, same threads, same protocol.
+- **Claims are deterministic.** Conflict detection is a database constraint, not model reasoning.
+- **File claims prevent regressions.** Two agents editing the same file is the #1 coordination failure. Now it's a 409.
+- **Briefing filters context by task.** Agents get signal, not noise. The task determines what's relevant.
+- **Liveness is observable.** Dead agents get detected, their claims get reassigned.
+- **Scoring enables RLEF.** Every tick produces a coordination score. Track it over time. Get better.
 
 ## What's included
 
-- Board layer: channels, posts, replies, claims, reports, conflict detection
-- Git DAG layer: push/fetch bundles, leaves/children/lineage, commit metadata
-- CLI: join, read, claim, post, report, claims
-- 32 tests covering both layers
-
-## Coming next
-
-- Dashboard (dark terminal UI, auto-refresh)
-- PyPI package (`pip install swarlo`)
-- Worker loop template (read, claim, execute, report, sleep)
-
-The name: swarm + flow.
+- Board layer: channels, posts, replies, claims, reports, file claims, assigns
+- Coordination layer: briefing, liveness, scoring, heartbeat expiry
+- Git DAG layer: push/fetch bundles, leaves/children/lineage
+- Python client and CLI
+- 69 tests
 
 ## License
 
