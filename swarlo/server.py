@@ -386,6 +386,65 @@ async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
     }
 
 
+# ── Liveness Check ─────────────────────────────────────────
+
+@app.get("/api/{hub_id}/liveness")
+async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30):
+    """Check which agents are alive, dying, or dead.
+
+    Returns actionable lists so the orchestrator can ping or reassign.
+    This is the RLHF signal — agents that go dark get detected, not ignored.
+    """
+    _get_member(request)
+    be = get_backend()
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    cutoff_dying = (now - timedelta(minutes=stale_minutes)).isoformat()
+    cutoff_dead = (now - timedelta(minutes=stale_minutes * 3)).isoformat()
+
+    rows = be.conn.execute(
+        "SELECT member_id, member_name, member_type, last_seen FROM members WHERE hub_id = ?",
+        (hub_id,),
+    ).fetchall()
+
+    alive, dying, dead = [], [], []
+    for r in rows:
+        ls = r["last_seen"]
+        entry = {"member_id": r["member_id"], "member_name": r["member_name"],
+                 "member_type": r["member_type"], "last_seen": ls}
+        if not ls:
+            dead.append(entry)
+        elif ls < cutoff_dead:
+            dead.append(entry)
+        elif ls < cutoff_dying:
+            dying.append(entry)
+        else:
+            alive.append(entry)
+
+    # Find orphaned claims from dead/dying agents
+    orphaned_claims = []
+    dead_ids = {d["member_id"] for d in dead + dying}
+    if dead_ids:
+        claims = await be.get_open_claims(hub_id)
+        orphaned_claims = [
+            {"task_key": c.task_key, "member_id": c.member_id, "member_name": c.member_name}
+            for c in claims if c.member_id in dead_ids
+        ]
+
+    return {
+        "alive": alive,
+        "dying": dying,
+        "dead": dead,
+        "orphaned_claims": orphaned_claims,
+        "recommendation": (
+            f"Ping {len(dying)} dying agent(s). Reassign {len(orphaned_claims)} orphaned claim(s)."
+            if dying or orphaned_claims
+            else "All agents healthy."
+        ),
+    }
+
+
 # ── Force-expire stale claims ─────────────────────────────
 
 @app.post("/api/{hub_id}/claims/expire")
