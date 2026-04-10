@@ -547,6 +547,42 @@ async def compute_score(hub_id: str, request: Request):
         if count > 0:
             avg_time_to_claim = round(total_seconds / count, 1)
 
+    # Conflict detection: find file claims that were contested (409'd)
+    # and edits to same file by different agents within 30 min
+    file_conflicts = be.conn.execute(
+        """
+        SELECT COUNT(DISTINCT task_key) FROM posts
+        WHERE hub_id = ? AND task_key LIKE 'file:%'
+        AND kind = 'claim' AND status = 'open'
+        """,
+        (hub_id,),
+    ).fetchone()[0]
+
+    # Detect revert patterns: same file edited by 2+ different agents
+    revert_risk = be.conn.execute(
+        """
+        SELECT task_key, COUNT(DISTINCT member_id) as editors
+        FROM posts
+        WHERE hub_id = ? AND task_key LIKE 'file:%' AND kind = 'claim'
+        GROUP BY task_key
+        HAVING editors > 1
+        """,
+        (hub_id,),
+    ).fetchall()
+    files_with_multi_editors = len(revert_risk)
+
+    # Coordination score: higher is better
+    # +10 per shipped task, +5 per active agent, -20 per multi-editor file, -5 per unclaimed task
+    unclaimed_tasks = be.conn.execute(
+        "SELECT COUNT(DISTINCT task_key) FROM posts WHERE hub_id = ? AND kind = 'message' AND task_key IS NOT NULL "
+        "AND task_key NOT IN (SELECT task_key FROM posts WHERE hub_id = ? AND kind = 'claim' AND task_key IS NOT NULL)",
+        (hub_id, hub_id),
+    ).fetchone()[0]
+
+    coord_score = (tasks_shipped * 10) + (agents_active * 5) - (files_with_multi_editors * 20) - (unclaimed_tasks * 5)
+
+    now = datetime.now(timezone.utc).isoformat()
+
     # Store score in SQLite for history (create table if needed)
     try:
         be.conn.execute("""
@@ -557,12 +593,16 @@ async def compute_score(hub_id: str, request: Request):
                 tasks_claimed INTEGER,
                 tasks_shipped INTEGER,
                 avg_time_to_claim REAL,
+                file_conflicts INTEGER DEFAULT 0,
+                files_with_multi_editors INTEGER DEFAULT 0,
+                coord_score INTEGER DEFAULT 0,
                 computed_at TEXT NOT NULL
             )
         """)
         be.conn.execute(
-            "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, computed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, now),
         )
         be.conn.commit()
     except Exception:
@@ -574,7 +614,11 @@ async def compute_score(hub_id: str, request: Request):
         "tasks_claimed": tasks_claimed,
         "tasks_shipped": tasks_shipped,
         "avg_time_to_claim": avg_time_to_claim,
-        "computed_at": datetime.now(timezone.utc).isoformat(),
+        "file_conflicts": file_conflicts,
+        "files_with_multi_editors": files_with_multi_editors,
+        "unclaimed_tasks": unclaimed_tasks,
+        "coord_score": coord_score,
+        "computed_at": now,
     }
 
 
