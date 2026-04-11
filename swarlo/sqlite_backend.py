@@ -560,17 +560,29 @@ class SQLiteBackend(SwarloBackend):
 
         A task is "ready" iff:
           - It's assigned to this member (assignee_id = member_id)
-          - It's kind='assign' (i.e. not already claimed/done)
+          - It's kind='assign'
+          - It has NOT yet been reported as done/failed (no done post
+            exists for the same task_key)
           - Every task_key in its depends_on array has a done post
 
         Tasks with no deps are trivially ready. Tasks with deps all done
-        are ready. Tasks with any unmet dep are excluded.
+        are ready. Tasks already finished or blocked by unmet deps are
+        excluded. The "already finished" filter is what makes the agent
+        workflow terminate — otherwise claim_next would keep returning
+        the same done task.
         """
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM posts WHERE hub_id = ? AND assignee_id = ? "
-                "AND kind = 'assign'",
-                (hub_id, member_id),
+                """
+                SELECT * FROM posts
+                WHERE hub_id = ? AND assignee_id = ? AND kind = 'assign'
+                  AND task_key NOT IN (
+                      SELECT task_key FROM posts
+                      WHERE hub_id = ? AND task_key IS NOT NULL
+                        AND status IN ('done', 'failed')
+                  )
+                """,
+                (hub_id, member_id, hub_id),
             ).fetchall()
 
         candidates = [self._row_to_post(r) for r in rows]

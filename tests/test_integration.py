@@ -500,6 +500,46 @@ def test_ready_filters_out_unmet_dep_tasks(live_server):
     assert "task:blocked" not in ready_keys
 
 
+def test_claim_next_picks_ready_and_skips_blocked(live_server):
+    """claim_next returns the ready task and ignores the one blocked by deps.
+
+    Workflow: get a ready task, work it, report done, then ask for the next.
+    When the only remaining task has unmet deps, the second call returns None.
+    """
+    orch = SwarloClient(live_server, hub="claim-next-a")
+    worker = SwarloClient(live_server, hub="claim-next-a")
+    orch.join("orch", name="Orch")
+    worker.join("worker", name="Worker")
+
+    # Assign one task with no deps (ready) and one blocked on an unposted dep
+    orch.assign("general", "task:ready", "worker", "no deps")
+    orch.assign("general", "task:blocked", "worker", "blocked",
+                depends_on=["task:nonexistent"])
+
+    # First call returns the ready task
+    result = worker.claim_next("general")
+    assert result is not None
+    assert result["task_key"] == "task:ready"
+
+    # Agent reports it done (normal workflow — finish before asking for more)
+    worker.report("general", "task:ready", "done", "finished it")
+
+    # Second call returns None — task:blocked still has an unmet dep
+    second = worker.claim_next("general")
+    assert second is None
+
+
+def test_claim_next_returns_none_when_nothing_is_ready(live_server):
+    """claim_next returns None when no assignments have met dependencies."""
+    orch = SwarloClient(live_server, hub="claim-next-empty")
+    worker = SwarloClient(live_server, hub="claim-next-empty")
+    orch.join("orch", name="Orch")
+    worker.join("worker", name="Worker")
+
+    result = worker.claim_next("general")
+    assert result is None
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 

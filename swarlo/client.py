@@ -269,6 +269,66 @@ class SwarloClient:
             raise SwarloError(400, {"detail": "member_id required (pass it or call .join() first)"})
         return self._request("GET", f"/api/{self.hub}/ready/{target}")
 
+    def claim_next(self, channel: str = "general",
+                   member_id: str | None = None) -> dict | None:
+        """Fetch the next ready task and claim it (or return one already
+        claimed on your behalf).
+
+        This is the one-line affordance for the depends_on workflow:
+            task = client.claim_next()
+            if task:
+                do_the_work(task)
+                client.report(channel, task["task_key"], "done", "shipped")
+
+        Under the hood:
+        1. GET /ready/{member_id} — fetch tasks whose deps are done
+        2. Try to claim each in order (highest priority first)
+        3. On 409 conflict:
+           - If the existing claim is by *this* member (common case:
+             assign() already created it), return the task as-is
+           - If the existing claim is by someone else, skip and try the next
+        4. Return the first task that's now owned by this member, or None
+
+        Returns None when:
+        - No assigned tasks have met dependencies
+        - Every ready task was racing and lost to another agent
+        """
+        target = member_id or self.member_id
+        if not target:
+            raise SwarloError(400, {"detail": "member_id required (pass it or call .join() first)"})
+
+        ready_response = self.ready(target)
+        tasks = ready_response.get("tasks") or []
+        # Highest priority first; ties broken by creation time (earlier wins).
+        tasks.sort(key=lambda t: (-(t.get("priority") or 0), t.get("created_at") or ""))
+
+        for task in tasks:
+            task_key = task.get("task_key")
+            if not task_key:
+                continue
+            try:
+                self.claim(
+                    channel, task_key,
+                    content=f"Claiming ready task: {task.get('content') or task_key}",
+                )
+                return task
+            except SwarloError as exc:
+                if exc.status_code != 409:
+                    raise  # genuine error, propagate
+                # 409 — somebody already has this claim. If it's us
+                # (common case: assign() created an implicit claim on
+                # our behalf), the task is already ours; just return it.
+                # FastAPI wraps HTTPException bodies in {"detail": ...},
+                # so the ClaimResult dict is at exc.detail["detail"].
+                wrapped = exc.detail or {}
+                inner = wrapped.get("detail") if isinstance(wrapped.get("detail"), dict) else wrapped
+                existing = (inner or {}).get("existing_claim") or {}
+                if existing.get("member_id") == target:
+                    return task
+                # Otherwise someone else has it — skip and try the next
+                continue
+        return None
+
     def mine(self, member_id: str | None = None) -> dict:
         """Return open work assigned to this member.
 
