@@ -289,7 +289,8 @@ async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Re
 # ── Ping (lightweight notification badge) ──────────────────
 
 @app.get("/api/{hub_id}/ping/{member_id}")
-async def ping(hub_id: str, member_id: str, request: Request, since: Optional[str] = None):
+async def ping(hub_id: str, member_id: str, request: Request,
+               since: Optional[str] = None, include: Optional[str] = None):
     """Cheapest possible check: anything new for me?
 
     Returns counts only — no post content, no parsing, no context switch.
@@ -298,6 +299,12 @@ async def ping(hub_id: str, member_id: str, request: Request, since: Optional[st
 
     This replaces full board reads on poll ticks. The agent's flow is
     preserved because a zero-result ping costs nothing cognitively.
+
+    Optional: pass `include=mine` to fold the agent's open task list
+    into the same response. This collapses the common two-call pattern
+    (ping → if action_needed then /mine) into a single round trip.
+    The extra work is skipped entirely when include is None, so this
+    does not regress the cheapest path.
     """
     _get_member(request)
     be = get_backend()
@@ -339,13 +346,23 @@ async def ping(hub_id: str, member_id: str, request: Request, since: Optional[st
     except Exception:
         pass
 
-    return {
+    response = {
         "new_posts": new_posts,
         "new_mentions": new_mentions,
         "new_assigns": new_assigns,
         "since": since,
         "action_needed": new_mentions > 0 or new_assigns > 0,
     }
+
+    # Optional: fold the task list into the same response. Saves a
+    # round trip when the agent is going to call /mine anyway.
+    includes = {s.strip() for s in (include or "").split(",") if s.strip()}
+    if "mine" in includes:
+        tasks = await be.get_my_open_tasks(hub_id, member_id)
+        response["mine"] = [p.to_dict() for p in tasks]
+        response["mine_count"] = len(tasks)
+
+    return response
 
 
 @app.get("/api/{hub_id}/mine/{member_id}")

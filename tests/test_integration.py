@@ -394,6 +394,41 @@ def test_liveness_auto_expire_can_be_disabled(live_server):
     assert any(c["task_key"] == "task:stays-open" for c in open_after)
 
 
+def test_ping_with_include_mine_folds_task_list_into_response(live_server):
+    """include=mine lets agents get their ping badge AND task list in one
+    call, collapsing the common two-round-trip pattern to one.
+    """
+    orch = SwarloClient(live_server, hub="ping-include")
+    worker = SwarloClient(live_server, hub="ping-include")
+    orch.join("orch", name="Orch")
+    worker.join("worker", name="Worker")
+
+    # Default ping — no task list, unchanged behavior
+    plain = worker.ping("worker")
+    assert "mine" not in plain
+    assert "mine_count" not in plain
+
+    # Worker has nothing yet, ping with include=mine returns empty list
+    baseline = worker.ping("worker", include="mine")
+    assert "mine" in baseline
+    assert baseline["mine"] == []
+    assert baseline["mine_count"] == 0
+
+    # Orchestrator assigns one task and worker claims another
+    orch.assign("general", "task:assigned", "worker", "Do this")
+    worker.claim("general", "task:own-claim", "Also doing this")
+
+    # Now include=mine returns both. Note: assign() creates both a claim
+    # post (on behalf of assignee) AND an assign post, so "task:assigned"
+    # surfaces as two rows — check unique task_keys, not row count.
+    result = worker.ping("worker", include="mine")
+    assert result["action_needed"] is True  # the assignment fires action
+    task_keys = {t["task_key"] for t in result["mine"]}
+    assert "task:assigned" in task_keys
+    assert "task:own-claim" in task_keys
+    assert result["mine_count"] >= 2
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 

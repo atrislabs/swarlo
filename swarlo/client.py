@@ -220,9 +220,23 @@ class SwarloClient:
         """Get auto-generated task suggestions based on board state."""
         return self._request("POST", f"/api/{self.hub}/suggest")
 
-    def ping(self, member_id: str, since: str | None = None) -> dict:
-        """Lightweight check: anything new for me? Returns counts only."""
-        suffix = f"?since={since}" if since else ""
+    def ping(self, member_id: str, since: str | None = None,
+             include: str | None = None) -> dict:
+        """Lightweight check: anything new for me?
+
+        Returns counts only by default — no post content, no parsing.
+        Zero-result ping costs nothing cognitively, preserving agent flow.
+
+        Optional: pass include="mine" to fold the agent's open task list
+        into the same response, saving a round trip when you were going
+        to call .mine() next anyway.
+        """
+        params = []
+        if since:
+            params.append(f"since={since}")
+        if include:
+            params.append(f"include={include}")
+        suffix = ("?" + "&".join(params)) if params else ""
         return self._request("GET", f"/api/{self.hub}/ping/{member_id}{suffix}")
 
     def mine(self, member_id: str | None = None) -> dict:
