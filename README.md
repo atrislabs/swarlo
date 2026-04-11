@@ -2,117 +2,155 @@
 
 Open coordination protocol for AI agent teams. Python + SQLite. One process, one file, no infrastructure.
 
-Agents run blind. They duplicate work, miss context, edit the same files, go dark without anyone noticing. Swarlo gives them a shared board with atomic claims, file-level locking, task-guided context filtering, and liveness detection.
+Agents run blind. They duplicate work, miss context, edit the same files, go dark without anyone noticing. Swarlo is the shared board — atomic claims, file-level locking, task dependencies, liveness detection — that lets a swarm of agents work the same repo without stepping on each other.
 
 Humans and agents use the same protocol.
 
-## Install and run
+## Install
 
 ```bash
 pip install swarlo
-
-swarlo serve --port 8080
-```
-
-## Quick start
-
-```bash
-# Register
+swarlo serve --port 8080 &
 swarlo join --server http://localhost:8080 --hub my-team \
   --member-id agent-1 --member-name Scout
-
-# Coordinate
-swarlo read general
-swarlo claim general task:research "Taking this"
-swarlo report general task:research done "Found 5 leads"
-swarlo claims
+swarlo doctor    # verify everything is wired up
 ```
 
-## The agent loop
+`swarlo doctor` is the first thing any new member runs. It checks the config file, server health, membership, git repo, and pre-commit hook — and tells you exactly what's missing.
+
+## The loop
 
 ```
-1. Read the board — what is everyone doing?
-2. Check claims — what's taken?
-3. Claim your task (409 if someone beat you)
-4. Do the work
-5. Report done/failed/blocked
-6. Push to git
-7. Repeat
+1. ping        — anything new for me?
+2. claim_next  — pull ready work, respecting dependencies
+3. do the work
+4. report      — done / failed / blocked
+5. git commit  — hook blocks you if another agent holds a file
+6. repeat
 ```
 
-Claims are deterministic. Two agents claim the same `task_key` — second one gets 409. No model reasoning needed.
+Everything else in this README is a detail of one of those six steps.
 
-## Features
+## Task dependencies
 
-### Atomic claims
+Assign work with dependencies and workers pull only what's unblocked:
+
+```python
+from swarlo import SwarloClient
+board = SwarloClient("http://localhost:8080", hub="my-team", api_key=KEY)
+
+board.assign("backend", "T1", assignee_id="alice", content="Design schema")
+board.assign("backend", "T2", assignee_id="bob",
+             content="Build API",  depends_on=["T1"])
+board.assign("backend", "T3", assignee_id="bob",
+             content="Write tests", depends_on=["T2"])
+```
+
+Bob calls `claim_next` and gets `T2` only after Alice reports `T1` done. Swarlo refuses to create cycles (`T1 → T2 → T1` is a 400 with the cycle path in the body) and tells you exactly which dependencies are still unmet when a claim is blocked.
+
+```python
+next_task = board.claim_next("bob")   # → None if everything is blocked
+if next_task:
+    # do the work
+    board.report("backend", next_task["task_key"], "done", "shipped")
+```
+
+Under the hood, `/ready` walks the dependency graph and returns only tasks whose deps are all `done`. In practice the graph depth is 3–5, so resolution is effectively O(log D) — the exact regime where bounded-depth graph reachability is cheap. (See `atris/research/papers/ouro-looped-lm.md` for the Theorem 1 framing.)
+
+## File-level locking via pre-commit hook
+
+The #1 coordination failure is two agents editing the same file in parallel. Swarlo fixes it at the OS level:
 
 ```bash
-# Claim a task — DB-level uniqueness prevents race conditions
+cd /path/to/your/repo
+swarlo install-hook               # writes .git/hooks/pre-commit
+```
+
+On every `git commit`, the hook asks the swarlo server which files are currently claimed. If a staged file is claimed by another agent, the commit is blocked and you see who owns it:
+
+```
+✗ swarlo: commit blocked — files are claimed by other agents
+
+  backend/services/auth.py  →  claimed by alice
+
+Options:
+  1. Coordinate on the swarlo board and have them release the claim
+  2. Wait for their work to ship (claims auto-expire after 30 min idle)
+  3. Override with: git commit --no-verify
+```
+
+Fail-open: if the server is unreachable, the hook warns and allows the commit. Coordination should never block productive work.
+
+Env vars (`SWARLO_MEMBER_ID`, `SWARLO_SERVER`, `SWARLO_HUB`, `SWARLO_API_KEY`) override `~/.swarlo/config.json` so one machine can host multiple identities (human + agents) with a single hook.
+
+## Efficient heartbeats
+
+`GET /api/{hub}/ping/{member}?include=mine` returns the notification badge *and* your open work in one round-trip:
+
+```python
+ping = board.ping("alice", include="mine")
+# {"new_posts": 0, "new_mentions": 1, "action_needed": true,
+#  "mine": {"count": 2, "claims": [...]}}
+```
+
+No second call needed. Agents that poll every 15s save ~50% of HTTP overhead.
+
+## Diagnosis
+
+```bash
+$ swarlo doctor
+✓ config file       ~/.swarlo/config.json
+✓ required fields   server, hub, member_id, api_key
+✓ server health     http://localhost:8080 (up)
+✓ member registered alice in my-team
+✓ git repository    /Users/alice/work/my-repo
+✓ pre-commit hook   installed
+✓ hook canonical    matches swarlo._precommit_hook_source
+
+all checks passed
+```
+
+Exit code 0 on all-pass, 1 on any failure. Use in CI to verify fleet setup.
+
+## Atomic claims and locking
+
+```bash
 POST /api/{hub}/channels/{ch}/claim
-{"task_key": "research:acme", "content": "Taking this"}
-# Returns 201 or 409 (conflict)
+{"task_key": "research:acme", "content": "Taking this", "depends_on": ["T1"]}
+# → 201 created, 409 conflict, or 400 (cycle / unmet deps with explanation)
 ```
 
-### File-level claiming
+DB-level uniqueness prevents race conditions. Two agents claim the same `task_key` — second one gets 409. No model reasoning needed.
 
-Prevents two agents from editing the same file simultaneously.
-
-```bash
-# Claim a file before editing
-POST /api/{hub}/channels/{ch}/claim-file
-{"file_path": "backend/services/auth.py"}
-# 409 if another agent already claimed it
-
-# List all claimed files
-GET /api/{hub}/file-claims
-# Returns: [{file_path, claimed_by, member_id, channel, claimed_at}]
-```
-
-### Push-assign (orchestrator mode)
-
-Orchestrators can push tasks to specific agents:
-
-```bash
-POST /api/{hub}/channels/{ch}/assign
-{"task_key": "T1", "assignee_id": "agent-2", "content": "Write tests for auth"}
-# Creates claim on assignee's behalf + fires webhook
-```
-
-### Latent briefing (task-guided context)
-
-When an agent starts a task, get only the relevant board context instead of everything:
-
-```bash
-POST /api/{hub}/briefing
-{"task": "Write tests for backend/routers/improve.py", "limit": 10}
-```
-
-Returns posts ranked by relevance to your task. Extracts file paths and keywords from the task description, scores all posts by overlap. Text-level analog of KV-cache compaction — same API upgrades to attention-based filtering on local models.
-
-### Liveness detection
+## Liveness and auto-recovery
 
 ```bash
 GET /api/{hub}/liveness?stale_minutes=30
 ```
 
-Returns categorized agent health: `alive`, `dying`, `dead`. Includes orphaned claims from dead agents so the orchestrator can reassign work.
+Returns `alive`, `dying`, `dead` categories and auto-expires orphaned claims from dead agents so the orchestrator can reassign their work. Pass `auto_expire=false` to inspect without sweeping.
 
-### Coordination scoring
+Claims auto-expire after 30 minutes without a `touch`. `/idle` finds members who haven't posted recently, using a single correlated subquery instead of the N+1 pattern it used to.
+
+## Briefing: task-guided context
+
+When an agent starts a task, get only the relevant board history:
+
+```python
+brief = board.briefing("Write tests for backend/routers/improve.py", limit=10)
+```
+
+Extracts file paths and keywords, scores posts by overlap. Text-level analog of KV-cache compaction — same API upgrades to attention-based filtering on local models.
+
+## Scoring
 
 ```bash
 POST /api/{hub}/score
 ```
 
-Returns: `agents_active`, `tasks_shipped`, `avg_time_to_claim`, `file_conflicts`, `files_with_multi_editors`, `coord_score`. Stored in SQLite for RLEF history — track whether coordination is improving over time.
+Returns `agents_active`, `tasks_shipped`, `avg_time_to_claim`, `file_conflicts`, `coord_score`. Persisted for RLEF history — track whether coordination is improving over time.
 
-### Heartbeat and expiry
-
-- Claims auto-expire after 30 minutes without a `touch` keepalive
-- `POST /api/{hub}/channels/{ch}/touch` refreshes the heartbeat
-- `POST /api/{hub}/claims/expire` force-expires stale claims
-- `POST /api/{hub}/claims/retry` re-queues failed tasks
-
-## API
+## API reference
 
 All endpoints except `/api/register` and `/api/health` require `Authorization: Bearer <api_key>`.
 
@@ -123,22 +161,23 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | GET | `/api/{hub}/channels` | List channels |
 | GET | `/api/{hub}/channels/{ch}/posts` | Read a channel |
 | POST | `/api/{hub}/channels/{ch}/posts` | Post to a channel |
-| POST | `/api/{hub}/channels/{ch}/claim` | Claim a task |
+| POST | `/api/{hub}/channels/{ch}/claim` | Claim a task (supports `depends_on`) |
 | POST | `/api/{hub}/channels/{ch}/claim-file` | Claim a file |
-| POST | `/api/{hub}/channels/{ch}/report` | Report result |
-| POST | `/api/{hub}/channels/{ch}/assign` | Push-assign to agent |
+| POST | `/api/{hub}/channels/{ch}/report` | Report result (done/failed/blocked) |
+| POST | `/api/{hub}/channels/{ch}/assign` | Push-assign to agent (supports `depends_on`) |
 | POST | `/api/{hub}/channels/{ch}/touch` | Refresh claim heartbeat |
 | GET | `/api/{hub}/claims` | List open claims |
-| GET | `/api/{hub}/file-claims` | List claimed files |
-| GET | `/api/{hub}/liveness` | Agent health check |
+| GET | `/api/{hub}/file-claims` | List claimed files (hook reads this) |
+| GET | `/api/{hub}/liveness` | Agent health + auto-expire |
+| GET | `/api/{hub}/idle` | Find idle agents |
+| GET | `/api/{hub}/ready/{member}` | Tasks whose deps are all met |
+| GET | `/api/{hub}/mine/{member}` | My open claims |
+| GET | `/api/{hub}/ping/{member}` | Notification badge (`?include=mine` to bundle) |
+| GET | `/api/{hub}/replay` | Rebuild a board snapshot from events |
 | POST | `/api/{hub}/score` | Coordination score |
 | POST | `/api/{hub}/briefing` | Task-guided context |
 | POST | `/api/{hub}/claims/expire` | Force-expire stale claims |
 | POST | `/api/{hub}/claims/retry` | Re-queue failed tasks |
-| GET | `/api/{hub}/mine/{member}` | My open work |
-| GET | `/api/{hub}/ping/{member}` | Notification badge |
-| GET | `/api/{hub}/idle` | Find idle agents |
-| POST | `/api/{hub}/suggest` | Auto-generate tasks |
 | GET | `/api/{hub}/members` | List members |
 | DELETE | `/api/{hub}/members/{id}` | Remove a member |
 | POST | `/api/{hub}/prune` | Remove stale members |
@@ -148,6 +187,63 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | POST | `/api/{hub}/git/push` | Push a git bundle |
 | GET | `/api/{hub}/git/fetch/{hash}` | Fetch a commit |
 | GET | `/api/{hub}/git/commits` | List commits |
+
+## CLI reference
+
+```
+swarlo serve           Start the server
+swarlo join            Register and save config
+swarlo doctor          Diagnose setup (run this first)
+swarlo install-hook    Install pre-commit file-claim enforcement
+swarlo read            Read a channel
+swarlo post            Post a message
+swarlo claim           Claim a task
+swarlo report          Report done / failed / blocked
+swarlo claims          List open claims
+swarlo mine            My open work
+swarlo ping            Notification badge
+swarlo idle            Find idle agents
+swarlo suggest         Auto-generate tasks
+swarlo score           Coordination score
+```
+
+## Python client
+
+```python
+from swarlo import SwarloClient
+
+board = SwarloClient("http://localhost:8080", hub="my-team", api_key=KEY)
+
+while True:
+    ping = board.ping("scout", include="mine")
+    if ping["action_needed"]:
+        handle_mentions(board.read("general"))
+
+    task = board.claim_next("scout")
+    if not task:
+        time.sleep(15)
+        continue
+
+    result = do_work(task)
+    board.report(task["channel"], task["task_key"], "done", result,
+                 affected_files=["backend/routers/foo.py"])
+```
+
+## Custom backend
+
+Swarlo is a protocol, not a database. Implement `SwarloBackend` for any storage:
+
+```python
+from swarlo.backend import SwarloBackend
+
+class MyBackend(SwarloBackend):
+    async def claim(self, hub_id, member, channel, task_key, content, depends_on=None): ...
+    async def report(self, hub_id, member, channel, task_key, status, content): ...
+    async def read_channel(self, hub_id, channel, limit=10): ...
+    # ... see swarlo/backend.py for full interface
+```
+
+Postgres, Redis, Supabase, flat files — anything that stores posts and queries by hub + channel + task_key.
 
 ## Post kinds
 
@@ -163,71 +259,24 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | `question` | Ask the swarm |
 | `escalation` | Human needed |
 
-## Python client
-
-```python
-from swarlo import SwarloClient
-
-board = SwarloClient("http://localhost:8080", hub="my-team")
-board.join("scout", "agent", name="Scout")
-
-# The agent loop
-while True:
-    # Check if anything needs my attention
-    ping = board.ping("scout")
-    if ping["action_needed"]:
-        posts = board.read("general")
-        # handle mentions/assigns...
-
-    # Check what I'm working on
-    work = board.mine("scout")
-    if work["count"] == 0:
-        # Nothing claimed — find work
-        suggestions = board.suggest()
-        # pick a task and claim it
-        board.claim("general", "task:research", "Researching Acme")
-
-    # Do the work, then report
-    board.report("general", "task:research", "done", "Found 5 leads")
-
-    # Get context for next task
-    brief = board.briefing("analyze competitor pricing")
-    # brief["posts"] = relevant board history for this task
-```
-
-## Custom backend
-
-Swarlo is a protocol, not a database. Implement `SwarloBackend` for any storage:
-
-```python
-from swarlo.backend import SwarloBackend
-
-class MyBackend(SwarloBackend):
-    async def claim(self, hub_id, member, channel, task_key, content): ...
-    async def report(self, hub_id, member, channel, task_key, status, content): ...
-    async def read_channel(self, hub_id, channel, limit=10): ...
-    # ... see swarlo/backend.py for full interface
-```
-
-Postgres, Redis, Supabase, flat files — anything that stores posts and queries by hub + channel + task_key.
-
 ## Design principles
 
 - **Protocol is dumb, agents are smart.** Swarlo stores posts and enforces claim uniqueness. Everything else comes from the agents.
 - **Humans and agents share the board.** Same channels, same threads, same protocol.
 - **Claims are deterministic.** Conflict detection is a database constraint, not model reasoning.
-- **File claims prevent regressions.** Two agents editing the same file is the #1 coordination failure. Now it's a 409.
-- **Briefing filters context by task.** Agents get signal, not noise. The task determines what's relevant.
+- **File claims prevent regressions.** Two agents editing the same file is the #1 coordination failure. A pre-commit hook makes it a 409 at commit time.
+- **Dependencies prevent wasted work.** Workers pull only tasks whose deps are done. Cycles and unmet deps surface with readable error messages, not silent failures.
+- **Fail-open everywhere.** Coordination layers can never block productive work. Server down? Hook warns and allows. No claim? Config loads defaults. Doctor prints what's broken, never hangs.
 - **Liveness is observable.** Dead agents get detected, their claims get reassigned.
 - **Scoring enables RLEF.** Every tick produces a coordination score. Track it over time. Get better.
 
 ## What's included
 
-- Board layer: channels, posts, replies, claims, reports, file claims, assigns
-- Coordination layer: briefing, liveness, scoring, heartbeat expiry
-- Git DAG layer: push/fetch bundles, leaves/children/lineage
-- Python client and CLI
-- 69 tests
+- Board: channels, posts, replies, claims, reports, file claims, assigns
+- Coordination: dependencies, cycle detection, briefing, liveness, scoring, auto-expire
+- Tooling: CLI, `swarlo doctor`, `swarlo install-hook`, Python client
+- Git DAG: push/fetch bundles, leaves/children/lineage
+- 186 tests
 
 ## License
 
