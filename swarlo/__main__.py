@@ -149,6 +149,16 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--hub")
     report.add_argument("--api-key")
 
+    ping = sub.add_parser("ping", help="Lightweight check: anything new?")
+    ping.add_argument("--member-id", help="Override member ID")
+    ping.add_argument("--server")
+    ping.add_argument("--hub")
+    ping.add_argument("--api-key")
+
+    sub.add_parser("score", help="Coordination score").add_argument("--server")
+    sub.add_parser("idle", help="Find idle agents").add_argument("--server")
+    sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
+
     init = sub.add_parser("init", help="Enable Swarlo for this repo")
 
     return parser
@@ -318,6 +328,64 @@ fi
         if status not in (200, 201):
             raise SystemExit(f"Report failed ({status}): {body}")
         print(f"Reported {args.status} for {args.task_key} on #{args.channel}")
+        return
+
+    if args.command == "ping":
+        runtime = _require_runtime(args)
+        member_id = args.member_id or runtime.get("member_id", "unknown")
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/ping/{member_id}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            raise SystemExit(f"Ping failed ({status}): {body}")
+        if body.get("action_needed"):
+            print(f"ACTION: {body['new_mentions']} mentions, {body['new_assigns']} assigns, {body['new_posts']} posts")
+        else:
+            print("Clear.")
+        return
+
+    if args.command == "score":
+        runtime = _require_runtime(args)
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/score",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            raise SystemExit(f"Score failed ({status}): {body}")
+        print(f"Score: {body['coord_score']} | Shipped: {body['tasks_shipped']} | Active: {body['agents_active']} | Conflicts: {body['file_conflicts']}")
+        return
+
+    if args.command == "idle":
+        runtime = _require_runtime(args)
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/idle",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            raise SystemExit(f"Idle failed ({status}): {body}")
+        if body["idle"]:
+            for a in body["idle"]:
+                print(f"  IDLE: {a['member_name']}")
+        else:
+            print("All agents producing.")
+        return
+
+    if args.command == "suggest":
+        runtime = _require_runtime(args)
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/suggest",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            raise SystemExit(f"Suggest failed ({status}): {body}")
+        for s in body.get("suggestions", []):
+            print(f"  {s['reason']}")
+            print(f"    → {s['suggestion']}")
         return
 
     parser.print_help()
