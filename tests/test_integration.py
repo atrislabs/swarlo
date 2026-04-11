@@ -344,6 +344,56 @@ def test_precommit_hook_blocks_conflicting_files(live_server, tmp_path):
     assert "Alice" in result.stderr or "alice" in result.stderr
 
 
+def test_liveness_auto_expires_stale_claims(live_server):
+    """Hitting /liveness sweeps stale claims so orphans don't accumulate.
+
+    Before this change, a stale claim would sit in 'open' status forever
+    unless someone explicitly hit /claims/expire. Now the orchestrator's
+    regular liveness check doubles as cleanup.
+    """
+    alice = SwarloClient(live_server, hub="liveness-sweep")
+    observer = SwarloClient(live_server, hub="liveness-sweep")
+    alice.join("alice", name="Alice")
+    observer.join("observer", name="Observer")
+
+    # Alice claims a task
+    alice.claim("general", "task:will-go-stale", "Alice working")
+
+    # Initially the claim is open
+    open_before = observer.claims()
+    assert any(c["task_key"] == "task:will-go-stale" for c in open_before)
+
+    # Liveness with stale_minutes=0 treats everything as stale and sweeps
+    result = observer._request(
+        "GET", "/api/liveness-sweep/liveness?stale_minutes=0"
+    )
+    assert "expired_on_sweep" in result
+    assert "task:will-go-stale" in result["expired_on_sweep"]
+
+    # After the sweep, the claim is no longer open
+    open_after = observer.claims()
+    assert not any(c["task_key"] == "task:will-go-stale" for c in open_after)
+
+
+def test_liveness_auto_expire_can_be_disabled(live_server):
+    """auto_expire=false lets consumers observe without cleanup."""
+    alice = SwarloClient(live_server, hub="liveness-observe")
+    observer = SwarloClient(live_server, hub="liveness-observe")
+    alice.join("alice", name="Alice")
+    observer.join("observer", name="Observer")
+
+    alice.claim("general", "task:stays-open", "Alice working")
+
+    result = observer._request(
+        "GET", "/api/liveness-observe/liveness?stale_minutes=0&auto_expire=false"
+    )
+    # No sweep happened
+    assert result.get("expired_on_sweep") == []
+    # Claim still present
+    open_after = observer.claims()
+    assert any(c["task_key"] == "task:stays-open" for c in open_after)
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 

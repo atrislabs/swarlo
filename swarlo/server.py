@@ -543,15 +543,29 @@ async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
 # ── Liveness Check ─────────────────────────────────────────
 
 @app.get("/api/{hub_id}/liveness")
-async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30):
+async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30,
+                          auto_expire: bool = True):
     """Check which agents are alive, dying, or dead.
 
     Returns actionable lists so the orchestrator can ping or reassign.
     This is the RLHF signal — agents that go dark get detected, not ignored.
+
+    Side effect: when auto_expire is True (default), expires any claim
+    whose heartbeat is older than stale_minutes. This makes /liveness a
+    passive cleanup sweep — the orchestrator's health check doubles as
+    garbage collection for dead-agent claims. Pass auto_expire=false if
+    you only want to observe without cleaning up.
     """
     _get_member(request)
     be = get_backend()
     from datetime import datetime, timezone, timedelta
+
+    # Passive cleanup: expire stale claims before computing orphans. This
+    # way the orphaned_claims list reflects what's *still* stuck after
+    # the expiry ran, not what was stale a second ago.
+    expired_keys: list[str] = []
+    if auto_expire:
+        expired_keys = await be.force_expire_claims(hub_id, stale_minutes=stale_minutes)
 
     now = datetime.now(timezone.utc)
     cutoff_dying = (now - timedelta(minutes=stale_minutes)).isoformat()
@@ -579,7 +593,7 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30)
         else:
             alive.append(entry)
 
-    # Find orphaned claims from dead/dying agents
+    # Find orphaned claims from dead/dying agents (after auto-expire cleanup)
     orphaned_claims = []
     dead_ids = {d["member_id"] for d in dead + dying}
     if dead_ids:
@@ -594,6 +608,7 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30)
         "dying": dying,
         "dead": dead,
         "orphaned_claims": orphaned_claims,
+        "expired_on_sweep": expired_keys,
         "recommendation": (
             f"Ping {len(dying)} dying agent(s). Reassign {len(orphaned_claims)} orphaned claim(s)."
             if dying or orphaned_claims

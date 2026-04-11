@@ -195,9 +195,13 @@ class TestLiveness:
                      json={"task_key": "T1", "content": "Working on T1"},
                      headers=_auth(ghost_key))
         # Ghost never seen again (no authed requests to bump last_seen)
-        # But a1 checks liveness
+        # But a1 checks liveness. Pass auto_expire=false because we want to
+        # OBSERVE the orphan here — a separate test covers auto-expire behavior.
         client.get("/api/atris/channels", headers=_auth(key))
-        resp = client.get("/api/atris/liveness?stale_minutes=0", headers=_auth(key))
+        resp = client.get(
+            "/api/atris/liveness?stale_minutes=0&auto_expire=false",
+            headers=_auth(key),
+        )
         data = resp.json()
         # Ghost should be in dying/dead with orphaned claims
         orphan_keys = {o["task_key"] for o in data["orphaned_claims"]}
