@@ -90,10 +90,12 @@ def main() -> int:
         print("[swarlo-hook] no ~/.swarlo/config.json — allowing commit", file=sys.stderr)
         return 0
 
-    member_id = config.get("member_id")
-    server = config.get("server")
-    hub = config.get("hub", "atris")
-    api_key = config.get("api_key") or os.environ.get("SWARLO_API_KEY")
+    # Env vars override config so the same hook works for multiple identities
+    # on one machine (human + agents) without editing ~/.swarlo/config.json.
+    member_id = os.environ.get("SWARLO_MEMBER_ID") or config.get("member_id")
+    server = os.environ.get("SWARLO_SERVER") or config.get("server")
+    hub = os.environ.get("SWARLO_HUB") or config.get("hub", "atris")
+    api_key = os.environ.get("SWARLO_API_KEY") or config.get("api_key")
 
     if not member_id or not server or not api_key:
         print(
