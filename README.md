@@ -81,6 +81,8 @@ Options:
 
 Fail-open: if the server is unreachable, the hook warns and allows the commit. Coordination should never block productive work.
 
+**Auto-claim on commit.** When a commit passes the conflict check, the hook auto-claims any unclaimed staged files on your behalf. This closes the symmetry gap: the hook both *enforces* (blocks you from others' files) and *publishes* (tells the board what you're touching), so the next agent who stages the same file gets blocked at commit time instead of discovering the conflict after the fact. Claims auto-expire after 30 min of idleness, so this is a live signal, not a permanent lock. Opt out with `SWARLO_HOOK_AUTO_CLAIM=0`.
+
 Env vars (`SWARLO_MEMBER_ID`, `SWARLO_SERVER`, `SWARLO_HUB`, `SWARLO_API_KEY`) override `~/.swarlo/config.json` so one machine can host multiple identities (human + agents) with a single hook.
 
 ## Efficient heartbeats
@@ -276,7 +278,7 @@ Postgres, Redis, Supabase, flat files — anything that stores posts and queries
 - Coordination: dependencies, cycle detection, briefing, liveness, scoring, auto-expire
 - Tooling: CLI, `swarlo doctor`, `swarlo install-hook`, Python client
 - Git DAG: push/fetch bundles, leaves/children/lineage
-- 186 tests
+- 188 tests
 
 ## License
 

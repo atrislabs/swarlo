@@ -344,6 +344,107 @@ def test_precommit_hook_blocks_conflicting_files(live_server, tmp_path):
     assert "Alice" in result.stderr or "alice" in result.stderr
 
 
+def test_precommit_hook_auto_claims_staged_files(live_server, tmp_path):
+    """When the hook runs a passing commit, it should auto-claim staged
+    files on behalf of the committer so the next agent's hook can see
+    them as held. This closes the symmetry gap: the hook both enforces
+    and publishes.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    alice = SwarloClient(live_server, hub="autoclaim-test")
+    observer = SwarloClient(live_server, hub="autoclaim-test")
+    alice_key = alice.join("alice", name="Alice")
+    observer.join("observer", name="Observer")
+
+    # Before: no file claims on the board
+    initial_paths = {c["file_path"] for c in observer.file_claims()}
+    assert "src/new_feature.py" not in initial_paths
+
+    # Alice's config for the hook
+    fake_home = tmp_path / "home"
+    (fake_home / ".swarlo").mkdir(parents=True)
+    (fake_home / ".swarlo" / "config.json").write_text(json.dumps({
+        "server": live_server,
+        "hub": "autoclaim-test",
+        "member_id": "alice",
+        "api_key": alice_key,
+    }))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "a@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "A"], cwd=repo, check=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "new_feature.py").write_text("# alice writes\n")
+
+    hook = Path(__file__).resolve().parent.parent / "scripts" / "swarlo-precommit-hook"
+    env = {**os.environ, "HOME": str(fake_home)}
+
+    subprocess.run(["git", "add", "src/new_feature.py"], cwd=repo, check=True)
+    result = subprocess.run(
+        [str(hook)], cwd=repo, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, f"hook should pass, got {result.returncode}\n{result.stderr}"
+
+    # After: the staged file is now claimed by Alice
+    after = observer.file_claims()
+    after_by_path = {c["file_path"]: c for c in after}
+    assert "src/new_feature.py" in after_by_path, (
+        f"auto-claim did not publish: {after}"
+    )
+    assert after_by_path["src/new_feature.py"]["member_id"] == "alice"
+
+
+def test_precommit_hook_autoclaim_opt_out(live_server, tmp_path):
+    """SWARLO_HOOK_AUTO_CLAIM=0 disables the auto-claim side-effect."""
+    import json
+    import subprocess
+    from pathlib import Path
+
+    alice = SwarloClient(live_server, hub="autoclaim-off")
+    observer = SwarloClient(live_server, hub="autoclaim-off")
+    alice_key = alice.join("alice", name="Alice")
+    observer.join("observer", name="Observer")
+
+    fake_home = tmp_path / "home"
+    (fake_home / ".swarlo").mkdir(parents=True)
+    (fake_home / ".swarlo" / "config.json").write_text(json.dumps({
+        "server": live_server,
+        "hub": "autoclaim-off",
+        "member_id": "alice",
+        "api_key": alice_key,
+    }))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "a@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "A"], cwd=repo, check=True)
+    (repo / "quiet.py").write_text("# no publish\n")
+
+    hook = Path(__file__).resolve().parent.parent / "scripts" / "swarlo-precommit-hook"
+    env = {
+        **os.environ,
+        "HOME": str(fake_home),
+        "SWARLO_HOOK_AUTO_CLAIM": "0",
+    }
+
+    subprocess.run(["git", "add", "quiet.py"], cwd=repo, check=True)
+    result = subprocess.run(
+        [str(hook)], cwd=repo, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0
+
+    after_paths = {c["file_path"] for c in observer.file_claims()}
+    assert "quiet.py" not in after_paths, (
+        "auto-claim should be disabled by SWARLO_HOOK_AUTO_CLAIM=0"
+    )
+
+
 def test_liveness_auto_expires_stale_claims(live_server):
     """Hitting /liveness sweeps stale claims so orphans don't accumulate.
 

@@ -84,6 +84,34 @@ def _fetch_file_claims(server: str, hub: str, api_key: str) -> list[dict] | None
         return None
 
 
+def _claim_file(server: str, hub: str, api_key: str, file_path: str) -> bool:
+    """POST a file claim so other agents see we are touching this file.
+
+    Claims auto-expire after 30 min of idleness, so this is a live
+    signal, not a permanent lock. Fail-silent on any error: publishing
+    is best-effort and must never block a commit.
+    """
+    url = f"{server.rstrip('/')}/api/{hub}/channels/general/claim-file"
+    body = json.dumps({
+        "file_path": file_path,
+        "content": "auto-claimed by pre-commit hook",
+    }).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            return resp.status in (200, 201)
+    except Exception:
+        return False
+
+
 def main() -> int:
     config = _load_config()
     if not config:
@@ -116,22 +144,28 @@ def main() -> int:
         )
         return 0
 
-    # Build {file_path: claim_dict} for files claimed by OTHER members
+    # Files claimed by anyone (so we know what NOT to re-claim) and the
+    # subset claimed by OTHER members (so we know what to block on).
+    all_claimed_files: set[str] = set()
     others_claims: dict[str, dict] = {}
     for c in claims:
-        if c.get("member_id") != member_id and c.get("file_path"):
-            others_claims[c["file_path"]] = c
+        fp = c.get("file_path")
+        if not fp:
+            continue
+        all_claimed_files.add(fp)
+        if c.get("member_id") != member_id:
+            others_claims[fp] = c
 
-    if not others_claims:
-        return 0
-
-    # Check intersection with staged files
-    conflicts = []
-    for f in staged:
-        if f in others_claims:
-            conflicts.append((f, others_claims[f]))
+    conflicts = [(f, others_claims[f]) for f in staged if f in others_claims]
 
     if not conflicts:
+        # No conflicts. Publish my intent to work on the staged files
+        # so the next agent's hook sees them as held. Opt-out with
+        # SWARLO_HOOK_AUTO_CLAIM=0. Fail-silent — never block a commit.
+        if os.environ.get("SWARLO_HOOK_AUTO_CLAIM", "1") != "0":
+            unclaimed = [f for f in staged if f not in all_claimed_files]
+            for f in unclaimed:
+                _claim_file(server, hub, api_key, f)
         return 0
 
     # Block the commit and print who owns each file
