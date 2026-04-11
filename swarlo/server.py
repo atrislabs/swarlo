@@ -1097,22 +1097,10 @@ async def compute_score(hub_id: str, request: Request):
 
     now = datetime.now(timezone.utc).isoformat()
 
-    # Store score in SQLite for history (create table if needed)
+    # Store score in SQLite for history. The scores table is created in
+    # the SCHEMA block at startup (sqlite_backend.py) — no need to
+    # CREATE TABLE IF NOT EXISTS on every request.
     try:
-        be.conn.execute("""
-            CREATE TABLE IF NOT EXISTS scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                hub_id TEXT NOT NULL,
-                agents_active INTEGER,
-                tasks_claimed INTEGER,
-                tasks_shipped INTEGER,
-                avg_time_to_claim REAL,
-                file_conflicts INTEGER DEFAULT 0,
-                files_with_multi_editors INTEGER DEFAULT 0,
-                coord_score INTEGER DEFAULT 0,
-                computed_at TEXT NOT NULL
-            )
-        """)
         be.conn.execute(
             "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, computed_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

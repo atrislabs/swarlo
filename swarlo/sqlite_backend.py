@@ -67,6 +67,19 @@ CREATE TABLE IF NOT EXISTS commits (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hub_id TEXT NOT NULL,
+    agents_active INTEGER,
+    tasks_claimed INTEGER,
+    tasks_shipped INTEGER,
+    avg_time_to_claim REAL,
+    file_conflicts INTEGER DEFAULT 0,
+    files_with_multi_editors INTEGER DEFAULT 0,
+    coord_score INTEGER DEFAULT 0,
+    computed_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_posts_hub_channel ON posts(hub_id, channel);
 CREATE INDEX IF NOT EXISTS idx_posts_hub_task_key ON posts(hub_id, task_key);
 CREATE INDEX IF NOT EXISTS idx_posts_kind_status ON posts(kind, status);
