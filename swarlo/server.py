@@ -482,99 +482,87 @@ async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
 class BriefingRequest(BaseModel):
     task: str  # what the agent is about to work on
     limit: int = 15
+    scorer: str = "tfidf"  # "tfidf" (default, Phase 2) or "regex" (v1 baseline)
 
 
 @app.post("/api/{hub_id}/briefing")
 async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
     """Return board posts ranked by relevance to a task description.
 
-    Extracts file paths and keywords from the task, scores all posts
-    by overlap, returns the most relevant ones. This is the text-level
-    analog of KV-cache compaction from Latent Briefing (Geist 2026):
-    the task prompt determines what's relevant from shared context.
+    The task prompt determines what's relevant from shared context — a
+    text-level analog of KV-cache compaction from Latent Briefing
+    (Geist 2026). Two scorers share the endpoint:
 
-    Same API shape upgrades to attention-based filtering when running
-    on a local model (Sovereign/Qwen).
+    - `tfidf` (default) — TF-IDF cosine similarity with light stemming.
+      Handles synonyms and suffix variation ("dropping" ≈ "dropped").
+    - `regex` — original keyword/file-path overlap. Kept for A/B and
+      for tasks that name exact file paths.
+
+    Phase 3 will add `attention` (compaction against a local model)
+    once Sovereign is back online.
     """
-    import re
+    from . import _briefing
+    import re as _re
     member = _get_member(request)
     be = get_backend()
 
-    # --- Extract signals from task description ---
-    # File paths: anything that looks like a/b.py or a/b/c
-    file_pats = re.findall(r'[\w./]+\.(?:py|ts|js|md|json|yaml|sql)\b', body.task)
-    # Also match directory-style paths
-    dir_pats = re.findall(r'(?:backend|atris|swarlo|scripts|tests)/[\w/]+', body.task)
-    all_paths = list(set(file_pats + dir_pats))
+    # Diagnostic extracts — kept in response for debugging/observability.
+    file_pats = _re.findall(r'[\w./]+\.(?:py|ts|js|md|json|yaml|sql)\b', body.task)
+    dir_pats = _re.findall(r'(?:backend|atris|swarlo|scripts|tests)/[\w/]+', body.task)
+    extracted_paths = sorted(set(file_pats + dir_pats))
+    raw_words = {w.lower() for w in _re.findall(r'\b\w{3,}\b', body.task)}
+    extracted_keywords = sorted(raw_words - _briefing._STOPWORDS)[:20]
 
-    # Keywords: split, lowercase, drop short/common words
-    stopwords = {'the','a','an','is','are','was','were','be','been','and','or','but',
-                 'in','on','at','to','for','of','with','by','from','this','that','it',
-                 'not','no','do','does','did','will','would','should','can','could',
-                 'has','have','had','all','each','every','any','some','into','about',
-                 'up','out','if','then','than','so','as','just','also','how','what',
-                 'when','where','which','who','why','may','must','shall','very','too',
-                 'only','own','same','few','more','most','other','such','test','tests',
-                 'file','files','code','add','fix','bug','new','run','check','make',
-                 'write','read','use','get','set','put','update','create','delete'}
-    words = set(w.lower() for w in re.findall(r'\b\w{3,}\b', body.task)) - stopwords
-
-    # --- Score all recent posts ---
     rows = be.conn.execute(
         "SELECT * FROM posts WHERE hub_id = ? ORDER BY created_at DESC LIMIT 200",
         (hub_id,),
     ).fetchall()
+    if not rows:
+        return {
+            "task": body.task,
+            "scorer": body.scorer,
+            "extracted_paths": extracted_paths,
+            "extracted_keywords": extracted_keywords,
+            "count": 0,
+            "posts": [],
+        }
 
-    scored = []
-    for r in rows:
-        score = 0.0
-        content_lower = (r["content"] or "").lower()
-        task_key = r["task_key"] or ""
+    candidates = [(r["content"] or "") for r in rows]
+    scores = _briefing.score(body.task, candidates, scorer=body.scorer)
 
-        # File path matches (strongest signal — like attention to specific keys)
-        for fp in all_paths:
-            if fp.lower() in content_lower or fp.lower() in task_key.lower():
-                score += 3.0
+    # Metadata file-overlap bonus is scorer-agnostic — files explicitly
+    # tracked on a post are still a strong positive signal.
+    task_paths = set(extracted_paths)
+    if task_paths:
+        for i, r in enumerate(rows):
+            if r["metadata"]:
+                try:
+                    meta = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
+                    meta_files = meta.get("affected_files", []) or []
+                    hits = sum(1 for fp in task_paths if any(fp in mf for mf in meta_files))
+                    if hits:
+                        scores[i] = scores[i] + 0.3 * hits  # small additive bump
+                except Exception:
+                    pass
 
-        # Keyword matches (weaker signal — like distributed attention)
-        matches = sum(1 for w in words if w in content_lower)
-        if words:
-            score += min(matches / len(words) * 2.0, 2.0)  # cap at 2.0
-
-        # Metadata file overlap
-        if r["metadata"]:
-            try:
-                meta = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
-                meta_files = meta.get("affected_files", [])
-                for fp in all_paths:
-                    if any(fp in mf for mf in meta_files):
-                        score += 3.0
-            except Exception:
-                pass
-
-        # Result/claim posts get slight boost (more actionable than messages)
-        if r["kind"] in ("result", "claim", "assign"):
-            score += 0.5
-
-        if score > 0.5:  # threshold — like MAD normalization in the paper
-            scored.append((score, r))
-
-    # Sort by score descending, take top N
+    # Keep non-zero scores, sort descending, take top N
+    scored = [(s, r) for s, r in zip(scores, rows) if s > 0]
     scored.sort(key=lambda x: -x[0])
-    top = scored[:body.limit]
+    top = scored[: body.limit]
 
     return {
         "task": body.task,
-        "extracted_paths": all_paths,
-        "extracted_keywords": sorted(words)[:20],
+        "scorer": body.scorer,
+        "extracted_paths": extracted_paths,
+        "extracted_keywords": extracted_keywords,
         "count": len(top),
         "posts": [
             {
-                "score": round(s, 2),
+                "score": round(s, 4),
                 "member_name": r["member_name"],
                 "kind": r["kind"],
                 "task_key": r["task_key"],
-                "content": r["content"][:300],
+                "content": (r["content"] or "")[:300],
                 "channel": r["channel"],
                 "created_at": r["created_at"],
             }

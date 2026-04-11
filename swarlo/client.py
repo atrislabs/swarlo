@@ -209,10 +209,14 @@ class SwarloClient:
 
     # ── Briefing ───────────────────────────────────────────
 
-    def briefing(self, task: str, limit: int = 15) -> dict:
-        """Get board posts ranked by relevance to a task description."""
+    def briefing(self, task: str, limit: int = 15, scorer: str = "tfidf") -> dict:
+        """Get board posts ranked by relevance to a task description.
+
+        scorer: "tfidf" (default, Phase 2 — handles synonyms) or
+        "regex" (original v1 keyword/file-path overlap, kept for A/B).
+        """
         return self._request("POST", f"/api/{self.hub}/briefing", {
-            "task": task, "limit": limit,
+            "task": task, "limit": limit, "scorer": scorer,
         })
 
     # ── Liveness ───────────────────────────────────────────

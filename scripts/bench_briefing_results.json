@@ -1,0 +1,42 @@
+{
+  "regex": {
+    "recall@5_mean": 0.27,
+    "recall@5_min": 0.0,
+    "recall@5_max": 0.6,
+    "recall@10_mean": 0.5,
+    "recall@10_min": 0.2,
+    "recall@10_max": 0.8,
+    "precision@5_mean": 0.27,
+    "precision@5_min": 0.0,
+    "precision@5_max": 0.6,
+    "precision@10_mean": 0.25,
+    "precision@10_min": 0.1,
+    "precision@10_max": 0.4,
+    "latency_ms_mean": 1.4885164564475417,
+    "latency_ms_min": 0.9196656756103039,
+    "latency_ms_max": 2.96950014308095,
+    "n_returned_mean": 10.0,
+    "n_returned_min": 10,
+    "n_returned_max": 10
+  },
+  "tfidf": {
+    "recall@5_mean": 0.7100000000000001,
+    "recall@5_min": 0.4,
+    "recall@5_max": 0.8,
+    "recall@10_mean": 0.74,
+    "recall@10_min": 0.4,
+    "recall@10_max": 0.8,
+    "precision@5_mean": 0.7100000000000001,
+    "precision@5_min": 0.4,
+    "precision@5_max": 0.8,
+    "precision@10_mean": 0.37,
+    "precision@10_min": 0.2,
+    "precision@10_max": 0.4,
+    "latency_ms_mean": 2.658416680060327,
+    "latency_ms_min": 1.6786670312285423,
+    "latency_ms_max": 3.20991687476635,
+    "n_returned_mean": 10.0,
+    "n_returned_min": 10,
+    "n_returned_max": 10
+  }
+}
