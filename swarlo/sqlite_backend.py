@@ -552,26 +552,40 @@ class SQLiteBackend(SwarloBackend):
         return expired_keys
 
     async def get_ready_tasks(self, hub_id: str, member_id: str) -> list[Post]:
-        """Return tasks assigned to a member where every dep is done.
+        """Return tasks assigned to a member where every direct dep is done.
 
-        This is the Theorem 1 / O(log D) story applied to a small graph:
-        our dependency chains are short enough that a single recursive
-        walk answers "what can this agent claim right now?" optimally.
+        Two-query implementation: one query fetches the set of all done
+        task_keys for the hub, a second query fetches this member's
+        candidate assignments. Readiness is then a pure Python set
+        membership check per candidate — no per-candidate round trip,
+        no recursive self-reference, no extra work.
 
         A task is "ready" iff:
           - It's assigned to this member (assignee_id = member_id)
           - It's kind='assign'
-          - It has NOT yet been reported as done/failed (no done post
-            exists for the same task_key)
-          - Every task_key in its depends_on array has a done post
+          - It has NOT yet been reported as done/failed
+          - Every task_key in its depends_on array is directly done
 
-        Tasks with no deps are trivially ready. Tasks with deps all done
-        are ready. Tasks already finished or blocked by unmet deps are
-        excluded. The "already finished" filter is what makes the agent
-        workflow terminate — otherwise claim_next would keep returning
-        the same done task.
+        Transitive readiness across a dep chain resolves naturally via
+        the workflow: an agent calls claim_next, ships, reports done,
+        calls claim_next again. The recursive SQL version was attempted
+        (see atris/research/papers/ouro-looped-lm.md, Ouro tick 6) but
+        SQLite forbids recursive CTE self-reference inside subqueries,
+        making the json_each-based formulation impossible without an
+        auxiliary fixpoint. The two-query approach is the same order of
+        complexity (O(candidates + deps)) without the round-trip explosion
+        the previous N+1 implementation had.
         """
         with self._lock:
+            # Query 1: every task_key that's currently done in this hub
+            done_rows = self.conn.execute(
+                "SELECT DISTINCT task_key FROM posts "
+                "WHERE hub_id = ? AND task_key IS NOT NULL AND status = 'done'",
+                (hub_id,),
+            ).fetchall()
+            done_set = {r["task_key"] for r in done_rows}
+
+            # Query 2: my candidate assignments (not yet done/failed)
             rows = self.conn.execute(
                 """
                 SELECT * FROM posts
@@ -585,24 +599,19 @@ class SQLiteBackend(SwarloBackend):
                 (hub_id, member_id, hub_id),
             ).fetchall()
 
-        candidates = [self._row_to_post(r) for r in rows]
         ready: list[Post] = []
-        for post in candidates:
-            raw_deps = None
-            if post.metadata and isinstance(post.metadata, dict):
-                raw_deps = post.metadata.get("depends_on")
-            # The canonical location is the depends_on column; fall back to metadata
-            row_deps = next((r["depends_on"] for r in rows if r["post_id"] == post.post_id), None)
+        for row in rows:
+            depends_on_raw = row["depends_on"]
+            if not depends_on_raw:
+                ready.append(self._row_to_post(row))
+                continue
             try:
-                deps = json.loads(row_deps) if row_deps else (raw_deps or [])
+                deps = json.loads(depends_on_raw)
             except Exception:
                 deps = []
-            if not deps:
-                ready.append(post)
-                continue
-            unmet = await self._unmet_deps(hub_id, deps)
-            if not unmet:
-                ready.append(post)
+            # Set-membership check — O(deps) per candidate, no extra queries
+            if all(d in done_set for d in deps):
+                ready.append(self._row_to_post(row))
         return ready
 
     async def get_my_open_tasks(self, hub_id: str, member_id: str) -> list[Post]:
