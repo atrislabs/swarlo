@@ -99,6 +99,7 @@ class PostRequest(BaseModel):
 class ClaimRequest(BaseModel):
     task_key: str
     content: str
+    depends_on: Optional[list[str]] = None
 
 
 class ReportRequest(BaseModel):
@@ -113,6 +114,7 @@ class AssignRequest(BaseModel):
     task_key: str
     assignee_id: str
     content: str
+    depends_on: Optional[list[str]] = None
 
 
 class ReplyRequest(BaseModel):
@@ -178,7 +180,10 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
 @app.post("/api/{hub_id}/channels/{channel}/claim", status_code=201)
 async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Request):
     member = _get_member(request)
-    result = await get_backend().claim(hub_id, member, channel, body.task_key, body.content)
+    result = await get_backend().claim(
+        hub_id, member, channel, body.task_key, body.content,
+        depends_on=body.depends_on,
+    )
     if result.conflict:
         raise HTTPException(409, result.to_dict())
     return result.to_dict()
@@ -232,7 +237,8 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
     """Push-assign a task to a specific member. Creates a claim on their behalf and notifies via webhook."""
     assigner = _get_member(request)
     be = get_backend()
-    result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content)
+    result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
+                             depends_on=body.depends_on)
     if not result.claimed:
         if result.conflict:
             raise HTTPException(409, result.to_dict())
@@ -365,6 +371,25 @@ async def ping(hub_id: str, member_id: str, request: Request,
     return response
 
 
+@app.get("/api/{hub_id}/ready/{member_id}")
+async def my_ready_tasks(hub_id: str, member_id: str, request: Request):
+    """Return tasks assigned to this member where every dependency is done.
+
+    This is /mine filtered by dependency readiness. Use it as the
+    "what can I claim right now?" query instead of /mine when your
+    workflow uses task dependencies. Short-circuits the "try to claim,
+    get blocked, move on" loop into one call.
+    """
+    _get_member(request)
+    be = get_backend()
+    posts = await be.get_ready_tasks(hub_id, member_id)
+    return {
+        "member_id": member_id,
+        "count": len(posts),
+        "tasks": [p.to_dict() for p in posts],
+    }
+
+
 @app.get("/api/{hub_id}/mine/{member_id}")
 async def my_open_tasks(hub_id: str, member_id: str, request: Request):
     """Return open work assigned to this member.
@@ -375,6 +400,7 @@ async def my_open_tasks(hub_id: str, member_id: str, request: Request):
     - Assignment posts addressed to them via the assignee_id column
 
     Combine with /ping for the full notification badge → work-list flow.
+    Use /ready instead if you want only the subset whose deps are done.
     """
     _get_member(request)
     be = get_backend()

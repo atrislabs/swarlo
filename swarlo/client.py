@@ -125,11 +125,18 @@ class SwarloClient:
             body["metadata"] = metadata
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/posts", body)
 
-    def claim(self, channel: str, task_key: str, content: str) -> dict:
-        """Claim a task. Raises SwarloError(409) if already claimed."""
-        return self._request("POST", f"/api/{self.hub}/channels/{channel}/claim", {
-            "task_key": task_key, "content": content,
-        })
+    def claim(self, channel: str, task_key: str, content: str,
+              depends_on: list[str] | None = None) -> dict:
+        """Claim a task. Raises SwarloError(409) if already claimed or if
+        any declared dependency is not yet done.
+
+        depends_on: list of task_keys this task waits on. A dep is
+            satisfied iff some post with that task_key has status='done'.
+        """
+        body: dict = {"task_key": task_key, "content": content}
+        if depends_on:
+            body["depends_on"] = depends_on
+        return self._request("POST", f"/api/{self.hub}/channels/{channel}/claim", body)
 
     def report(self, channel: str, task_key: str, status: str, content: str,
                affected_files: list[str] | None = None,
@@ -147,11 +154,21 @@ class SwarloClient:
             body["metadata"] = metadata
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/report", body)
 
-    def assign(self, channel: str, task_key: str, assignee_id: str, content: str) -> dict:
-        """Push-assign a task to a specific member. Creates a claim on their behalf."""
-        return self._request("POST", f"/api/{self.hub}/channels/{channel}/assign", {
+    def assign(self, channel: str, task_key: str, assignee_id: str, content: str,
+               depends_on: list[str] | None = None) -> dict:
+        """Push-assign a task to a specific member. Creates a claim on their behalf.
+
+        depends_on is recorded on the assignment post so the assignee's
+        /ready endpoint can filter it out until all deps are done.
+        Assignments themselves are never blocked by unmet deps — they're
+        push notifications that work can eventually be done.
+        """
+        body: dict = {
             "task_key": task_key, "assignee_id": assignee_id, "content": content,
-        })
+        }
+        if depends_on:
+            body["depends_on"] = depends_on
+        return self._request("POST", f"/api/{self.hub}/channels/{channel}/assign", body)
 
     def touch(self, channel: str, task_key: str) -> dict:
         """Refresh a claim's heartbeat to prevent stale expiry."""
@@ -238,6 +255,19 @@ class SwarloClient:
             params.append(f"include={include}")
         suffix = ("?" + "&".join(params)) if params else ""
         return self._request("GET", f"/api/{self.hub}/ping/{member_id}{suffix}")
+
+    def ready(self, member_id: str | None = None) -> dict:
+        """Return tasks assigned to this member where every dep is done.
+
+        Use this instead of .mine() when your workflow uses dependencies
+        and you want the subset that can actually be claimed right now.
+        Short-circuits the "try to claim, get blocked, move on" loop
+        into a single call that returns only the ready tasks.
+        """
+        target = member_id or self.member_id
+        if not target:
+            raise SwarloError(400, {"detail": "member_id required (pass it or call .join() first)"})
+        return self._request("GET", f"/api/{self.hub}/ready/{target}")
 
     def mine(self, member_id: str | None = None) -> dict:
         """Return open work assigned to this member.

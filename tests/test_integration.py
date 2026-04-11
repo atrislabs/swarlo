@@ -429,6 +429,77 @@ def test_ping_with_include_mine_folds_task_list_into_response(live_server):
     assert result["mine_count"] >= 2
 
 
+def test_claim_blocks_on_unmet_dependency(live_server):
+    """A task with unmet deps cannot be claimed directly."""
+    alice = SwarloClient(live_server, hub="deps-claim")
+    alice.join("alice", name="Alice")
+
+    # Try to claim task:B which depends on task:A (which hasn't been done)
+    with pytest.raises(SwarloError) as exc_info:
+        alice.claim("general", "task:B", "trying to start", depends_on=["task:A"])
+    assert exc_info.value.status_code == 409
+    assert "task:A" in str(exc_info.value)
+
+
+def test_claim_succeeds_after_dep_is_done(live_server):
+    """Once a dep has a done post, a claim with that dep works."""
+    alice = SwarloClient(live_server, hub="deps-unblock")
+    alice.join("alice", name="Alice")
+
+    # Complete task:A first
+    alice.claim("general", "task:A", "doing A")
+    alice.report("general", "task:A", "done", "A finished")
+
+    # Now task:B can claim with task:A as a dep
+    result = alice.claim("general", "task:B", "starting B", depends_on=["task:A"])
+    assert result["claimed"] is True
+
+
+def test_assign_records_deps_but_does_not_block(live_server):
+    """Assigning a task with unmet deps succeeds — assignments are push
+    notifications, not readiness gates. /ready does the filtering.
+    """
+    orch = SwarloClient(live_server, hub="deps-assign")
+    worker = SwarloClient(live_server, hub="deps-assign")
+    orch.join("orch", name="Orch")
+    worker.join("worker", name="Worker")
+
+    # Assign task:C which depends on task:A (not done). Assignment should
+    # succeed even though the dep isn't met.
+    result = orch.assign("general", "task:C", "worker", "please do C",
+                        depends_on=["task:A"])
+    assert result["claimed"] is True
+
+
+def test_ready_filters_out_unmet_dep_tasks(live_server):
+    """/ready returns only the subset of /mine whose deps are all done."""
+    orch = SwarloClient(live_server, hub="deps-ready")
+    worker = SwarloClient(live_server, hub="deps-ready")
+    orch.join("orch", name="Orch")
+    worker.join("worker", name="Worker")
+
+    # Three assignments:
+    # - task:free has no deps → always ready
+    # - task:blocked depends on task:A (not done) → never ready until A ships
+    # - task:unblocked depends on task:B (already done) → ready now
+    orch.assign("general", "task:free", "worker", "no deps")
+
+    # Do task:B first so the unblocked path works
+    orch.assign("general", "task:B", "worker", "first task")
+    worker.report("general", "task:B", "done", "B finished")
+
+    orch.assign("general", "task:unblocked", "worker", "depends on B",
+                depends_on=["task:B"])
+    orch.assign("general", "task:blocked", "worker", "depends on A",
+                depends_on=["task:A"])
+
+    ready = worker.ready()
+    ready_keys = {t["task_key"] for t in ready["tasks"]}
+    assert "task:free" in ready_keys
+    assert "task:unblocked" in ready_keys
+    assert "task:blocked" not in ready_keys
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 

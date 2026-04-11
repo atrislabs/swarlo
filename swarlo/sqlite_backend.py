@@ -137,6 +137,14 @@ class SQLiteBackend(SwarloBackend):
                 self._conn.execute("ALTER TABLE members ADD COLUMN last_active TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                # Dependency edge for the coordination graph. JSON-encoded
+                # list of task_keys this task waits on. Enables recursive
+                # CTE reachability queries — "what can I claim right now?"
+                # — in O(log D) iterations where D is the dep-chain depth.
+                self._conn.execute("ALTER TABLE posts ADD COLUMN depends_on TEXT")
+            except sqlite3.OperationalError:
+                pass
         return self._conn
 
     @property
@@ -277,7 +285,8 @@ class SQLiteBackend(SwarloBackend):
                           content: str, kind: str = "message",
                           task_key: str | None = None, status: str | None = None,
                           metadata: dict | None = None, priority: int = 0,
-                          assignee_id: str | None = None) -> Post:
+                          assignee_id: str | None = None,
+                          depends_on: list[str] | None = None) -> Post:
         from .types import extract_mentions
         post_id = _uid()
         now = _utcnow()
@@ -288,11 +297,13 @@ class SQLiteBackend(SwarloBackend):
 
         metadata_json = json.dumps(metadata) if metadata is not None else None
         mentions_json = json.dumps(mention_ids) if mention_ids else None
+        # Dependencies stored as JSON array of task_keys. None = no deps.
+        depends_on_json = json.dumps(depends_on) if depends_on else None
 
         with self._lock:
             self.conn.execute(
-                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now, assignee_id),
+                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id, depends_on) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now, assignee_id, depends_on_json),
             )
             # Bump last_active — this is the "actually working" signal,
             # distinct from last_seen which fires on any auth touch.
@@ -357,8 +368,14 @@ class SQLiteBackend(SwarloBackend):
         )
 
     async def assign(self, hub_id: str, assigner: Member, channel: str,
-                     task_key: str, assignee_id: str, content: str) -> ClaimResult:
-        """Push-assign a task to a specific member. Claims first, then posts assignment message."""
+                     task_key: str, assignee_id: str, content: str,
+                     depends_on: list[str] | None = None) -> ClaimResult:
+        """Push-assign a task to a specific member. Claims first, then posts assignment message.
+
+        depends_on is recorded on both the implicit claim AND the visible
+        assign post so /ready can filter correctly regardless of which
+        row it walks.
+        """
         # Look up assignee
         assignee = self.get_member(hub_id, assignee_id)
         if not assignee:
@@ -367,7 +384,13 @@ class SQLiteBackend(SwarloBackend):
                 message=f"Member {assignee_id} not found in hub",
             )
 
-        # Claim first — no orphan assign posts on conflict
+        # NOTE: we don't check dep readiness on assign — assignments are
+        # push notifications that work can eventually be done. Whether
+        # the assignee should *claim* right now is handled by /ready.
+        # This lets the orchestrator assign the whole dependency graph
+        # up front without having to wait for each level to finish first.
+        # So we DON'T pass depends_on to the inner claim (which would
+        # block on unmet deps); deps go only on the visible assign post.
         result = await self.claim(hub_id, assignee, channel, task_key, content)
         if not result.claimed:
             return result
@@ -380,14 +403,29 @@ class SQLiteBackend(SwarloBackend):
             kind="assign", task_key=task_key,
             metadata={"assignee_id": assignee_id, "claim_post_id": result.post_id},
             assignee_id=assignee_id,
+            depends_on=depends_on,
         )
 
         return result
 
     async def claim(self, hub_id: str, member: Member, channel: str,
-                    task_key: str, content: str) -> ClaimResult:
+                    task_key: str, content: str,
+                    depends_on: list[str] | None = None) -> ClaimResult:
         # Auto-expire stale claims first
         await self.force_expire_claims(hub_id, stale_minutes=30)
+
+        # Check that every declared dependency is already done. A dep is
+        # satisfied when there's a post with that task_key whose status is
+        # 'done'. Missing deps (no post at all) block — this prevents
+        # claiming work that depends on tasks that haven't even been
+        # posted yet, which is a silent-failure pattern I want to catch.
+        if depends_on:
+            blocked = await self._unmet_deps(hub_id, depends_on)
+            if blocked:
+                return ClaimResult(
+                    claimed=False, conflict=True,
+                    message=f"Blocked by unmet dependencies: {', '.join(blocked)}",
+                )
 
         # Atomic claim via unique index — no TOCTOU race condition
         from .types import extract_mentions
@@ -397,16 +435,17 @@ class SQLiteBackend(SwarloBackend):
         mention_ids = self.resolve_mentions(hub_id, mention_names) if mention_names else []
         metadata_json = json.dumps({"heartbeat_at": now})
         mentions_json = json.dumps(mention_ids) if mention_ids else None
+        depends_on_json = json.dumps(depends_on) if depends_on else None
 
         try:
             with self._lock:
                 self.conn.execute(
                     "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
-                    "content, kind, task_key, status, metadata, mentions, created_at, assignee_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?, ?)",
+                    "content, kind, task_key, status, metadata, mentions, created_at, assignee_id, depends_on) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?, ?, ?)",
                     (post_id, hub_id, channel, member.member_id, member.member_name,
                      member.member_type, content, task_key, metadata_json, mentions_json, now,
-                     member.member_id),  # claimer is the assignee
+                     member.member_id, depends_on_json),  # claimer is the assignee
                 )
                 # Bump last_active — claimer is producing work
                 self.conn.execute(
@@ -426,6 +465,24 @@ class SQLiteBackend(SwarloBackend):
                 existing_claim=existing[0] if existing else None,
                 message=f"Already claimed by {existing[0].member_name}" if existing else "Claim conflict",
             )
+
+    async def _unmet_deps(self, hub_id: str, deps: list[str]) -> list[str]:
+        """Return the subset of deps whose task_keys have no done post yet.
+
+        A dep is "met" iff some post with that task_key has status='done'.
+        Anything else (no post, open claim, failed, etc.) counts as unmet.
+        Single query — no per-dep round trip.
+        """
+        if not deps:
+            return []
+        placeholders = ",".join("?" * len(deps))
+        rows = self.conn.execute(
+            f"SELECT DISTINCT task_key FROM posts "
+            f"WHERE hub_id = ? AND task_key IN ({placeholders}) AND status = 'done'",
+            (hub_id, *deps),
+        ).fetchall()
+        done_set = {r["task_key"] for r in rows}
+        return [d for d in deps if d not in done_set]
 
     async def report(self, hub_id: str, member: Member, channel: str,
                      task_key: str, status: str, content: str,
@@ -493,6 +550,48 @@ class SQLiteBackend(SwarloBackend):
                 )
                 self.conn.commit()
         return expired_keys
+
+    async def get_ready_tasks(self, hub_id: str, member_id: str) -> list[Post]:
+        """Return tasks assigned to a member where every dep is done.
+
+        This is the Theorem 1 / O(log D) story applied to a small graph:
+        our dependency chains are short enough that a single recursive
+        walk answers "what can this agent claim right now?" optimally.
+
+        A task is "ready" iff:
+          - It's assigned to this member (assignee_id = member_id)
+          - It's kind='assign' (i.e. not already claimed/done)
+          - Every task_key in its depends_on array has a done post
+
+        Tasks with no deps are trivially ready. Tasks with deps all done
+        are ready. Tasks with any unmet dep are excluded.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM posts WHERE hub_id = ? AND assignee_id = ? "
+                "AND kind = 'assign'",
+                (hub_id, member_id),
+            ).fetchall()
+
+        candidates = [self._row_to_post(r) for r in rows]
+        ready: list[Post] = []
+        for post in candidates:
+            raw_deps = None
+            if post.metadata and isinstance(post.metadata, dict):
+                raw_deps = post.metadata.get("depends_on")
+            # The canonical location is the depends_on column; fall back to metadata
+            row_deps = next((r["depends_on"] for r in rows if r["post_id"] == post.post_id), None)
+            try:
+                deps = json.loads(row_deps) if row_deps else (raw_deps or [])
+            except Exception:
+                deps = []
+            if not deps:
+                ready.append(post)
+                continue
+            unmet = await self._unmet_deps(hub_id, deps)
+            if not unmet:
+                ready.append(post)
+        return ready
 
     async def get_my_open_tasks(self, hub_id: str, member_id: str) -> list[Post]:
         """Return open work assigned to a member.
