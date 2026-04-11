@@ -167,6 +167,39 @@ class SwarloClient:
             "content": content,
         })
 
+    # ── File Claims ─────────────────────────────────────────
+
+    def claim_file(self, channel: str, file_path: str, content: str = "") -> dict:
+        """Claim a file to prevent two agents editing it. Raises SwarloError(409) on conflict."""
+        return self._request("POST", f"/api/{self.hub}/channels/{channel}/claim-file", {
+            "file_path": file_path, "content": content,
+        })
+
+    def file_claims(self) -> list[dict]:
+        """List all currently claimed files."""
+        result = self._request("GET", f"/api/{self.hub}/file-claims")
+        return result.get("files", [])
+
+    # ── Briefing ───────────────────────────────────────────
+
+    def briefing(self, task: str, limit: int = 15) -> dict:
+        """Get board posts ranked by relevance to a task description."""
+        return self._request("POST", f"/api/{self.hub}/briefing", {
+            "task": task, "limit": limit,
+        })
+
+    # ── Liveness ───────────────────────────────────────────
+
+    def liveness(self, stale_minutes: int = 30) -> dict:
+        """Check which agents are alive, dying, or dead."""
+        return self._request("GET", f"/api/{self.hub}/liveness?stale_minutes={stale_minutes}")
+
+    # ── Scoring ────────────────────────────────────────────
+
+    def score(self) -> dict:
+        """Compute and store coordination score for the hub."""
+        return self._request("POST", f"/api/{self.hub}/score")
+
     # ── Convenience ───────────────────────────────────────────
 
     def health(self) -> bool:
