@@ -168,7 +168,7 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int) -> dict:
         client = SwarloClient(base, hub=hub)
         key = client.join("bencher", name="Bencher")
 
-        metrics_by_scorer: dict[str, list[dict]] = {"regex": [], "tfidf": [], "prf": []}
+        metrics_by_scorer: dict[str, list[dict]] = {"regex": [], "tfidf": [], "prf": [], "prf_gated": []}
         for i in range(iters):
             # Each iter runs in its own hub so posts never leak across iters
             iter_hub = f"{hub}-{i}"
@@ -189,7 +189,7 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int) -> dict:
                 "quota problem in the improvement endpoint. Pull up anything "
                 "the team has learned about this."
             )
-            for scorer in ("regex", "tfidf", "prf"):
+            for scorer in ("regex", "tfidf", "prf", "prf_gated"):
                 metrics_by_scorer[scorer].append(
                     _score_one(iter_client, task, relevant_contents, scorer)
                 )
@@ -236,18 +236,19 @@ def main():
         ("n_returned_mean", "n_return"),
         ("latency_ms_mean", "lat_ms"),
     ]
-    header = f"{'metric':12s}  {'v1 regex':>10s}  {'v2 tfidf':>10s}  {'v3 prf':>10s}  {'Δ v3-v2':>10s}"
+    header = f"{'metric':12s}  {'v1 regex':>10s}  {'v2 tfidf':>10s}  {'v3 prf':>10s}  {'v4 gated':>10s}  {'Δ v4-v2':>10s}"
     print(header)
-    print("-" * 72)
+    print("-" * 82)
     for field, label in key_metrics:
         r = results["regex"].get(field, 0.0)
         t = results["tfidf"].get(field, 0.0)
         p = results["prf"].get(field, 0.0)
-        delta = p - t
+        g = results["prf_gated"].get(field, 0.0)
+        delta = g - t
         if "latency" in field:
-            print(f"{label:12s}  {r:10.2f}  {t:10.2f}  {p:10.2f}  {delta:+10.2f}")
+            print(f"{label:12s}  {r:10.2f}  {t:10.2f}  {p:10.2f}  {g:10.2f}  {delta:+10.2f}")
         else:
-            print(f"{label:12s}  {r:10.3f}  {t:10.3f}  {p:10.3f}  {delta:+10.3f}")
+            print(f"{label:12s}  {r:10.3f}  {t:10.3f}  {p:10.3f}  {g:10.3f}  {delta:+10.3f}")
 
     out_path = REPO_ROOT / "scripts" / "bench_briefing_results.json"
     out_path.write_text(json.dumps(results, indent=2))

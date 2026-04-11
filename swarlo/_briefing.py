@@ -222,12 +222,112 @@ def v3_prf_tfidf(
     return [cosine(expanded, vec(d)) for d in docs]
 
 
+# ── v4: Gated PRF (Ouro "learned depth" analog) ────────────────────
+#
+# The v3 PRF experiment (see tick 13 in atris/research/papers/
+# ouro-looped-lm.md) lost 35pp of recall@5 on the symptom-style
+# benchmark. Diagnosis: naive iteration. Ouro's real claim is not
+# "iteration helps" but "*learned depth allocation* helps" — the
+# model decides how much compute to spend per input. Fixed-k fixed-β
+# PRF iterates blindly.
+#
+# v4 tries the smallest possible instance of learned depth: a
+# hand-coded signal-quality gate on pass-1. Expand only if:
+#   (1) top-1 score clears a floor (pass-1 is not all noise), AND
+#   (2) top-k score is at least tau_ratio × top-1 (top-k is a
+#       coherent cluster, not a single real hit + noise).
+# Otherwise fall back to v2 single-pass scores.
+#
+# This is not a learned gate — it's a hand-tuned one. If it beats
+# both v2 and v3, that justifies building a learned variant later.
+# If it only matches v2, that's still a win: it proves the gating
+# *concept* is load-bearing.
+
+def v4_prf_gated(
+    task: str,
+    candidates: list[str],
+    k_feedback: int = 3,
+    n_expand: int = 5,
+    beta: float = 0.5,
+    tau_margin: float = 0.15,
+) -> list[float]:
+    """Gated PRF: only run expansion when pass-1 has a clear precision edge.
+
+    Gate: normalized margin between the k-th and (k+1)-th best scores
+    must exceed tau_margin. Concretely:
+        (topk - top_{k+1}) / top1 >= tau_margin
+    where top1 must also be strictly positive.
+
+    Rationale: on adversarial retrieval (many posts share weak vocabulary
+    with the query), pass-1 produces a flat score distribution where
+    top-k bleeds straight into the noise floor. Pooling from top-k then
+    contaminates the expansion with near-miss terms. A real precision
+    edge — a visible gap between "inside the pool" and "just outside" —
+    is what distinguishes a trustworthy pool from a noisy one.
+
+    When the gate fails, returns pass-1 scores unchanged (v2 behavior).
+    This is the Ouro "learned depth" principle reduced to its smallest
+    hand-coded form: decide per-input whether looping is worth it.
+    """
+    docs = [_tokenize(c) for c in candidates]
+    q_tokens = _tokenize(task)
+    if not q_tokens:
+        return [0.0] * len(candidates)
+    vec, cosine, idf = _tfidf_vec_fn(docs, q_tokens)
+
+    q_vec = vec(q_tokens)
+    pass1 = [cosine(q_vec, vec(d)) for d in docs]
+    nonzero_sorted = sorted((s for s in pass1 if s > 0), reverse=True)
+
+    # Need at least k+1 nonzero results to measure the precision edge
+    if len(nonzero_sorted) < k_feedback + 1:
+        return pass1
+
+    top1 = nonzero_sorted[0]
+    topk = nonzero_sorted[k_feedback - 1]
+    top_kp1 = nonzero_sorted[k_feedback]
+
+    if top1 <= 0:
+        return pass1
+
+    margin = (topk - top_kp1) / top1
+    if margin < tau_margin:
+        return pass1  # no precision edge → pool would drift → stay at v2
+
+    # ── Expansion (same as v3) ───────────────────────────────
+    nonzero_idx = sorted(
+        (i for i in range(len(pass1)) if pass1[i] > 0),
+        key=lambda i: -pass1[i],
+    )
+    top_idx = nonzero_idx[:k_feedback]
+
+    centroid: dict[str, float] = {}
+    for i in top_idx:
+        for term, weight in vec(docs[i]).items():
+            centroid[term] = centroid.get(term, 0.0) + weight
+    for term in list(centroid):
+        if term in q_vec:
+            centroid.pop(term)
+
+    scored_terms = sorted(
+        centroid.items(),
+        key=lambda kv: -(kv[1] * idf(kv[0])),
+    )[:n_expand]
+
+    expanded = dict(q_vec)
+    for term, weight in scored_terms:
+        expanded[term] = expanded.get(term, 0.0) + beta * weight
+
+    return [cosine(expanded, vec(d)) for d in docs]
+
+
 # ── Dispatcher ────────────────────────────────────────────────────
 
 SCORERS = {
     "regex": v1_regex,
     "tfidf": v2_tfidf,
     "prf": v3_prf_tfidf,
+    "prf_gated": v4_prf_gated,
 }
 
 

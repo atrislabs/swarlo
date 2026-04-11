@@ -124,3 +124,72 @@ def test_v3_prf_bails_when_first_pass_is_all_zero():
         ["solana wallet", "gmail oauth renewal"],
     )
     assert scores == [0.0, 0.0]
+
+
+# ── v4 gated PRF ──
+# The adversarial end-to-end benchmark (scripts/bench_briefing.py) is
+# the load-bearing validation: it shows v4 with default tau_margin
+# exactly matches v2 on the drift-heavy task, recovering the 35pp that
+# v3 lost. These unit tests exercise the gate MECHANISM directly by
+# forcing tau_margin, so they don't depend on fragile score predictions.
+
+def test_v4_gate_blocks_when_tau_margin_is_impossibly_strict():
+    """A tau_margin of 0.9 demands a 90% precision edge — almost
+    nothing will clear it. v4 must fall through to v2 scores."""
+    task = "fix the quota bug in the improvement endpoint"
+    cands = [
+        "Onboarding email for Marty shipped.",
+        "The improvement router drops requests when quota is exceeded.",
+        "Browser agent v3 captcha flow hardened.",
+        "Found a missing auth check on the quota endpoint in improve router.",
+    ]
+    v2 = _briefing.v2_tfidf(task, cands)
+    v4 = _briefing.v4_prf_gated(task, cands, tau_margin=0.9)
+    assert v4 == v2, f"strict gate must block expansion\nv2={v2}\nv4={v4}"
+
+
+def test_v4_gate_fires_when_tau_margin_is_zero():
+    """A tau_margin of 0 means any nonzero edge triggers expansion —
+    equivalent to ungated v3. Scores must differ from v2 on at least
+    one candidate (expansion ran)."""
+    task = "fix the quota bug in the improvement endpoint"
+    cands = [
+        "Onboarding email for Marty shipped.",
+        "The improvement router drops requests when quota is exceeded.",
+        "Missing auth check in improve router on quota endpoint blocked.",
+        "Added a test for the improvement quota error path.",
+        "Browser agent v3 captcha flow hardened.",
+        "Daily digest service landed with the cascade.",
+    ]
+    v2 = _briefing.v2_tfidf(task, cands)
+    v4 = _briefing.v4_prf_gated(task, cands, k_feedback=2, tau_margin=0.0)
+    # Some candidate's score must have moved — gate fired
+    assert any(abs(a - b) > 1e-9 for a, b in zip(v2, v4)), (
+        f"open gate should have run expansion and shifted scores\nv2={v2}\nv4={v4}"
+    )
+
+
+def test_v4_gate_bails_when_fewer_than_kp1_nonzero_results():
+    """Without k+1 nonzero scores, the gate has nothing to measure the
+    precision edge against — must fall back to pass-1 unchanged."""
+    # Only 2 candidates have any task-overlap; k_feedback=3 → gate bails
+    v4 = _briefing.v4_prf_gated(
+        "solana devnet wallet signing",
+        [
+            "Kubernetes pod autoscaler review.",
+            "Solana wallet devnet signer landed.",
+            "Mercury integration on analytics page.",
+            "Wallet signing failed on devnet.",
+        ],
+        k_feedback=3,
+    )
+    v2 = _briefing.v2_tfidf(
+        "solana devnet wallet signing",
+        [
+            "Kubernetes pod autoscaler review.",
+            "Solana wallet devnet signer landed.",
+            "Mercury integration on analytics page.",
+            "Wallet signing failed on devnet.",
+        ],
+    )
+    assert v4 == v2
