@@ -75,3 +75,52 @@ def test_dispatcher_defaults_to_tfidf():
 def test_dispatcher_can_select_regex():
     scores = _briefing.score("backend/routers/x.py", ["touched backend/routers/x.py"], scorer="regex")
     assert scores[0] >= 3.0
+
+
+# ── v3 PRF ──
+
+def test_v3_prf_amplifies_topical_posts_when_signal_is_clean():
+    """When the top-k is genuinely relevant, PRF expansion should
+    strengthen the ranking of related posts."""
+    task = "fix the quota bug in the improvement endpoint"
+    cands = [
+        "Onboarding email for Marty shipped.",
+        "The improvement router drops requests when quota is exceeded.",
+        "Browser agent v3 captcha flow hardened.",
+        "Found a missing auth check on the quota endpoint in improve router.",
+    ]
+    v2 = _briefing.v2_tfidf(task, cands)
+    v3 = _briefing.v3_prf_tfidf(task, cands)
+    # The two topical posts (1, 3) should score at least as high in v3
+    assert v3[1] >= v2[1] - 1e-9
+    # Zero-score distractors must remain zero — no query drift
+    assert v3[0] == 0.0
+    assert v3[2] == 0.0
+
+
+def test_v3_prf_does_not_drift_onto_zero_score_candidates():
+    """Regression test for the query-drift bug caught in the first
+    implementation: pooling from zero-score docs leaks unrelated terms
+    into the expanded query and boosts unrelated candidates."""
+    task = "solana wallet devnet integration"
+    cands = [
+        "Kubernetes pod autoscaling review.",  # unrelated
+        "Merged the devnet wallet tool after testing on solana.",  # topical
+        "Retry-on-503 added to the openrouter client.",  # unrelated
+    ]
+    v3 = _briefing.v3_prf_tfidf(task, cands)
+    # Unrelated candidates must stay at zero. If they have any score,
+    # the expansion drifted.
+    assert v3[0] == 0.0
+    assert v3[2] == 0.0
+    assert v3[1] > 0.0
+
+
+def test_v3_prf_bails_when_first_pass_is_all_zero():
+    """If nothing in pass 1 has signal, there's nothing to feed back
+    from. Must return zeros, not blow up."""
+    scores = _briefing.v3_prf_tfidf(
+        "kubernetes pod autoscaler",
+        ["solana wallet", "gmail oauth renewal"],
+    )
+    assert scores == [0.0, 0.0]

@@ -87,25 +87,14 @@ def v1_regex(task: str, candidates: list[str]) -> list[float]:
     return scores
 
 
-# ── v2: TF-IDF cosine (Phase 2) ───────────────────────────────────
+# ── TF-IDF primitives (shared by v2 and v3) ───────────────────────
 
-def v2_tfidf(task: str, candidates: list[str]) -> list[float]:
-    """Rank candidates by TF-IDF cosine similarity to the task.
+def _tfidf_vec_fn(docs: list[list[str]], q_tokens: list[str]):
+    """Build IDF over (docs + query) and return (vec_fn, cosine_fn).
 
-    Builds the IDF over (candidates + task) so discriminative terms
-    surface: a word that appears in every post has zero weight, a word
-    unique to a few posts that also appears in the task gets high weight.
-
-    This is a text-level analog of the paper's attention-score ranking:
-    both highlight positions the query is selectively attending to.
+    Splitting this lets v2 (single-pass) and v3 (two-pass PRF) share
+    the same IDF statistics so their scores are directly comparable.
     """
-    docs = [_tokenize(c) for c in candidates]
-    q_tokens = _tokenize(task)
-    if not q_tokens:
-        return [0.0] * len(candidates)
-
-    # Document frequency across the candidate pool. Include the query itself
-    # so a term only present in the query and one post still carries signal.
     n_docs = len(docs) + 1
     df: Counter[str] = Counter()
     for d in docs:
@@ -115,28 +104,122 @@ def v2_tfidf(task: str, candidates: list[str]) -> list[float]:
     def idf(term: str) -> float:
         return math.log((n_docs + 1) / (df.get(term, 0) + 1)) + 1.0
 
-    def tfidf_vec(tokens: list[str]) -> dict[str, float]:
+    def vec(tokens: list[str]) -> dict[str, float]:
         if not tokens:
             return {}
         tf = Counter(tokens)
         n = sum(tf.values())
         return {t: (count / n) * idf(t) for t, count in tf.items()}
 
-    def norm(v: dict[str, float]) -> float:
-        return math.sqrt(sum(x * x for x in v.values()))
-
     def cosine(a: dict[str, float], b: dict[str, float]) -> float:
         if not a or not b:
             return 0.0
-        na, nb = norm(a), norm(b)
+        na = math.sqrt(sum(x * x for x in a.values()))
+        nb = math.sqrt(sum(x * x for x in b.values()))
         if na == 0 or nb == 0:
             return 0.0
         common = set(a).intersection(b)
         dot = sum(a[k] * b[k] for k in common)
         return dot / (na * nb)
 
-    q_vec = tfidf_vec(q_tokens)
-    return [cosine(q_vec, tfidf_vec(d)) for d in docs]
+    return vec, cosine, idf
+
+
+# ── v2: TF-IDF cosine (Phase 2) ───────────────────────────────────
+
+def v2_tfidf(task: str, candidates: list[str]) -> list[float]:
+    """Rank candidates by TF-IDF cosine similarity to the task.
+
+    Text-level analog of the paper's attention-score ranking: both
+    highlight positions the query is selectively attending to.
+    """
+    docs = [_tokenize(c) for c in candidates]
+    q_tokens = _tokenize(task)
+    if not q_tokens:
+        return [0.0] * len(candidates)
+    vec, cosine, _ = _tfidf_vec_fn(docs, q_tokens)
+    q_vec = vec(q_tokens)
+    return [cosine(q_vec, vec(d)) for d in docs]
+
+
+# ── v3: Pseudo-Relevance Feedback (Ouro-inspired two-pass) ────────
+#
+# Ouro (arxiv:2510.25741) argues that a looped smaller model can match
+# a deeper one — depth-via-iteration. In IR, Pseudo-Relevance Feedback
+# (PRF) is the classical analog: a second pass of a cheap retriever,
+# using the first pass's top results to expand the query, often beats
+# a single pass of a more sophisticated ranker. Same pattern, different
+# domain. This is a text-level experiment on whether looping matters
+# for our coordination-graph retrieval case.
+#
+# Rocchio-style expansion with the γ=0 (negative-feedback-off) variant:
+#     q_new = α · q_original + β · centroid(top_k_docs)
+# We set α=1.0, β=0.5, k=3, exp_terms=5.
+
+def v3_prf_tfidf(
+    task: str,
+    candidates: list[str],
+    k_feedback: int = 3,
+    n_expand: int = 5,
+    beta: float = 0.5,
+) -> list[float]:
+    """Two-pass TF-IDF with Rocchio pseudo-relevance feedback.
+
+    Pass 1: rank candidates with v2_tfidf's vectors.
+    Expand: take top k_feedback candidate tokens, pick the n_expand
+            highest-IDF terms NOT already in the query, add them to
+            the query vector at weight beta.
+    Pass 2: rescore with the expanded query vector.
+
+    Returns pass-2 scores, aligned with the input candidate order.
+    """
+    docs = [_tokenize(c) for c in candidates]
+    q_tokens = _tokenize(task)
+    if not q_tokens:
+        return [0.0] * len(candidates)
+    vec, cosine, idf = _tfidf_vec_fn(docs, q_tokens)
+
+    # ── Pass 1 ────────────────────────────────────────────────
+    q_vec = vec(q_tokens)
+    pass1 = [cosine(q_vec, vec(d)) for d in docs]
+    if not any(s > 0 for s in pass1):
+        return pass1  # nothing to expand from — bail out
+
+    # ── Expand query from pseudo-relevant top-k ───────────────
+    # Only pool from docs that actually scored above zero. Pooling from
+    # zero-score docs causes query drift — the canonical PRF failure
+    # mode, where expansion terms come from random unrelated posts.
+    nonzero = [(i, pass1[i]) for i in range(len(pass1)) if pass1[i] > 0]
+    nonzero.sort(key=lambda x: -x[1])
+    top_idx = [i for i, _ in nonzero[:k_feedback]]
+    if not top_idx:
+        return pass1
+
+    # Centroid of top-k as a TF-IDF vector, minus terms already in q
+    centroid: dict[str, float] = {}
+    for i in top_idx:
+        for term, weight in vec(docs[i]).items():
+            centroid[term] = centroid.get(term, 0.0) + weight
+    # Averaging is implicit — scaling by k doesn't change cosine ranks
+    for term in list(centroid):
+        if term in q_vec:
+            # Don't re-inject terms already in the query — that's just
+            # reinforcement. PRF wants to discover *new* discriminators.
+            centroid.pop(term)
+
+    # Pick the n_expand terms with the highest (centroid_weight × idf)
+    scored_terms = sorted(
+        centroid.items(),
+        key=lambda kv: -(kv[1] * idf(kv[0])),
+    )[:n_expand]
+
+    # Build expanded query: α·q + β·expansion
+    expanded = dict(q_vec)
+    for term, weight in scored_terms:
+        expanded[term] = expanded.get(term, 0.0) + beta * weight
+
+    # ── Pass 2 ────────────────────────────────────────────────
+    return [cosine(expanded, vec(d)) for d in docs]
 
 
 # ── Dispatcher ────────────────────────────────────────────────────
@@ -144,6 +227,7 @@ def v2_tfidf(task: str, candidates: list[str]) -> list[float]:
 SCORERS = {
     "regex": v1_regex,
     "tfidf": v2_tfidf,
+    "prf": v3_prf_tfidf,
 }
 
 
