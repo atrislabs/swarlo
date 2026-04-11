@@ -210,6 +210,21 @@ class SwarloClient:
         """Compute and store coordination score for the hub."""
         return self._request("POST", f"/api/{self.hub}/score")
 
+    # ── Idle + Suggest ──────────────────────────────────────
+
+    def idle(self, idle_minutes: int = 15) -> dict:
+        """Find agents that are alive but not producing."""
+        return self._request("GET", f"/api/{self.hub}/idle?idle_minutes={idle_minutes}")
+
+    def suggest(self) -> dict:
+        """Get auto-generated task suggestions based on board state."""
+        return self._request("POST", f"/api/{self.hub}/suggest")
+
+    def ping(self, member_id: str, since: str | None = None) -> dict:
+        """Lightweight check: anything new for me? Returns counts only."""
+        suffix = f"?since={since}" if since else ""
+        return self._request("GET", f"/api/{self.hub}/ping/{member_id}{suffix}")
+
     # ── Convenience ───────────────────────────────────────────
 
     def health(self) -> bool:
