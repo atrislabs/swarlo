@@ -37,16 +37,49 @@ from swarlo.sqlite_backend import SQLiteBackend  # noqa: E402
 
 # ─── Synthetic corpus ───────────────────────────────────────────────
 
-# Relevant posts describe the TOPIC but don't always name the target file.
-# This mirrors how agents talk on real boards: symptoms and discoveries,
-# not file-path dumps. A simple regex matcher will miss most of these.
-RELEVANT_TEMPLATES = [
+# ── Adversarial mode (the original bench) ─────────────────────────
+# Task describes a SYMPTOM without naming files. Distractors share some
+# weak vocabulary with the task. Pass-1 produces a flat score
+# distribution where top-k bleeds into the noise floor — the case where
+# naive PRF drifts and a gate should block looping.
+ADVERSARIAL_TASK = (
+    "I'm debugging the self-improvement loop. Users report proposals "
+    "are getting dropped under load. I think there's an auth or "
+    "quota problem in the improvement endpoint. Pull up anything "
+    "the team has learned about this."
+)
+ADVERSARIAL_RELEVANT = [
     "Got a 403 on the quota endpoint last night — traced to a missing member check.",
     "The improvement router was dropping requests silently when the agent_id was numeric.",
     "Added a regression: we now cover the zero-credit branch that the proposal engine was hitting.",
     "Hypothesis: the race we chased last week was in the self-improve loop, not the executor.",
     "Profile shows 80% of /api/improve latency is in the json.dumps step, not the model call.",
 ]
+
+# ── Clean-signal mode (mid-difficulty — PRF should have headroom) ─
+# Task names a narrow symptom. Some relevant posts share the task's
+# exact vocabulary (pass-1 finds them); OTHER relevant posts share
+# vocabulary with those first posts but NOT with the task itself
+# (pass-1 misses them, expansion should find them). This is the
+# regime where two-pass PRF has room to win over single-pass TF-IDF:
+# pass-1 bootstraps a topic cluster, pass-2 uses that cluster to
+# reach posts the task alone can't locate.
+CLEAN_TASK = "debug the signer retry flake"
+CLEAN_RELEVANT = [
+    # 2 direct hits — share "signer", "retry", "flake" with the task
+    "Fixed the Solana devnet wallet signer retry flake that broke Jupiter swap tests.",
+    "Reproed the signer retry flake: blockhash expires before the second retry fires.",
+    # 3 vocab-adjacent — share no task words, but share wallet/Jupiter/
+    # blockhash/swap vocabulary with the direct hits. These are what
+    # pass-2 expansion should pull in.
+    "Solana devnet Jupiter swap returns stale blockhash, breaking mid-transaction signing.",
+    "Wallet transaction rebuild landed for stale blockhash on Solana devnet.",
+    "Jupiter swap route was swallowing a devnet blockhash expiry silently.",
+]
+
+# Alias kept for the current seed_board signature — points at the
+# adversarial templates by default.
+RELEVANT_TEMPLATES = ADVERSARIAL_RELEVANT
 
 # Distractors are plausible engineering chatter on the same board.
 # Some mention credits/auth/latency too — so keyword matching isn't enough.
@@ -74,14 +107,25 @@ DISTRACTOR_TEMPLATES = [
 ]
 
 
-def seed_board(base_url: str, hub: str, n_total: int, k_relevant: int, target_file: str, rng: random.Random) -> set[str]:
-    """Post k_relevant posts mentioning target_file and n_total-k_relevant distractors.
+def seed_board(
+    base_url: str,
+    hub: str,
+    n_total: int,
+    k_relevant: int,
+    rng: random.Random,
+    mode: str = "adversarial",
+) -> set[str]:
+    """Post k_relevant topical posts and n_total-k_relevant distractors.
 
-    Uses fresh clients per seed member so posts are attributed to different authors.
-    Returns the set of relevant content strings so the scorer can check hits.
+    mode="adversarial" uses the symptom-style templates (regex/v1
+    collapses, flat score distribution). mode="clean" uses the
+    vocabulary-dense templates (clear precision edge, PRF should help).
     """
     n_distract = n_total - k_relevant
-    target = target_file.replace("backend/routers/", "").replace("backend/services/", "").replace("backend/tools/core/", "").replace(".py", "")
+    if mode == "clean":
+        relevant_pool = CLEAN_RELEVANT
+    else:
+        relevant_pool = ADVERSARIAL_RELEVANT
 
     clients = []
     for mid, mname in [("bench_alice", "Alice"), ("bench_bob", "Bob"), ("bench_carol", "Carol")]:
@@ -90,10 +134,23 @@ def seed_board(base_url: str, hub: str, n_total: int, k_relevant: int, target_fi
         clients.append(c)
 
     posts = []
-    for tpl in RELEVANT_TEMPLATES[:k_relevant]:
-        posts.append(("relevant", tpl.format(target=target)))
-    for _ in range(n_distract):
-        posts.append(("distractor", rng.choice(DISTRACTOR_TEMPLATES)))
+    for tpl in relevant_pool[:k_relevant]:
+        posts.append(("relevant", tpl))
+    # Sample distractors WITHOUT replacement when possible — using
+    # random.choice meant the same distractor could land in the top-k
+    # multiple times, inflating its apparent mass and poisoning any
+    # PRF pool drawn from it.
+    if n_distract <= len(DISTRACTOR_TEMPLATES):
+        distractors = rng.sample(DISTRACTOR_TEMPLATES, n_distract)
+    else:
+        # Use each template once, then repeat as needed
+        distractors = list(DISTRACTOR_TEMPLATES)
+        rng.shuffle(distractors)
+        while len(distractors) < n_distract:
+            distractors.extend(rng.sample(DISTRACTOR_TEMPLATES, len(DISTRACTOR_TEMPLATES)))
+        distractors = distractors[:n_distract]
+    for d in distractors:
+        posts.append(("distractor", d))
 
     rng.shuffle(posts)
 
@@ -141,7 +198,7 @@ def _score_one(client: SwarloClient, task: str, relevant_contents: set[str], sco
     }
 
 
-def run_bench(n_total: int, k_relevant: int, iters: int, seed: int) -> dict:
+def run_bench(n_total: int, k_relevant: int, iters: int, seed: int, mode: str = "adversarial") -> dict:
     rng = random.Random(seed)
     import uvicorn
     from swarlo import server as srv
@@ -172,18 +229,11 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int) -> dict:
         for i in range(iters):
             # Each iter runs in its own hub so posts never leak across iters
             iter_hub = f"{hub}-{i}"
-            target = rng.choice([
-                "backend/routers/improve.py",
-                "backend/routers/chat.py",
-                "backend/services/credits.py",
-                "backend/tools/core/swarlo_tool.py",
-            ])
-            relevant_contents = seed_board(base, iter_hub, n_total, k_relevant, target, rng)
+            relevant_contents = seed_board(base, iter_hub, n_total, k_relevant, rng, mode=mode)
 
             iter_client = SwarloClient(base, hub=iter_hub)
             iter_client.join("bench_reader", name="Reader")
-            # Task describes the goal, not file paths — the realistic case
-            task = (
+            task = CLEAN_TASK if mode == "clean" else (
                 "I'm debugging the self-improvement loop. Users report proposals "
                 "are getting dropped under load. I think there's an auth or "
                 "quota problem in the improvement endpoint. Pull up anything "
@@ -221,13 +271,27 @@ def main():
     ap.add_argument("--k", type=int, default=5, help="relevant posts per iter")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--mode", choices=("adversarial", "clean", "both"), default="both",
+                    help="adversarial = symptom-style task with overlapping distractors; "
+                         "clean = vocabulary-dense topic task with non-overlapping distractors; "
+                         "both = run both and print two tables")
     args = ap.parse_args()
 
-    print(f"bench: n={args.n} k={args.k} iters={args.iters} seed={args.seed}")
-    print("-" * 72)
-    results = run_bench(args.n, args.k, args.iters, args.seed)
+    modes = ("adversarial", "clean") if args.mode == "both" else (args.mode,)
+    all_results: dict[str, dict] = {}
+    for mode in modes:
+        print()
+        print(f"== {mode.upper()} ==  n={args.n} k={args.k} iters={args.iters} seed={args.seed}")
+        print("-" * 82)
+        all_results[mode] = run_bench(args.n, args.k, args.iters, args.seed, mode=mode)
+        _print_table(all_results[mode])
 
-    # Side-by-side table: only the key metrics
+    out_path = REPO_ROOT / "scripts" / "bench_briefing_results.json"
+    out_path.write_text(json.dumps(all_results, indent=2))
+    print(f"\nwrote {out_path.relative_to(REPO_ROOT)}")
+
+
+def _print_table(results: dict) -> None:
     key_metrics = [
         ("recall@5_mean", "recall@5"),
         ("recall@10_mean", "recall@10"),
@@ -249,10 +313,6 @@ def main():
             print(f"{label:12s}  {r:10.2f}  {t:10.2f}  {p:10.2f}  {g:10.2f}  {delta:+10.2f}")
         else:
             print(f"{label:12s}  {r:10.3f}  {t:10.3f}  {p:10.3f}  {g:10.3f}  {delta:+10.3f}")
-
-    out_path = REPO_ROOT / "scripts" / "bench_briefing_results.json"
-    out_path.write_text(json.dumps(results, indent=2))
-    print(f"\nwrote {out_path.relative_to(REPO_ROOT)}")
 
 
 if __name__ == "__main__":
