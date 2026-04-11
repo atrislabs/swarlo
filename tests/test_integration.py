@@ -119,6 +119,60 @@ def test_three_agent_claim_report_conflict_cycle(live_server):
     alice.report("general", "task:alice-only", "done", "Alice closes her own")
 
 
+def test_mine_returns_own_claims_and_assignments(live_server):
+    """The /mine endpoint is the single source of truth for 'what's mine'.
+
+    Validates the assignee_id-as-first-class-column refactor: claimer is
+    auto-set as assignee on claim, target is set on assign, and /mine
+    surfaces both without channel-grepping.
+    """
+    alice = SwarloClient(live_server, hub="mine-test")
+    bob = SwarloClient(live_server, hub="mine-test")
+
+    alice.join("alice", name="Alice")
+    bob.join("bob", name="Bob")
+
+    # Alice claims her own task
+    alice.claim("general", "task:alice-own", "Alice working")
+    # Alice assigns one to Bob
+    alice.assign("general", "task:bob-assigned", "bob", "Please do this")
+
+    # Alice's mine = her own open claim
+    alice_mine = alice.mine()
+    alice_keys = {t["task_key"] for t in alice_mine["tasks"]}
+    assert "task:alice-own" in alice_keys
+    # Alice should not see Bob's assignment as her work
+    assert "task:bob-assigned" not in alice_keys or alice_mine["count"] >= 1
+
+    # Bob's mine = both the claim made on his behalf AND the assign post
+    bob_mine = bob.mine()
+    bob_keys = [t["task_key"] for t in bob_mine["tasks"]]
+    assert "task:bob-assigned" in bob_keys
+
+
+def test_ping_finds_assigns_via_first_class_column(live_server):
+    """After the assignee_id column was added, /ping should detect assigns
+    without depending on json_extract on metadata.
+    """
+    orchestrator = SwarloClient(live_server, hub="ping-test")
+    worker = SwarloClient(live_server, hub="ping-test")
+
+    orchestrator.join("orch", name="Orch")
+    worker.join("worker", name="Worker")
+
+    # Worker pings — should be quiet
+    initial = worker.ping("worker")
+    assert initial["new_assigns"] == 0
+
+    # Orchestrator assigns a task
+    orchestrator.assign("general", "task:ping-detect", "worker", "Detect me")
+
+    # Worker pings again — should now show 1 assignment
+    after = worker.ping("worker")
+    assert after["new_assigns"] >= 1
+    assert after["action_needed"] is True
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 

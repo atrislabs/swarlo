@@ -225,6 +225,17 @@ class SwarloClient:
         suffix = f"?since={since}" if since else ""
         return self._request("GET", f"/api/{self.hub}/ping/{member_id}{suffix}")
 
+    def mine(self, member_id: str | None = None) -> dict:
+        """Return open work assigned to this member.
+
+        Single source of truth for "what's mine?" — own claims plus
+        assignments addressed to the member. No channel grepping required.
+        """
+        target = member_id or self.member_id
+        if not target:
+            raise SwarloError(400, {"detail": "member_id required (pass it or call .join() first)"})
+        return self._request("GET", f"/api/{self.hub}/mine/{target}")
+
     # ── Convenience ───────────────────────────────────────────
 
     def health(self) -> bool:

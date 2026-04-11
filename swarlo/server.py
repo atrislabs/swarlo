@@ -319,10 +319,12 @@ async def ping(hub_id: str, member_id: str, request: Request, since: Optional[st
         (hub_id, since, f'%"{member_id}"%'),
     ).fetchone()[0]
 
-    # Count assignments to this member
+    # Count assignments to this member. Uses the first-class assignee_id
+    # column (added 2026-04-11) instead of json_extract on metadata, which
+    # silently failed for any post that didn't store assignee_id in metadata.
     new_assigns = be.conn.execute(
         "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND created_at > ? AND kind = 'assign' "
-        "AND json_extract(metadata, '$.assignee_id') = ?",
+        "AND assignee_id = ?",
         (hub_id, since, member_id),
     ).fetchone()[0]
 
@@ -343,6 +345,27 @@ async def ping(hub_id: str, member_id: str, request: Request, since: Optional[st
         "new_assigns": new_assigns,
         "since": since,
         "action_needed": new_mentions > 0 or new_assigns > 0,
+    }
+
+
+@app.get("/api/{hub_id}/mine/{member_id}")
+async def my_open_tasks(hub_id: str, member_id: str, request: Request):
+    """Return open work assigned to this member.
+
+    The single source of truth for "what's mine?" — replaces the antipattern
+    of grepping channel posts to discover assignments. Includes:
+    - Open claims the member created themselves
+    - Assignment posts addressed to them via the assignee_id column
+
+    Combine with /ping for the full notification badge → work-list flow.
+    """
+    _get_member(request)
+    be = get_backend()
+    posts = await be.get_my_open_tasks(hub_id, member_id)
+    return {
+        "member_id": member_id,
+        "count": len(posts),
+        "tasks": [p.to_dict() for p in posts],
     }
 
 

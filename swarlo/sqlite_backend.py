@@ -110,6 +110,20 @@ class SQLiteBackend(SwarloBackend):
                 self._conn.execute("ALTER TABLE posts ADD COLUMN retry_count INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # column already exists
+            try:
+                # First-class assignee column. Set on claim (= claimer) and
+                # assign (= target). Lets agents query "what's mine?" without
+                # grepping channels.
+                self._conn.execute("ALTER TABLE posts ADD COLUMN assignee_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                # Distinguish "alive" (last_seen, bumped on any auth touch)
+                # from "working" (last_active, bumped only when producing
+                # a post/claim/report). Fixes the idle/liveness lying problem.
+                self._conn.execute("ALTER TABLE members ADD COLUMN last_active TEXT")
+            except sqlite3.OperationalError:
+                pass
         return self._conn
 
     @property
@@ -204,7 +218,8 @@ class SQLiteBackend(SwarloBackend):
     async def create_post(self, hub_id: str, member: Member, channel: str,
                           content: str, kind: str = "message",
                           task_key: str | None = None, status: str | None = None,
-                          metadata: dict | None = None, priority: int = 0) -> Post:
+                          metadata: dict | None = None, priority: int = 0,
+                          assignee_id: str | None = None) -> Post:
         from .types import extract_mentions
         post_id = _uid()
         now = _utcnow()
@@ -218,8 +233,14 @@ class SQLiteBackend(SwarloBackend):
 
         with self._lock:
             self.conn.execute(
-                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now),
+                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now, assignee_id),
+            )
+            # Bump last_active — this is the "actually working" signal,
+            # distinct from last_seen which fires on any auth touch.
+            self.conn.execute(
+                "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
+                (now, hub_id, member.member_id),
             )
             self.conn.commit()
         return Post(
@@ -293,10 +314,14 @@ class SQLiteBackend(SwarloBackend):
         if not result.claimed:
             return result
 
-        # Claim succeeded — post the visible assignment message
+        # Claim succeeded — post the visible assignment message.
+        # assignee_id is passed as a first-class column so /ping can find it
+        # without json_extract gymnastics.
         assign_post = await self.create_post(
             hub_id, assigner, channel, f"Assigned {task_key} to @{assignee.member_name}: {content}",
-            kind="assign", task_key=task_key, metadata={"assignee_id": assignee_id, "claim_post_id": result.post_id},
+            kind="assign", task_key=task_key,
+            metadata={"assignee_id": assignee_id, "claim_post_id": result.post_id},
+            assignee_id=assignee_id,
         )
 
         return result
@@ -319,10 +344,16 @@ class SQLiteBackend(SwarloBackend):
             with self._lock:
                 self.conn.execute(
                     "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
-                    "content, kind, task_key, status, metadata, mentions, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?)",
+                    "content, kind, task_key, status, metadata, mentions, created_at, assignee_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?, ?)",
                     (post_id, hub_id, channel, member.member_id, member.member_name,
-                     member.member_type, content, task_key, metadata_json, mentions_json, now),
+                     member.member_type, content, task_key, metadata_json, mentions_json, now,
+                     member.member_id),  # claimer is the assignee
+                )
+                # Bump last_active — claimer is producing work
+                self.conn.execute(
+                    "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
+                    (now, hub_id, member.member_id),
                 )
                 self.conn.commit()
             return ClaimResult(
@@ -404,6 +435,25 @@ class SQLiteBackend(SwarloBackend):
                 )
                 self.conn.commit()
         return expired_keys
+
+    async def get_my_open_tasks(self, hub_id: str, member_id: str) -> list[Post]:
+        """Return open work assigned to a member.
+
+        Includes:
+        - Their own open claims (assignee_id = member_id, kind = claim, status = open)
+        - Open assignments addressed to them (assignee_id = member_id, kind = assign)
+
+        Replaces the "grep channels for your name" antipattern. This is the
+        single source of truth for "what's mine?".
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM posts WHERE hub_id = ? AND assignee_id = ? "
+                "AND ((kind = 'claim' AND status = 'open') OR kind = 'assign') "
+                "ORDER BY created_at DESC",
+                (hub_id, member_id),
+            ).fetchall()
+        return [self._row_to_post(r) for r in rows]
 
     async def get_open_claims(self, hub_id: str, channel: str | None = None,
                               task_key: str | None = None) -> list[Post]:
