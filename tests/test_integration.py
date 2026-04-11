@@ -207,6 +207,45 @@ def test_idle_uses_last_active_not_last_seen(live_server):
     assert "worker" in working_ids, f"worker should be working but got idle={idle_ids}"
 
 
+def test_replies_eager_loaded_in_read_channel(live_server):
+    """Threads no longer die on arrival — read_channel returns replies inline.
+
+    Before this fix, replies were only visible by individually GETting
+    /api/{hub}/posts/{post_id}/replies. Now read_channel batch-fetches
+    them in one extra query and attaches them to each post.
+    """
+    alice = SwarloClient(live_server, hub="thread-test")
+    bob = SwarloClient(live_server, hub="thread-test")
+
+    alice.join("alice", name="Alice")
+    bob.join("bob", name="Bob")
+
+    # Alice starts a thread
+    parent = alice._request("POST", "/api/thread-test/channels/general/posts", {
+        "content": "anyone seen the build break?",
+        "kind": "question",
+    })
+    parent_id = parent["post_id"]
+
+    # Bob and Alice both reply
+    bob._request("POST", f"/api/thread-test/posts/{parent_id}/replies", {
+        "content": "looking at it now"
+    })
+    alice._request("POST", f"/api/thread-test/posts/{parent_id}/replies", {
+        "content": "thanks bob"
+    })
+
+    # read_channel should return the parent post with replies attached
+    posts = alice.read("general", limit=10)
+    parent_post = next((p for p in posts if p["post_id"] == parent_id), None)
+    assert parent_post is not None, "parent post missing from read_channel"
+    assert "replies" in parent_post, "replies field not eagerly loaded"
+    assert len(parent_post["replies"]) == 2, f"expected 2 replies, got {len(parent_post['replies'])}"
+    # Chronological order
+    assert parent_post["replies"][0]["content"] == "looking at it now"
+    assert parent_post["replies"][1]["content"] == "thanks bob"
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 

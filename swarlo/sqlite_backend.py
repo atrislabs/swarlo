@@ -208,12 +208,57 @@ class SQLiteBackend(SwarloBackend):
         active = {row["channel"] for row in rows}
         return sorted(set(DEFAULT_CHANNELS) | active)
 
-    async def read_channel(self, hub_id: str, channel: str, limit: int = 10) -> list[Post]:
+    async def read_channel(self, hub_id: str, channel: str, limit: int = 10,
+                           include_replies: bool = True) -> list[Post]:
+        """Read recent posts on a channel.
+
+        When include_replies is True (default), eagerly batch-loads replies
+        for the returned posts in a single extra query so threads don't die
+        on arrival. Replies are attached to each Post via the .replies field
+        as a list of dicts (chronological order).
+        """
         rows = self.conn.execute(
             "SELECT * FROM posts WHERE hub_id = ? AND channel = ? ORDER BY created_at DESC LIMIT ?",
             (hub_id, channel, limit),
         ).fetchall()
-        return [self._row_to_post(r) for r in rows]
+        posts = [self._row_to_post(r) for r in rows]
+        if include_replies and posts:
+            self._attach_replies(hub_id, posts)
+        return posts
+
+    def _attach_replies(self, hub_id: str, posts: list[Post]) -> None:
+        """Batch-fetch replies for a list of posts and attach via Post.replies.
+
+        Single SQL query with IN clause — O(1) extra round trip regardless
+        of how many posts are in the list. Replies are grouped by post_id
+        and sorted chronologically (oldest first, like a normal thread).
+        """
+        if not posts:
+            return
+        post_ids = [p.post_id for p in posts]
+        placeholders = ",".join("?" * len(post_ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM replies WHERE hub_id = ? AND post_id IN ({placeholders}) "
+            f"ORDER BY post_id, created_at ASC",
+            (hub_id, *post_ids),
+        ).fetchall()
+
+        from collections import defaultdict
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for r in rows:
+            grouped[r["post_id"]].append({
+                "reply_id": r["reply_id"],
+                "post_id": r["post_id"],
+                "content": r["content"],
+                "member_id": r["member_id"],
+                "member_name": r["member_name"],
+                "member_type": r["member_type"],
+                "created_at": r["created_at"],
+            })
+        for p in posts:
+            replies = grouped.get(p.post_id)
+            if replies:
+                p.replies = replies
 
     async def create_post(self, hub_id: str, member: Member, channel: str,
                           content: str, kind: str = "message",

@@ -38,6 +38,7 @@ class Post:
     metadata: Optional[dict] = None  # structured data: steps, artifacts, files
     mentions: Optional[list[str]] = None  # resolved member_ids from @mentions
     created_at: Optional[str] = None
+    replies: Optional[list[dict]] = None  # eager-loaded replies — fixes thread fragmentation
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -45,6 +46,8 @@ class Post:
             del d["metadata"]
         if d.get("mentions") is None:
             del d["mentions"]
+        if d.get("replies") is None:
+            del d["replies"]
         return d
 
 
