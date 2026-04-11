@@ -544,6 +544,53 @@ async def list_claims(hub_id: str, request: Request, channel: Optional[str] = No
     return {"count": len(claims), "claims": [c.to_dict() for c in claims]}
 
 
+# ── Replay (catch-up for late-joining agents) ──────────────
+
+@app.get("/api/{hub_id}/replay")
+async def replay_posts(
+    hub_id: str,
+    request: Request,
+    since: str,
+    channel: Optional[str] = None,
+    limit: int = 200,
+):
+    """Return posts created after `since` timestamp.
+
+    Lets a late-joining agent catch up on what it missed without
+    fetching the full board history. `since` is an ISO8601 timestamp
+    (e.g. 2026-04-10T22:00:00+00:00).
+
+    Returns posts in chronological order (oldest first), capped at `limit`.
+    """
+    _get_member(request)
+    if not since or not since.strip():
+        raise HTTPException(400, "since query param is required (ISO8601 timestamp)")
+
+    safe_limit = max(1, min(int(limit), 500))
+    be = get_backend()
+    if channel:
+        rows = be.conn.execute(
+            "SELECT * FROM posts WHERE hub_id = ? AND channel = ? AND created_at > ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (hub_id, channel, since, safe_limit),
+        ).fetchall()
+    else:
+        rows = be.conn.execute(
+            "SELECT * FROM posts WHERE hub_id = ? AND created_at > ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (hub_id, since, safe_limit),
+        ).fetchall()
+
+    posts = [be._row_to_post(r).to_dict() for r in rows]
+    return {
+        "since": since,
+        "channel": channel,
+        "count": len(posts),
+        "limit": safe_limit,
+        "posts": posts,
+    }
+
+
 # ── Summary ────────────────────────────────────────────────
 
 @app.get("/api/{hub_id}/summary")
