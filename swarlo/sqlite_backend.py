@@ -340,7 +340,9 @@ class SQLiteBackend(SwarloBackend):
 
     async def report(self, hub_id: str, member: Member, channel: str,
                      task_key: str, status: str, content: str,
-                     parent_id: str | None = None) -> Post:
+                     parent_id: str | None = None,
+                     affected_files: list[str] | None = None,
+                     metadata: dict | None = None) -> Post:
         existing = await self.get_open_claims(hub_id, task_key=task_key)
         if existing and existing[0].member_id != member.member_id:
             raise PermissionError(
@@ -348,8 +350,16 @@ class SQLiteBackend(SwarloBackend):
             )
 
         kind = "result" if status == "done" else "failed" if status == "failed" else status
+        # Merge affected_files into metadata for downstream consumption
+        report_meta = dict(metadata or {})
+        if affected_files:
+            # Sanitize: keep only string entries, cap to 100 files
+            clean = [str(f) for f in affected_files if f][:100]
+            if clean:
+                report_meta["affected_files"] = clean
         post = await self.create_post(hub_id, member, channel, content,
-                                      kind=kind, task_key=task_key, status=status)
+                                      kind=kind, task_key=task_key, status=status,
+                                      metadata=report_meta or None)
         with self._lock:
             self.conn.execute(
                 "UPDATE posts SET status = ? WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",

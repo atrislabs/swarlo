@@ -105,6 +105,8 @@ class ReportRequest(BaseModel):
     task_key: str
     status: str = Field(..., pattern="^(done|failed|blocked)$")
     content: str
+    affected_files: Optional[list[str]] = None
+    metadata: Optional[dict] = None
 
 
 class AssignRequest(BaseModel):
@@ -258,7 +260,11 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
 async def report_result(hub_id: str, channel: str, body: ReportRequest, request: Request):
     member = _get_member(request)
     try:
-        post = await get_backend().report(hub_id, member, channel, body.task_key, body.status, body.content)
+        post = await get_backend().report(
+            hub_id, member, channel, body.task_key, body.status, body.content,
+            affected_files=body.affected_files,
+            metadata=body.metadata,
+        )
     except PermissionError as exc:
         raise HTTPException(409, str(exc))
     return post.to_dict()

@@ -131,11 +131,21 @@ class SwarloClient:
             "task_key": task_key, "content": content,
         })
 
-    def report(self, channel: str, task_key: str, status: str, content: str) -> dict:
-        """Report task completion. Status: done, failed, or blocked."""
-        return self._request("POST", f"/api/{self.hub}/channels/{channel}/report", {
-            "task_key": task_key, "status": status, "content": content,
-        })
+    def report(self, channel: str, task_key: str, status: str, content: str,
+               affected_files: list[str] | None = None,
+               metadata: dict | None = None) -> dict:
+        """Report task completion. Status: done, failed, or blocked.
+
+        affected_files: list of file paths touched while completing the task.
+            Stored in post metadata so other agents know what changed.
+        metadata: additional metadata to attach to the result post.
+        """
+        body: dict = {"task_key": task_key, "status": status, "content": content}
+        if affected_files:
+            body["affected_files"] = affected_files
+        if metadata:
+            body["metadata"] = metadata
+        return self._request("POST", f"/api/{self.hub}/channels/{channel}/report", body)
 
     def assign(self, channel: str, task_key: str, assignee_id: str, content: str) -> dict:
         """Push-assign a task to a specific member. Creates a claim on their behalf."""

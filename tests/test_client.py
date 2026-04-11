@@ -212,6 +212,34 @@ class TestFullFlow:
         assert len(scout.claims()) == 0
 
 
+class TestClientAffectedFiles:
+    """Tests for affected_files in report metadata (W4)."""
+
+    def test_report_with_affected_files(self, server):
+        client = SwarloClient(server, hub="affected1")
+        client.join("editor", name="Editor")
+
+        client.claim("general", "task:fix-stuff", "Fixing")
+        result = client.report(
+            "general", "task:fix-stuff", "done", "Fixed it",
+            affected_files=["backend/services/foo.py", "backend/tests/test_foo.py"],
+        )
+        assert result["status"] == "done"
+        meta = result.get("metadata") or {}
+        assert "affected_files" in meta
+        assert "backend/services/foo.py" in meta["affected_files"]
+
+    def test_report_without_affected_files(self, server):
+        client = SwarloClient(server, hub="affected2")
+        client.join("editor2", name="Editor2")
+
+        client.claim("general", "task:plain", "Plain")
+        result = client.report("general", "task:plain", "done", "Done")
+        assert result["status"] == "done"
+        meta = result.get("metadata") or {}
+        assert "affected_files" not in meta
+
+
 class TestClientFileClaiming:
     """Tests for claim_file + file_claims (W1)."""
 
