@@ -236,6 +236,37 @@ class SwarloClient:
             raise SwarloError(400, {"detail": "member_id required (pass it or call .join() first)"})
         return self._request("GET", f"/api/{self.hub}/mine/{target}")
 
+    def wait_for(self, task_key: str, channel: str = "general",
+                 timeout: float = 300.0, poll_interval: float = 2.0) -> dict:
+        """Block until a task ships (or fails) and return the result post.
+
+        The "subscribe to task" verb. Replaces the polling antipattern of
+        agents periodically reading the channel hoping to see a result.
+        Short-polls the posts endpoint at `poll_interval` seconds until
+        a result/failed post for the task_key appears, or `timeout` is hit.
+
+        Returns the result post (dict) on success.
+        Raises SwarloError(408) on timeout.
+
+        Example:
+            client.assign("general", "task:fix-bug", "executor", "Fix the thing")
+            result = client.wait_for("task:fix-bug", timeout=600)
+            print(f"Done: {result['status']}")
+
+        This is a stopgap until the server grows real SSE/webhook support
+        for task-status changes. Single agent, single task, predictable cost.
+        """
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            posts = self.read(channel, limit=50)
+            for p in posts:
+                if (p.get("task_key") == task_key
+                        and p.get("kind") in ("result", "failed")):
+                    return p
+            _time.sleep(poll_interval)
+        raise SwarloError(408, {"detail": f"timed out after {timeout}s waiting for {task_key}"})
+
     # ── Convenience ───────────────────────────────────────────
 
     def health(self) -> bool:

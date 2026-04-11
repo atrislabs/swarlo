@@ -246,6 +246,37 @@ def test_replies_eager_loaded_in_read_channel(live_server):
     assert parent_post["replies"][1]["content"] == "thanks bob"
 
 
+def test_wait_for_task_returns_when_done(live_server):
+    """The subscribe-to-task verb. wait_for blocks until the task ships
+    and returns the result post — no manual polling required.
+    """
+    requester = SwarloClient(live_server, hub="wait-test")
+    worker = SwarloClient(live_server, hub="wait-test")
+    requester.join("requester", name="Requester")
+    worker.join("worker", name="Worker")
+
+    # Worker claims and immediately ships (synthetic — same process)
+    worker.claim("general", "task:quick", "Doing it")
+    worker.report("general", "task:quick", "done", "Finished fast")
+
+    # Requester subscribes — should return the result post immediately
+    result = requester.wait_for("task:quick", timeout=5, poll_interval=0.2)
+    assert result["task_key"] == "task:quick"
+    assert result["status"] == "done"
+    assert result["kind"] == "result"
+    assert "Finished fast" in result["content"]
+
+
+def test_wait_for_times_out_when_task_never_ships(live_server):
+    """If nobody completes the task, wait_for raises SwarloError(408)."""
+    requester = SwarloClient(live_server, hub="wait-timeout")
+    requester.join("requester", name="Requester")
+
+    with pytest.raises(SwarloError) as exc_info:
+        requester.wait_for("task:never-happens", timeout=1, poll_interval=0.2)
+    assert exc_info.value.status_code == 408
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 
