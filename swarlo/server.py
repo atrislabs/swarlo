@@ -369,36 +369,6 @@ async def my_open_tasks(hub_id: str, member_id: str, request: Request):
     }
 
 
-# ── My Work ────────────────────────────────────────────────
-
-@app.get("/api/{hub_id}/mine/{member_id}")
-async def my_work(hub_id: str, member_id: str, request: Request):
-    """What should I be working on? Own claims + assignments."""
-    _get_member(request)
-    be = get_backend()
-
-    my_claims = be.conn.execute(
-        "SELECT task_key, content, channel, created_at FROM posts "
-        "WHERE hub_id = ? AND member_id = ? AND kind = 'claim' AND status = 'open' "
-        "ORDER BY created_at DESC",
-        (hub_id, member_id),
-    ).fetchall()
-
-    my_assigns = be.conn.execute(
-        "SELECT task_key, content, channel, created_at, member_name as assigned_by FROM posts "
-        "WHERE hub_id = ? AND kind = 'assign' AND json_extract(metadata, '$.assignee_id') = ? "
-        "ORDER BY created_at DESC LIMIT 20",
-        (hub_id, member_id),
-    ).fetchall()
-
-    return {
-        "member_id": member_id,
-        "claims": [dict(r) for r in my_claims],
-        "assignments": [dict(r) for r in my_assigns],
-        "total": len(my_claims) + len(my_assigns),
-        "has_work": len(my_claims) > 0,
-    }
-
 
 # ── Idle Detection ─────────────────────────────────────────
 

@@ -251,3 +251,88 @@ class TestScoring:
             "SELECT COUNT(*) FROM scores WHERE hub_id = 'atris'"
         ).fetchone()[0]
         assert rows == 2
+
+
+# ── Mine ───────────────────────────────────────────────────
+
+
+class TestMine:
+    def test_mine_empty(self, client):
+        key = _register(client)
+        resp = client.get("/api/atris/mine/agent-1", headers=_auth(key))
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 0
+
+    def test_mine_shows_claims(self, client):
+        key = _register(client)
+        client.post("/api/atris/channels/ops/claim",
+                     json={"task_key": "T1", "content": "my task"},
+                     headers=_auth(key))
+        resp = client.get("/api/atris/mine/agent-1", headers=_auth(key))
+        data = resp.json()
+        assert data["count"] >= 1
+        task_keys = [t["task_key"] for t in data["tasks"]]
+        assert "T1" in task_keys
+
+
+# ── Ping ───────────────────────────────────────────────────
+
+
+class TestPing:
+    def test_ping_no_activity(self, client):
+        key = _register(client)
+        resp = client.get("/api/atris/ping/agent-1", headers=_auth(key))
+        assert resp.status_code == 200
+        assert resp.json()["action_needed"] is False
+
+    def test_ping_detects_mention(self, client):
+        k1 = _register(client, "a1", "Agent 1")
+        k2 = _register(client, "a2", "Agent 2")
+        # a2 mentions a1
+        client.post("/api/atris/channels/general/posts",
+                     json={"content": "@a1 check this out"},
+                     headers=_auth(k2))
+        resp = client.get("/api/atris/ping/a1?since=2000-01-01T00:00:00",
+                           headers=_auth(k1))
+        data = resp.json()
+        assert data["new_mentions"] >= 1
+        assert data["action_needed"] is True
+
+    def test_ping_bumps_last_seen(self, client):
+        key = _register(client)
+        client.get("/api/atris/ping/agent-1", headers=_auth(key))
+        members = client.get("/api/atris/members", headers=_auth(key)).json()
+        agent = [m for m in members["members"] if m["member_id"] == "agent-1"][0]
+        assert agent["last_seen"] is not None
+
+
+# ── Idle ───────────────────────────────────────────────────
+
+
+class TestIdle:
+    def test_idle_endpoint_returns(self, client):
+        key = _register(client)
+        # Make authed request to bump last_seen
+        client.get("/api/atris/channels", headers=_auth(key))
+        # Post something so not idle
+        client.post("/api/atris/channels/general/posts",
+                     json={"content": "working"}, headers=_auth(key))
+        resp = client.get("/api/atris/idle", headers=_auth(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "idle" in data
+        assert "working" in data
+
+
+# ── Suggest ────────────────────────────────────────────────
+
+
+class TestSuggest:
+    def test_suggest_returns_suggestions(self, client):
+        key = _register(client)
+        client.get("/api/atris/channels", headers=_auth(key))
+        resp = client.post("/api/atris/suggest", headers=_auth(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "suggestions" in data
+        assert "suggestion_count" in data
