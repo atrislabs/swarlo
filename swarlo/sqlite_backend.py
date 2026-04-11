@@ -414,6 +414,19 @@ class SQLiteBackend(SwarloBackend):
         # Auto-expire stale claims first
         await self.force_expire_claims(hub_id, stale_minutes=30)
 
+        # Cycle detection — reject a claim whose declared deps would
+        # transitively depend back on this task_key. Without this, a
+        # cycle like task:A depends on task:B and task:B depends on
+        # task:A silently causes /ready to return nothing forever and
+        # nobody knows why. Catch it at declaration time.
+        if depends_on:
+            cycle_path = self._find_cycle(hub_id, task_key, depends_on)
+            if cycle_path:
+                return ClaimResult(
+                    claimed=False, conflict=True,
+                    message=f"Dependency cycle detected: {' → '.join(cycle_path)}",
+                )
+
         # Check that every declared dependency is already done. A dep is
         # satisfied when there's a post with that task_key whose status is
         # 'done'. Missing deps (no post at all) block — this prevents
@@ -483,6 +496,84 @@ class SQLiteBackend(SwarloBackend):
         ).fetchall()
         done_set = {r["task_key"] for r in rows}
         return [d for d in deps if d not in done_set]
+
+    def _find_cycle(self, hub_id: str, new_task_key: str,
+                    declared_deps: list[str]) -> list[str] | None:
+        """Return a cycle path if the new claim would create one, else None.
+
+        Walks the depends_on graph forward from each declared dep (BFS).
+        When we find a dep that points back to new_task_key, we've closed
+        the cycle and can return the path:
+
+            [new_task_key, declared_dep, ..., closing_node, new_task_key]
+
+        BFS batches each frontier level into one query, so the cost is
+        O(levels) queries bounded by the graph's D (3-5 in practice).
+        """
+        if not declared_deps:
+            return None
+
+        # Degenerate self-loop: new_task_key is in its own declared deps
+        if new_task_key in declared_deps:
+            return [new_task_key, new_task_key]
+
+        # parent[t] = the node that discovered t during BFS; None = root (declared dep)
+        parent: dict[str, str | None] = {d: None for d in declared_deps}
+        frontier: set[str] = set(declared_deps)
+        visited: set[str] = set()
+
+        while frontier:
+            placeholders = ",".join("?" * len(frontier))
+            rows = self.conn.execute(
+                f"SELECT task_key, depends_on FROM posts "
+                f"WHERE hub_id = ? AND task_key IN ({placeholders}) "
+                f"AND depends_on IS NOT NULL",
+                (hub_id, *frontier),
+            ).fetchall()
+
+            visited |= frontier
+            next_frontier: set[str] = set()
+            for r in rows:
+                src = r["task_key"]
+                try:
+                    deps = json.loads(r["depends_on"])
+                except Exception:
+                    deps = []
+                for d in deps:
+                    if d == new_task_key:
+                        # Cycle: src transitively depends on new_task_key,
+                        # and now src also depends directly on new_task_key.
+                        # Path: new_task_key → declared_dep → ... → src → new_task_key
+                        return self._reconstruct_cycle_path(new_task_key, parent, src)
+                    if d not in visited and d not in next_frontier:
+                        parent[d] = src
+                        next_frontier.add(d)
+            frontier = next_frontier
+
+        return None
+
+    @staticmethod
+    def _reconstruct_cycle_path(new_task_key: str,
+                                parent: dict[str, str | None],
+                                closing_node: str) -> list[str]:
+        """Build the cycle path from a parent-map walk.
+
+        closing_node is the node whose depends_on points back to
+        new_task_key — i.e. the last node in the cycle before the loop
+        closes. We walk backward from there through parent pointers
+        until we hit a root (None), then reverse to get forward order.
+        """
+        chain: list[str] = [closing_node]
+        cur: str | None = parent.get(closing_node)
+        guard = 0
+        while cur is not None and guard < 64:
+            chain.append(cur)
+            cur = parent.get(cur)
+            guard += 1
+        chain.reverse()
+        # chain is now: declared_dep → ... → closing_node
+        # The full cycle is: new → chain → new
+        return [new_task_key, *chain, new_task_key]
 
     async def report(self, hub_id: str, member: Member, channel: str,
                      task_key: str, status: str, content: str,

@@ -540,6 +540,84 @@ def test_claim_next_returns_none_when_nothing_is_ready(live_server):
     assert result is None
 
 
+def test_cycle_detection_rejects_self_loop(live_server):
+    """Claiming a task whose deps include itself is rejected immediately."""
+    alice = SwarloClient(live_server, hub="cycle-self")
+    alice.join("alice", name="Alice")
+
+    with pytest.raises(SwarloError) as exc_info:
+        alice.claim("general", "task:X", "self-loop", depends_on=["task:X"])
+    assert exc_info.value.status_code == 409
+    # The error message should surface "cycle" and the task_key
+    msg = str(exc_info.value).lower()
+    assert "cycle" in msg
+    assert "task:x" in msg
+
+
+def test_cycle_detection_rejects_three_hop_cycle(live_server):
+    """Detects A → B → C → A cycles and reports the full path."""
+    alice = SwarloClient(live_server, hub="cycle-three")
+    alice.join("alice", name="Alice")
+
+    # Seed the chain: first claim A (no deps), then B depending on A,
+    # then C depending on B. None are done yet but the dep *graph* exists.
+    # (claim() needs deps to be done, so we have to mark them done first.)
+    alice.claim("general", "task:A", "a")
+    alice.report("general", "task:A", "done", "a done")
+    alice.claim("general", "task:B", "b", depends_on=["task:A"])
+    alice.report("general", "task:B", "done", "b done")
+    alice.claim("general", "task:C", "c", depends_on=["task:B"])
+    alice.report("general", "task:C", "done", "c done")
+
+    # Now try to claim a NEW task that would create a cycle via A depending on C
+    # (A → C → B → A is the logical cycle; we re-claim A with depends_on=[C])
+    # But A is already done, so the unique-claim constraint would also fire.
+    # Use a fresh task that routes through the existing chain instead:
+    #   task:X depends_on=[C], and if C already (transitively) depends on X, we'd cycle.
+    # Since the existing chain is X-free, this won't trigger a cycle — it just claims.
+    # To actually test cycle detection across 3 hops, we need an existing chain
+    # that includes our new task. Do this by setting up a fresh hub:
+    bob = SwarloClient(live_server, hub="cycle-three-b")
+    bob.join("bob", name="Bob")
+
+    # Pre-populate a chain of open (not-yet-done) claims so the cycle check
+    # walks through them. Use direct POST to bypass the "deps must be done"
+    # check — that check runs AFTER cycle detection.
+    import urllib.request
+    import json as _json
+    def _post(path, body):
+        req = urllib.request.Request(
+            f"{live_server}{path}",
+            data=_json.dumps(body).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bob.api_key}",
+            },
+            method="POST",
+        )
+        return urllib.request.urlopen(req).read()
+
+    # We need posts with depends_on set but whose target isn't done yet.
+    # Create them as kind='assign' (not claim) so the "deps must be done"
+    # check doesn't fire, but the cycle-walker still sees them.
+    # task:P depends on task:Q (via assign)
+    # task:Q depends on task:newbie (via assign)
+    # Then trying to claim task:newbie with depends_on=[task:P] should detect
+    # cycle: newbie → P → Q → newbie
+    bob.assign("general", "task:P", "bob", "P work", depends_on=["task:Q"])
+    bob.assign("general", "task:Q", "bob", "Q work", depends_on=["task:newbie"])
+
+    with pytest.raises(SwarloError) as exc_info:
+        bob.claim("general", "task:newbie", "trying to close the loop",
+                  depends_on=["task:P"])
+    assert exc_info.value.status_code == 409
+    msg = str(exc_info.value).lower()
+    assert "cycle" in msg
+    assert "task:newbie" in msg
+    assert "task:p" in msg
+    assert "task:q" in msg
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 
