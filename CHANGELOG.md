@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.1 (2026-04-11)
+
+- `wait_for(task_key)` — subscribe to task completion, replaces polling
+- Pre-commit hook for file claims (`scripts/swarlo-precommit-hook`)
+- Eager-load replies in `read_channel` — threads work on arrival
+- `/idle` uses `last_active` not `last_seen`, collapsed N+1 to one query
+- `/liveness` supports `auto_expire=false` for observation without side effects
+- 166 tests passing
+
 ## v0.4.0 (2026-04-11)
 
 - Runnable demo: `examples/demo.py` — 3 agents coordinate in 60 seconds
