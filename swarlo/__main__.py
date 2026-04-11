@@ -155,6 +155,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ping.add_argument("--hub")
     ping.add_argument("--api-key")
 
+    mine = sub.add_parser("mine", help="What should I be working on?")
+    mine.add_argument("--member-id", help="Override member ID")
+    mine.add_argument("--server")
+    mine.add_argument("--hub")
+    mine.add_argument("--api-key")
+
     sub.add_parser("score", help="Coordination score").add_argument("--server")
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
@@ -328,6 +334,25 @@ fi
         if status not in (200, 201):
             raise SystemExit(f"Report failed ({status}): {body}")
         print(f"Reported {args.status} for {args.task_key} on #{args.channel}")
+        return
+
+    if args.command == "mine":
+        runtime = _require_runtime(args)
+        member_id = args.member_id or runtime.get("member_id", "unknown")
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/mine/{member_id}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            raise SystemExit(f"Mine failed ({status}): {body}")
+        if body.get("has_work"):
+            for c in body["claims"]:
+                print(f"  CLAIMED: {c['task_key']} — {c['content'][:60]}")
+        else:
+            print("No open work. Find something to do.")
+        for a in body.get("assignments", []):
+            print(f"  ASSIGNED: {a['task_key']} by {a.get('assigned_by','?')} — {a['content'][:60]}")
         return
 
     if args.command == "ping":
