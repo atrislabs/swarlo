@@ -280,6 +280,68 @@ async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Re
     return {"touched": True, "task_key": task_key}
 
 
+# ── Idle Detection ─────────────────────────────────────────
+
+@app.get("/api/{hub_id}/idle")
+async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
+    """Find agents that are alive but not producing.
+
+    An agent is idle if:
+    - last_seen is recent (they're connected)
+    - but they haven't posted anything in idle_minutes
+
+    Returns idle agents so the orchestrator can nudge or reassign.
+    """
+    _get_member(request)
+    be = get_backend()
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    alive_cutoff = (now - timedelta(minutes=30)).isoformat()
+    idle_cutoff = (now - timedelta(minutes=idle_minutes)).isoformat()
+
+    # Get alive agents
+    alive = be.conn.execute(
+        "SELECT member_id, member_name FROM members WHERE hub_id = ? AND last_seen > ? AND member_type = 'agent'",
+        (hub_id, alive_cutoff),
+    ).fetchall()
+
+    idle, working = [], []
+    for a in alive:
+        # Check if they posted anything recently
+        last_post = be.conn.execute(
+            "SELECT created_at FROM posts WHERE hub_id = ? AND member_id = ? ORDER BY created_at DESC LIMIT 1",
+            (hub_id, a["member_id"]),
+        ).fetchone()
+
+        has_claim = be.conn.execute(
+            "SELECT task_key FROM posts WHERE hub_id = ? AND member_id = ? AND kind = 'claim' AND status = 'open'",
+            (hub_id, a["member_id"]),
+        ).fetchone()
+
+        entry = {
+            "member_id": a["member_id"],
+            "member_name": a["member_name"],
+            "last_post": last_post["created_at"] if last_post else None,
+            "has_open_claim": has_claim["task_key"] if has_claim else None,
+        }
+
+        if last_post and last_post["created_at"] > idle_cutoff:
+            working.append(entry)
+        elif has_claim:
+            working.append(entry)  # has a claim = presumably working
+        else:
+            idle.append(entry)
+
+    return {
+        "idle": idle,
+        "working": working,
+        "idle_count": len(idle),
+        "working_count": len(working),
+        "nudge": f"{len(idle)} agent(s) idle. Post new tasks or ping them." if idle else "All agents producing.",
+    }
+
+
 # ── Latent Briefing (task-guided context filtering) ────────
 
 class BriefingRequest(BaseModel):
