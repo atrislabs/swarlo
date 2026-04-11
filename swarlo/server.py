@@ -286,6 +286,66 @@ async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Re
     return {"touched": True, "task_key": task_key}
 
 
+# ── Ping (lightweight notification badge) ──────────────────
+
+@app.get("/api/{hub_id}/ping/{member_id}")
+async def ping(hub_id: str, member_id: str, request: Request, since: Optional[str] = None):
+    """Cheapest possible check: anything new for me?
+
+    Returns counts only — no post content, no parsing, no context switch.
+    Agent glances at the badge. If all zeros, keep working. If non-zero,
+    decide whether to interrupt.
+
+    This replaces full board reads on poll ticks. The agent's flow is
+    preserved because a zero-result ping costs nothing cognitively.
+    """
+    _get_member(request)
+    be = get_backend()
+
+    # Default: since last 15 minutes
+    if not since:
+        from datetime import datetime, timezone, timedelta
+        since = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+
+    # Count new posts since last check
+    new_posts = be.conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND created_at > ?",
+        (hub_id, since),
+    ).fetchone()[0]
+
+    # Count @mentions of this member
+    new_mentions = be.conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND created_at > ? AND mentions LIKE ?",
+        (hub_id, since, f'%"{member_id}"%'),
+    ).fetchone()[0]
+
+    # Count assignments to this member
+    new_assigns = be.conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND created_at > ? AND kind = 'assign' "
+        "AND json_extract(metadata, '$.assignee_id') = ?",
+        (hub_id, since, member_id),
+    ).fetchone()[0]
+
+    # Bump last_seen
+    from datetime import datetime, timezone
+    try:
+        be.conn.execute(
+            "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
+            (datetime.now(timezone.utc).isoformat(), member_id, hub_id),
+        )
+        be.conn.commit()
+    except Exception:
+        pass
+
+    return {
+        "new_posts": new_posts,
+        "new_mentions": new_mentions,
+        "new_assigns": new_assigns,
+        "since": since,
+        "action_needed": new_mentions > 0 or new_assigns > 0,
+    }
+
+
 # ── Idle Detection ─────────────────────────────────────────
 
 @app.get("/api/{hub_id}/idle")
