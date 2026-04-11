@@ -277,6 +277,73 @@ def test_wait_for_times_out_when_task_never_ships(live_server):
     assert exc_info.value.status_code == 408
 
 
+def test_precommit_hook_blocks_conflicting_files(live_server, tmp_path):
+    """The swarlo-precommit-hook should block a commit when a staged file
+    is claimed by another agent, and pass when files are unclaimed.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    # Two agents share the hub
+    alice = SwarloClient(live_server, hub="hook-test")
+    bob = SwarloClient(live_server, hub="hook-test")
+    alice_key = alice.join("alice", name="Alice")
+    bob_key = bob.join("bob", name="Bob")
+
+    # Alice claims one file
+    alice.claim_file("general", "src/contested.py")
+
+    # Set up Bob's swarlo config in a temp HOME so the hook reads it
+    fake_home = tmp_path / "home"
+    (fake_home / ".swarlo").mkdir(parents=True)
+    config = {
+        "server": live_server,
+        "hub": "hook-test",
+        "member_id": "bob",
+        "api_key": bob_key,
+    }
+    (fake_home / ".swarlo" / "config.json").write_text(json.dumps(config))
+
+    # Set up a tiny git repo where Bob will try to commit
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "bob@test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Bob"], cwd=repo, check=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "contested.py").write_text("# bob's edit\n")
+    (repo / "src" / "safe.py").write_text("# nobody owns this\n")
+
+    hook = Path(__file__).resolve().parent.parent / "scripts" / "swarlo-precommit-hook"
+    assert hook.exists(), f"hook missing at {hook}"
+
+    env = {**os.environ, "HOME": str(fake_home)}
+
+    # Case 1: stage only the SAFE file → hook should pass
+    subprocess.run(["git", "add", "src/safe.py"], cwd=repo, check=True)
+    result = subprocess.run(
+        [str(hook)], cwd=repo, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"hook should pass for unclaimed file, got {result.returncode}\n"
+        f"stderr: {result.stderr}"
+    )
+    subprocess.run(["git", "reset"], cwd=repo, check=True)
+
+    # Case 2: stage the CONTESTED file → hook should block
+    subprocess.run(["git", "add", "src/contested.py"], cwd=repo, check=True)
+    result = subprocess.run(
+        [str(hook)], cwd=repo, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 1, (
+        f"hook should block claimed file, got {result.returncode}\n"
+        f"stderr: {result.stderr}"
+    )
+    assert "contested.py" in result.stderr
+    assert "Alice" in result.stderr or "alice" in result.stderr
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 
