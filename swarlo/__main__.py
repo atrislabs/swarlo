@@ -180,7 +180,198 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Target path for the hook (default: <repo>/.git/hooks/pre-commit)",
     )
 
+    sub.add_parser(
+        "doctor",
+        help="Diagnose swarlo setup — config, server reachability, git hook, member registration",
+    )
+
     return parser
+
+
+# ── Doctor ──────────────────────────────────────────────────
+
+# ANSI colors for doctor output. Fall back to empty strings when stdout
+# is not a terminal (e.g. when captured in tests or piped).
+def _colors() -> dict:
+    if sys.stdout.isatty():
+        return {
+            "ok": "\033[32m",    # green
+            "warn": "\033[33m",  # yellow
+            "fail": "\033[31m",  # red
+            "dim": "\033[2m",
+            "reset": "\033[0m",
+        }
+    return {k: "" for k in ("ok", "warn", "fail", "dim", "reset")}
+
+
+def _check(label: str, status: str, detail: str = "", colors: dict | None = None) -> None:
+    """Print one doctor check line.
+
+    status: 'ok' | 'warn' | 'fail'
+    """
+    c = colors or _colors()
+    marks = {"ok": "✓", "warn": "!", "fail": "✗"}
+    tag = f"{c[status]}{marks.get(status, '?')} {status.upper():<4}{c['reset']}"
+    if detail:
+        print(f"  {tag}  {label} {c['dim']}— {detail}{c['reset']}")
+    else:
+        print(f"  {tag}  {label}")
+
+
+def _run_doctor() -> int:
+    """Diagnose swarlo setup and print a per-check report.
+
+    Returns 0 if every check is OK or WARN, 1 if any check is FAIL.
+    Designed to be run by a human at any time — no side effects, no
+    config writes, just reads and HTTP HEADs.
+
+    Checks, in order:
+      1. ~/.swarlo/config.json exists and parses as JSON
+      2. Config has the required fields (server, hub, member_id, api_key)
+      3. Server responds to /api/health
+      4. Our member_id is registered on the server (listed in /members)
+      5. Running inside a git repo (optional — only a WARN if not)
+      6. Pre-commit hook is installed at .git/hooks/pre-commit
+      7. The installed hook matches the canonical SOURCE
+    """
+    import subprocess
+    from pathlib import Path
+
+    colors = _colors()
+    any_fail = False
+
+    print()
+    print(f"  {colors['dim']}swarlo doctor — diagnostics{colors['reset']}")
+    print()
+
+    # Check 1: config file exists and parses
+    cfg_path = _config_path()
+    config: dict = {}
+    if not cfg_path.exists():
+        _check(f"config file at {cfg_path}", "fail",
+               "missing — run `swarlo join ...` first", colors)
+        any_fail = True
+    else:
+        try:
+            config = json.loads(cfg_path.read_text())
+            _check(f"config file at {cfg_path}", "ok", "parsed OK", colors)
+        except json.JSONDecodeError as exc:
+            _check(f"config file at {cfg_path}", "fail",
+                   f"invalid JSON: {exc}", colors)
+            any_fail = True
+
+    # Check 2: required fields present
+    required = ["server", "hub", "member_id", "api_key"]
+    missing = [k for k in required if not config.get(k)]
+    if config and missing:
+        _check("required config fields",
+               "fail" if "server" in missing else "warn",
+               f"missing: {', '.join(missing)}", colors)
+        if "server" in missing:
+            any_fail = True
+    elif config:
+        _check("required config fields", "ok",
+               "server, hub, member_id, api_key present", colors)
+
+    # Check 3: server is reachable
+    server = config.get("server")
+    server_ok = False
+    if server:
+        try:
+            with urllib.request.urlopen(
+                f"{server.rstrip('/')}/api/health", timeout=3
+            ) as resp:
+                body = json.loads(resp.read().decode())
+                if body.get("status") == "ok":
+                    _check(f"server health at {server}", "ok",
+                           "responded with status=ok", colors)
+                    server_ok = True
+                else:
+                    _check(f"server health at {server}", "warn",
+                           f"unexpected body: {body}", colors)
+        except Exception as exc:
+            _check(f"server health at {server}", "fail",
+                   f"unreachable: {exc}", colors)
+            any_fail = True
+
+    # Check 4: our member_id is registered
+    hub = config.get("hub")
+    member_id = config.get("member_id")
+    api_key = config.get("api_key")
+    if server_ok and hub and member_id and api_key:
+        try:
+            req = urllib.request.Request(
+                f"{server.rstrip('/')}/api/{hub}/members",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                members = data.get("members") or []
+                me = next((m for m in members if m.get("member_id") == member_id), None)
+                if me:
+                    _check(f"member_id '{member_id}' registered in hub '{hub}'",
+                           "ok", f"member_name={me.get('member_name')}", colors)
+                else:
+                    _check(f"member_id '{member_id}' registered in hub '{hub}'",
+                           "fail", "not found — run `swarlo join ...` again", colors)
+                    any_fail = True
+        except Exception as exc:
+            _check(f"member lookup in hub '{hub}'", "warn",
+                   f"could not verify: {exc}", colors)
+
+    # Check 5: inside a git repo
+    in_git = False
+    repo_root: Path | None = None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        )
+        repo_root = Path(result.stdout.strip())
+        in_git = True
+        _check(f"git repo at {repo_root}", "ok", "", colors)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _check("git repo", "warn",
+               "not inside a git repo — hook checks skipped", colors)
+
+    # Check 6 + 7: pre-commit hook installed and matches canonical source
+    if in_git and repo_root is not None:
+        hook_path = repo_root / ".git" / "hooks" / "pre-commit"
+        if not hook_path.exists():
+            _check("pre-commit hook", "warn",
+                   "not installed — run `swarlo install-hook`", colors)
+        else:
+            try:
+                installed = hook_path.read_text()
+            except Exception as exc:
+                _check("pre-commit hook", "warn",
+                       f"cannot read: {exc}", colors)
+                installed = None
+
+            if installed is not None:
+                try:
+                    from swarlo._precommit_hook_source import SOURCE
+                    if installed == SOURCE:
+                        _check("pre-commit hook matches canonical source",
+                               "ok", str(hook_path), colors)
+                    else:
+                        _check("pre-commit hook matches canonical source",
+                               "warn",
+                               "drift detected — run `swarlo install-hook --force` to update",
+                               colors)
+                except ImportError:
+                    _check("pre-commit hook canonical source",
+                           "warn",
+                           "could not import swarlo._precommit_hook_source",
+                           colors)
+
+    print()
+    if any_fail:
+        print(f"  {colors['fail']}At least one check failed.{colors['reset']} "
+              f"Fix the issues above and re-run.")
+        return 1
+    print(f"  {colors['ok']}All checks passed.{colors['reset']}")
+    return 0
 
 
 def main():
@@ -239,6 +430,9 @@ fi
         if not os.path.exists(os.path.expanduser("~/.swarlo/config.json")):
             print("Next: run `swarlo join --server <url> --hub <hub> --member-id <id>` to connect.")
         return
+
+    if args.command == "doctor":
+        return _run_doctor()
 
     if args.command == "install-hook":
         from swarlo._precommit_hook_source import SOURCE
