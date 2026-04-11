@@ -376,11 +376,15 @@ async def my_open_tasks(hub_id: str, member_id: str, request: Request):
 async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
     """Find agents that are alive but not producing.
 
-    An agent is idle if:
-    - last_seen is recent (they're connected)
-    - but they haven't posted anything in idle_minutes
+    Uses the last_active column (added 2026-04-11) which is bumped only
+    when an agent actually produces work (post/claim/report) — not on
+    every auth touch like last_seen. This makes "idle" a server-native
+    concept instead of an N+1 query that infers it from posts.
 
-    Returns idle agents so the orchestrator can nudge or reassign.
+    An agent is:
+    - alive   : last_seen   within 30 minutes (connected)
+    - working : last_active within idle_minutes (producing) OR has open claim
+    - idle    : alive but neither of the above
     """
     _get_member(request)
     be = get_backend()
@@ -390,36 +394,34 @@ async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
     alive_cutoff = (now - timedelta(minutes=30)).isoformat()
     idle_cutoff = (now - timedelta(minutes=idle_minutes)).isoformat()
 
-    # Get alive agents
-    alive = be.conn.execute(
-        "SELECT member_id, member_name FROM members WHERE hub_id = ? AND last_seen > ? AND member_type = 'agent'",
+    # Single query: alive agents with their last_active and any open claim.
+    # LEFT JOIN folds the open-claim lookup into one round trip.
+    rows = be.conn.execute(
+        """
+        SELECT m.member_id, m.member_name, m.last_active,
+               (SELECT task_key FROM posts
+                WHERE hub_id = m.hub_id AND member_id = m.member_id
+                  AND kind = 'claim' AND status = 'open'
+                LIMIT 1) AS open_claim
+        FROM members m
+        WHERE m.hub_id = ? AND m.last_seen > ? AND m.member_type = 'agent'
+        """,
         (hub_id, alive_cutoff),
     ).fetchall()
 
     idle, working = [], []
-    for a in alive:
-        # Check if they posted anything recently
-        last_post = be.conn.execute(
-            "SELECT created_at FROM posts WHERE hub_id = ? AND member_id = ? ORDER BY created_at DESC LIMIT 1",
-            (hub_id, a["member_id"]),
-        ).fetchone()
-
-        has_claim = be.conn.execute(
-            "SELECT task_key FROM posts WHERE hub_id = ? AND member_id = ? AND kind = 'claim' AND status = 'open'",
-            (hub_id, a["member_id"]),
-        ).fetchone()
-
+    for r in rows:
         entry = {
-            "member_id": a["member_id"],
-            "member_name": a["member_name"],
-            "last_post": last_post["created_at"] if last_post else None,
-            "has_open_claim": has_claim["task_key"] if has_claim else None,
+            "member_id": r["member_id"],
+            "member_name": r["member_name"],
+            "last_active": r["last_active"],
+            "has_open_claim": r["open_claim"],
         }
-
-        if last_post and last_post["created_at"] > idle_cutoff:
+        # Working = produced work recently OR holding an open claim
+        if r["last_active"] and r["last_active"] > idle_cutoff:
             working.append(entry)
-        elif has_claim:
-            working.append(entry)  # has a claim = presumably working
+        elif r["open_claim"]:
+            working.append(entry)
         else:
             idle.append(entry)
 
@@ -556,15 +558,18 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30)
     cutoff_dead = (now - timedelta(minutes=stale_minutes * 3)).isoformat()
 
     rows = be.conn.execute(
-        "SELECT member_id, member_name, member_type, last_seen FROM members WHERE hub_id = ?",
+        "SELECT member_id, member_name, member_type, last_seen, last_active FROM members WHERE hub_id = ?",
         (hub_id,),
     ).fetchall()
 
     alive, dying, dead = [], [], []
     for r in rows:
         ls = r["last_seen"]
+        # last_seen = connected, last_active = producing work. Surface both
+        # so consumers can tell "alive but silent" from "alive and shipping".
         entry = {"member_id": r["member_id"], "member_name": r["member_name"],
-                 "member_type": r["member_type"], "last_seen": ls}
+                 "member_type": r["member_type"], "last_seen": ls,
+                 "last_active": r["last_active"]}
         if not ls:
             dead.append(entry)
         elif ls < cutoff_dead:

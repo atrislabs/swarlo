@@ -173,6 +173,40 @@ def test_ping_finds_assigns_via_first_class_column(live_server):
     assert after["action_needed"] is True
 
 
+def test_idle_uses_last_active_not_last_seen(live_server):
+    """Pinging /ping should NOT make an agent look 'working' to /idle.
+
+    Before the last_active split, calling /ping would bump last_seen and
+    /idle would treat the agent as working. After the split, only actual
+    production (post/claim/report) bumps last_active, so a polling-only
+    agent correctly shows as idle.
+    """
+    poller = SwarloClient(live_server, hub="idle-split")
+    worker = SwarloClient(live_server, hub="idle-split")
+    observer = SwarloClient(live_server, hub="idle-split")
+
+    poller.join("poller", name="Poller")
+    worker.join("worker", name="Worker")
+    observer.join("observer", name="Observer")
+
+    # Worker actually produces work
+    worker.post("general", "doing things")
+
+    # Poller only pings — no posts, no claims
+    poller.ping("poller")
+    poller.ping("poller")
+    poller.ping("poller")
+
+    # Observer queries idle. Poller should be idle, worker should be working.
+    result = observer._request("GET", "/api/idle-split/idle?idle_minutes=15")
+
+    idle_ids = {a["member_id"] for a in result["idle"]}
+    working_ids = {a["member_id"] for a in result["working"]}
+
+    assert "poller" in idle_ids, f"poller should be idle but got working={working_ids}"
+    assert "worker" in working_ids, f"worker should be working but got idle={idle_ids}"
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 
