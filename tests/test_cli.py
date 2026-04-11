@@ -97,3 +97,68 @@ def test_missing_runtime_errors(monkeypatch, tmp_path):
     monkeypatch.setenv("SWARLO_CONFIG", str(tmp_path / "missing.json"))
     with pytest.raises(SystemExit, match="Missing server"):
         cli._require_runtime(type("Args", (), {"server": None, "hub": None, "api_key": None})())
+
+
+def test_precommit_hook_source_matches_scripts_copy():
+    """The canonical SOURCE in swarlo/_precommit_hook_source.py must stay
+    byte-identical to scripts/swarlo-precommit-hook. If you edit one,
+    edit the other. A CI test catching drift immediately is cheaper
+    than two divergent copies of a 150-line hook.
+    """
+    from swarlo._precommit_hook_source import SOURCE
+
+    script_path = REPO_ROOT / "scripts" / "swarlo-precommit-hook"
+    on_disk = script_path.read_text()
+    assert SOURCE == on_disk, (
+        "swarlo/_precommit_hook_source.py SOURCE has drifted from "
+        "scripts/swarlo-precommit-hook. Sync them."
+    )
+
+
+def test_install_hook_writes_executable(monkeypatch, tmp_path, capsys):
+    """`swarlo install-hook --path ...` writes the hook and chmods +x."""
+    target = tmp_path / "pre-commit"
+
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "install-hook", "--path", str(target),
+    ])
+    cli.main()
+
+    assert target.exists()
+    from swarlo._precommit_hook_source import SOURCE
+    assert target.read_text() == SOURCE
+    import stat
+    mode = target.stat().st_mode
+    assert mode & stat.S_IXUSR, f"hook is not executable (mode={oct(mode)})"
+
+    out = capsys.readouterr().out
+    assert "Installed swarlo pre-commit hook" in out
+
+
+def test_install_hook_refuses_to_clobber_without_force(monkeypatch, tmp_path):
+    """Existing hook is not overwritten unless --force is passed."""
+    target = tmp_path / "pre-commit"
+    target.write_text("# existing\n")
+    original = target.read_text()
+
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "install-hook", "--path", str(target),
+    ])
+    with pytest.raises(SystemExit, match="already exists"):
+        cli.main()
+
+    assert target.read_text() == original
+
+
+def test_install_hook_force_overwrites(monkeypatch, tmp_path):
+    """--force replaces the existing hook."""
+    target = tmp_path / "pre-commit"
+    target.write_text("# old\n")
+
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "install-hook", "--path", str(target), "--force",
+    ])
+    cli.main()
+
+    from swarlo._precommit_hook_source import SOURCE
+    assert target.read_text() == SOURCE

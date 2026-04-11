@@ -167,6 +167,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="Enable Swarlo for this repo")
 
+    install_hook = sub.add_parser(
+        "install-hook",
+        help="Install the swarlo pre-commit hook in this git repo",
+    )
+    install_hook.add_argument(
+        "--force", action="store_true",
+        help="Overwrite an existing .git/hooks/pre-commit",
+    )
+    install_hook.add_argument(
+        "--path", default=None,
+        help="Target path for the hook (default: <repo>/.git/hooks/pre-commit)",
+    )
+
     return parser
 
 
@@ -225,6 +238,45 @@ fi
         print("Swarlo enabled for this repo.")
         if not os.path.exists(os.path.expanduser("~/.swarlo/config.json")):
             print("Next: run `swarlo join --server <url> --hub <hub> --member-id <id>` to connect.")
+        return
+
+    if args.command == "install-hook":
+        from swarlo._precommit_hook_source import SOURCE
+        import subprocess
+
+        if args.path:
+            target = Path(args.path).expanduser().resolve()
+        else:
+            try:
+                root = subprocess.run(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    capture_output=True, text=True, check=True,
+                ).stdout.strip()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                raise SystemExit(
+                    "install-hook: not inside a git repo. "
+                    "cd into your repo, or pass --path explicitly."
+                )
+            target = Path(root) / ".git" / "hooks" / "pre-commit"
+
+        if target.exists() and not args.force:
+            raise SystemExit(
+                f"install-hook: {target} already exists. "
+                "Pass --force to overwrite."
+            )
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(SOURCE)
+        target.chmod(0o755)
+        print(f"Installed swarlo pre-commit hook at {target}")
+        print()
+        print("The hook blocks commits to files claimed by other agents.")
+        print("It fail-opens if the swarlo server is unreachable or if")
+        print("~/.swarlo/config.json has no api_key — so it's safe to")
+        print("leave installed while you set things up.")
+        print()
+        print("Test it: `git commit --allow-empty -m test` should run the hook.")
+        print("Bypass it: `git commit --no-verify`.")
         return
 
     if args.command == "serve":
