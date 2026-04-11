@@ -435,9 +435,14 @@ class SQLiteBackend(SwarloBackend):
         if depends_on:
             blocked = await self._unmet_deps(hub_id, depends_on)
             if blocked:
+                # Enrich the error with the current state of each blocked
+                # dep so the user knows whether to wait, reassign, or
+                # escalate. Without this, "Blocked by unmet deps: task:B"
+                # gives no actionable signal.
+                explained = self._explain_blocked_deps(hub_id, blocked)
                 return ClaimResult(
                     claimed=False, conflict=True,
-                    message=f"Blocked by unmet dependencies: {', '.join(blocked)}",
+                    message=f"Blocked by unmet dependencies: {explained}",
                 )
 
         # Atomic claim via unique index — no TOCTOU race condition
@@ -496,6 +501,64 @@ class SQLiteBackend(SwarloBackend):
         ).fetchall()
         done_set = {r["task_key"] for r in rows}
         return [d for d in deps if d not in done_set]
+
+    def _explain_blocked_deps(self, hub_id: str, blocked: list[str]) -> str:
+        """Render a human-readable explanation of why blocked deps aren't met.
+
+        For each blocked dep, find the most-recent post with that task_key
+        and annotate the dep with what state it's in:
+          - task:X (not yet posted)
+          - task:X (claimed by @alice, in progress)
+          - task:X (failed)
+          - task:X (stale claim)
+
+        This is the error-path-only read path — one batch query for the
+        whole blocked set, no per-dep round trip.
+        """
+        if not blocked:
+            return ""
+        placeholders = ",".join("?" * len(blocked))
+        # For each blocked task_key, find its most recent post by kind/status.
+        # A task_key may have multiple posts (assign, claim, result) — we want
+        # the one that tells us the current state.
+        rows = self.conn.execute(
+            f"SELECT task_key, kind, status, member_name "
+            f"FROM posts "
+            f"WHERE hub_id = ? AND task_key IN ({placeholders}) "
+            f"ORDER BY created_at DESC",
+            (hub_id, *blocked),
+        ).fetchall()
+
+        # Walk rows in most-recent-first order and take the first row per task_key
+        latest: dict[str, dict] = {}
+        for r in rows:
+            if r["task_key"] not in latest:
+                latest[r["task_key"]] = {
+                    "kind": r["kind"],
+                    "status": r["status"],
+                    "member_name": r["member_name"],
+                }
+
+        parts: list[str] = []
+        for task_key in blocked:
+            info = latest.get(task_key)
+            if info is None:
+                parts.append(f"{task_key} (not yet posted)")
+                continue
+            kind = info["kind"]
+            status = info["status"]
+            name = info["member_name"]
+            if kind == "claim" and status == "open":
+                parts.append(f"{task_key} (claimed by @{name}, in progress)")
+            elif kind == "claim" and status == "stale":
+                parts.append(f"{task_key} (stale claim by @{name}, heartbeat expired)")
+            elif kind == "failed" or status == "failed":
+                parts.append(f"{task_key} (failed by @{name})")
+            elif kind == "assign":
+                parts.append(f"{task_key} (assigned to @{name}, not yet started)")
+            else:
+                parts.append(f"{task_key} ({kind}/{status or 'no-status'})")
+        return ", ".join(parts)
 
     def _find_cycle(self, hub_id: str, new_task_key: str,
                     declared_deps: list[str]) -> list[str] | None:

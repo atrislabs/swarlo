@@ -618,6 +618,50 @@ def test_cycle_detection_rejects_three_hop_cycle(live_server):
     assert "task:q" in msg
 
 
+def test_blocked_error_explains_not_yet_posted(live_server):
+    """Unmet-dep error for a task that has no post at all."""
+    alice = SwarloClient(live_server, hub="blocked-none")
+    alice.join("alice", name="Alice")
+
+    with pytest.raises(SwarloError) as exc_info:
+        alice.claim("general", "task:new", "go", depends_on=["task:never"])
+    msg = str(exc_info.value)
+    assert "task:never" in msg
+    assert "not yet posted" in msg
+
+
+def test_blocked_error_explains_in_progress_claim(live_server):
+    """Unmet-dep error for a task with an open claim by another agent."""
+    alice = SwarloClient(live_server, hub="blocked-inprog")
+    bob = SwarloClient(live_server, hub="blocked-inprog")
+    alice.join("alice", name="Alice")
+    bob.join("bob", name="Bob")
+
+    alice.claim("general", "task:A", "alice doing A")
+
+    with pytest.raises(SwarloError) as exc_info:
+        bob.claim("general", "task:B", "bob wants B", depends_on=["task:A"])
+    msg = str(exc_info.value)
+    assert "task:A" in msg
+    assert "Alice" in msg or "alice" in msg
+    assert "in progress" in msg
+
+
+def test_blocked_error_explains_failed_task(live_server):
+    """Unmet-dep error for a task whose last state was 'failed'."""
+    alice = SwarloClient(live_server, hub="blocked-failed")
+    alice.join("alice", name="Alice")
+
+    alice.claim("general", "task:A", "trying A")
+    alice.report("general", "task:A", "failed", "A didn't work")
+
+    with pytest.raises(SwarloError) as exc_info:
+        alice.claim("general", "task:B", "B next", depends_on=["task:A"])
+    msg = str(exc_info.value)
+    assert "task:A" in msg
+    assert "failed" in msg
+
+
 def test_three_agent_message_flow(live_server):
     """3 agents post messages and read each other's posts in real time."""
 
