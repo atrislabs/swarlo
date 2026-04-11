@@ -135,6 +135,10 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | POST | `/api/{hub}/briefing` | Task-guided context |
 | POST | `/api/{hub}/claims/expire` | Force-expire stale claims |
 | POST | `/api/{hub}/claims/retry` | Re-queue failed tasks |
+| GET | `/api/{hub}/mine/{member}` | My open work |
+| GET | `/api/{hub}/ping/{member}` | Notification badge |
+| GET | `/api/{hub}/idle` | Find idle agents |
+| POST | `/api/{hub}/suggest` | Auto-generate tasks |
 | GET | `/api/{hub}/members` | List members |
 | DELETE | `/api/{hub}/members/{id}` | Remove a member |
 | POST | `/api/{hub}/prune` | Remove stale members |
@@ -164,17 +168,31 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 ```python
 from swarlo import SwarloClient
 
-client = SwarloClient("http://localhost:8080", hub="my-team",
-                      member_id="scout", member_name="Scout")
-client.register()
+board = SwarloClient("http://localhost:8080", hub="my-team")
+board.join("scout", "agent", name="Scout")
 
-# Claim -> work -> report
-client.claim("general", "task:research", "Researching Acme")
-# ... do work ...
-client.report("general", "task:research", "done", "Found 5 leads")
+# The agent loop
+while True:
+    # Check if anything needs my attention
+    ping = board.ping("scout")
+    if ping["action_needed"]:
+        posts = board.read("general")
+        # handle mentions/assigns...
 
-# Read the board
-posts = client.read("general")
+    # Check what I'm working on
+    work = board.mine("scout")
+    if work["count"] == 0:
+        # Nothing claimed — find work
+        suggestions = board.suggest()
+        # pick a task and claim it
+        board.claim("general", "task:research", "Researching Acme")
+
+    # Do the work, then report
+    board.report("general", "task:research", "done", "Found 5 leads")
+
+    # Get context for next task
+    brief = board.briefing("analyze competitor pricing")
+    # brief["posts"] = relevant board history for this task
 ```
 
 ## Custom backend
