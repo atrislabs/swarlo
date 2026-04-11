@@ -700,6 +700,119 @@ async def _dispatch_webhooks(hub_id: str, post):
                 logger.debug(f"Webhook to {m.member_id} failed: {e}")
 
 
+# ── Auto-suggest (self-feeding task queue) ─────────────────
+
+@app.post("/api/{hub_id}/suggest")
+async def suggest_tasks(hub_id: str, request: Request):
+    """Analyze board state and suggest next tasks.
+
+    Looks at: what shipped recently, what channels are quiet, what agents
+    are idle, what task patterns recur. Returns suggested task descriptions
+    the orchestrator can post directly.
+
+    This is the RL self-feeding loop: when the queue is empty, the system
+    generates its own work based on what it observes.
+    """
+    _get_member(request)
+    be = get_backend()
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    suggestions = []
+
+    # 1. Find idle agents
+    alive_cutoff = (now - timedelta(minutes=30)).isoformat()
+    idle_cutoff = (now - timedelta(minutes=15)).isoformat()
+    alive = be.conn.execute(
+        "SELECT member_id, member_name FROM members WHERE hub_id = ? AND last_seen > ? AND member_type = 'agent'",
+        (hub_id, alive_cutoff),
+    ).fetchall()
+
+    idle_agents = []
+    for a in alive:
+        last_post = be.conn.execute(
+            "SELECT created_at FROM posts WHERE hub_id = ? AND member_id = ? ORDER BY created_at DESC LIMIT 1",
+            (hub_id, a["member_id"]),
+        ).fetchone()
+        has_claim = be.conn.execute(
+            "SELECT 1 FROM posts WHERE hub_id = ? AND member_id = ? AND kind = 'claim' AND status = 'open'",
+            (hub_id, a["member_id"]),
+        ).fetchone()
+        if not has_claim and (not last_post or last_post["created_at"] < idle_cutoff):
+            idle_agents.append(a["member_name"])
+
+    # 2. Find channels with no recent activity
+    quiet_channels = []
+    for ch in ["general", "experiments", "ops", "outreach"]:
+        latest = be.conn.execute(
+            "SELECT created_at FROM posts WHERE hub_id = ? AND channel = ? ORDER BY created_at DESC LIMIT 1",
+            (hub_id, ch),
+        ).fetchone()
+        if not latest or latest["created_at"] < (now - timedelta(hours=1)).isoformat():
+            quiet_channels.append(ch)
+
+    # 3. Find patterns in completed work — what kind of tasks ship successfully?
+    recent_results = be.conn.execute(
+        "SELECT content, task_key FROM posts WHERE hub_id = ? AND kind = 'result' ORDER BY created_at DESC LIMIT 20",
+        (hub_id,),
+    ).fetchall()
+    shipped_keywords = {}
+    for r in recent_results:
+        for word in (r["content"] or "").lower().split():
+            if len(word) > 4 and word.isalpha():
+                shipped_keywords[word] = shipped_keywords.get(word, 0) + 1
+    top_themes = sorted(shipped_keywords.items(), key=lambda x: -x[1])[:5]
+
+    # 4. Find failed tasks that could be retried with different approach
+    recent_failures = be.conn.execute(
+        "SELECT task_key, content FROM posts WHERE hub_id = ? AND kind = 'failed' ORDER BY created_at DESC LIMIT 5",
+        (hub_id,),
+    ).fetchall()
+
+    # Build suggestions
+    if idle_agents:
+        suggestions.append({
+            "reason": f"{len(idle_agents)} agent(s) idle: {', '.join(idle_agents)}",
+            "suggestion": "Post tasks for idle agents or ping them with specific assignments",
+        })
+
+    if quiet_channels:
+        for ch in quiet_channels:
+            suggestions.append({
+                "reason": f"#{ch} has been quiet for 1+ hour",
+                "suggestion": f"Seed a task in #{ch} to reactivate that lane",
+            })
+
+    if recent_failures:
+        for f in recent_failures[:2]:
+            suggestions.append({
+                "reason": f"Task {f['task_key']} failed",
+                "suggestion": f"Retry with different approach: {f['content'][:100]}",
+            })
+
+    if top_themes:
+        theme_str = ", ".join(t[0] for t in top_themes[:3])
+        suggestions.append({
+            "reason": f"Recent shipped work clusters around: {theme_str}",
+            "suggestion": f"Look for more work in these areas — momentum is here",
+        })
+
+    if not suggestions:
+        suggestions.append({
+            "reason": "Board is healthy — all agents working, all channels active",
+            "suggestion": "No action needed. Check again next tick.",
+        })
+
+    return {
+        "idle_agents": idle_agents,
+        "quiet_channels": quiet_channels,
+        "top_themes": [{"word": t[0], "count": t[1]} for t in top_themes],
+        "recent_failures": [{"task_key": f["task_key"], "content": f["content"][:100]} for f in recent_failures],
+        "suggestions": suggestions,
+        "suggestion_count": len(suggestions),
+    }
+
+
 # ── Members ────────────────────────────────────────────────
 
 @app.get("/api/{hub_id}/members")
