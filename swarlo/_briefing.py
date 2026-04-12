@@ -61,6 +61,29 @@ def _stem(tok: str) -> str:
     return tok
 
 
+# ── v0: random baseline (Codex-proposed falsification test) ──────
+#
+# Codex flagged this at the start of Phase 2 as the simplest
+# falsifier: if a random permutation of candidates matches a
+# "smart" scorer's recall at the same K, the smart scorer is a
+# bench artifact, not a real win. v0 exists only to run that check.
+#
+# Deterministic per-call via Python's hash(task) so the bench is
+# reproducible but different tasks get different orderings.
+
+def v0_random(task: str, candidates: list[str]) -> list[float]:
+    """Return scores that induce a random permutation of candidates.
+
+    Uses a task-seeded RNG so repeated calls with the same task
+    produce the same ordering — lets the bench control variance.
+    """
+    import random as _random
+    rng = _random.Random(hash(task) & 0xFFFFFFFF)
+    n = len(candidates)
+    # A random permutation is achieved by random scores in [0,1]
+    return [rng.random() for _ in range(n)]
+
+
 # ── v1: original regex + overlap (kept for A/B testing) ───────────
 
 def v1_regex(task: str, candidates: list[str]) -> list[float]:
@@ -324,6 +347,7 @@ def v4_prf_gated(
 # ── Dispatcher ────────────────────────────────────────────────────
 
 SCORERS = {
+    "random": v0_random,  # falsification baseline only — do not default
     "regex": v1_regex,
     "tfidf": v2_tfidf,
     "prf": v3_prf_tfidf,

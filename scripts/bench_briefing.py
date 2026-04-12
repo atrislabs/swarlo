@@ -225,7 +225,7 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int, mode: str = 
         client = SwarloClient(base, hub=hub)
         key = client.join("bencher", name="Bencher")
 
-        metrics_by_scorer: dict[str, list[dict]] = {"regex": [], "tfidf": [], "prf": [], "prf_gated": []}
+        metrics_by_scorer: dict[str, list[dict]] = {"random": [], "regex": [], "tfidf": [], "prf": [], "prf_gated": []}
         for i in range(iters):
             # Each iter runs in its own hub so posts never leak across iters
             iter_hub = f"{hub}-{i}"
@@ -239,7 +239,7 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int, mode: str = 
                 "quota problem in the improvement endpoint. Pull up anything "
                 "the team has learned about this."
             )
-            for scorer in ("regex", "tfidf", "prf", "prf_gated"):
+            for scorer in ("random", "regex", "tfidf", "prf", "prf_gated"):
                 metrics_by_scorer[scorer].append(
                     _score_one(iter_client, task, relevant_contents, scorer)
                 )
@@ -300,19 +300,20 @@ def _print_table(results: dict) -> None:
         ("n_returned_mean", "n_return"),
         ("latency_ms_mean", "lat_ms"),
     ]
-    header = f"{'metric':12s}  {'v1 regex':>10s}  {'v2 tfidf':>10s}  {'v3 prf':>10s}  {'v4 gated':>10s}  {'Δ v4-v2':>10s}"
+    header = f"{'metric':12s}  {'v0 random':>10s}  {'v1 regex':>10s}  {'v2 tfidf':>10s}  {'v3 prf':>10s}  {'v4 gated':>10s}  {'Δ v2-v0':>10s}"
     print(header)
-    print("-" * 82)
+    print("-" * 96)
     for field, label in key_metrics:
+        rnd = results["random"].get(field, 0.0)
         r = results["regex"].get(field, 0.0)
         t = results["tfidf"].get(field, 0.0)
         p = results["prf"].get(field, 0.0)
         g = results["prf_gated"].get(field, 0.0)
-        delta = g - t
+        delta_vs_random = t - rnd
         if "latency" in field:
-            print(f"{label:12s}  {r:10.2f}  {t:10.2f}  {p:10.2f}  {g:10.2f}  {delta:+10.2f}")
+            print(f"{label:12s}  {rnd:10.2f}  {r:10.2f}  {t:10.2f}  {p:10.2f}  {g:10.2f}  {delta_vs_random:+10.2f}")
         else:
-            print(f"{label:12s}  {r:10.3f}  {t:10.3f}  {p:10.3f}  {g:10.3f}  {delta:+10.3f}")
+            print(f"{label:12s}  {rnd:10.3f}  {r:10.3f}  {t:10.3f}  {p:10.3f}  {g:10.3f}  {delta_vs_random:+10.3f}")
 
 
 if __name__ == "__main__":
