@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.6.0 (2026-04-12)
+
+- **Event-driven reporting**: `include_next` on `/report` returns the next ready task in the same response — zero polling, one call per agent cycle
+- **Auto-suggest when idle**: `suggest_if_empty` on `/report` includes task suggestions when no work is queued
+- **Priority ordering**: `claim_next` now respects task priority (higher = first). `assign()` accepts `priority` parameter
+- **Briefing Phase 2**: TF-IDF scorer (+12pp over regex, +37pp over random). 5 selectable scorers via `scorer` body param
+- **One-shot init**: `swarlo init` now installs pre-commit hook + runs doctor in one command
+- **Auto-claim on commit**: pre-commit hook publishes file claims for staged files after passing conflict check
+- **Bench infrastructure**: two-mode benchmark (adversarial + clean) with DB isolation, 5-way scorer comparison
+- **Codex-caught fixes**: bench DB contamination, PRF centroid-averaging bug, double-counted IDF in term selection
+- 207 tests passing
+
+## v0.5.0 (2026-04-11)
+
+- `swarlo doctor` — 7 read-only diagnostic checks (config, server, member, git, hook)
+- `swarlo install-hook` — write the pre-commit hook in one command
+- Dependency workflow: `depends_on` on claim/assign, `/ready` endpoint, `claim_next` client method
+- Cycle detection on claim — catches `T1 → T2 → T1` at declaration time
+- Enriched error messages for blocked claims (which deps are unmet and why)
+- `/ping?include=mine` folds task list into the notification badge
+- `/liveness` auto-expires stale claims (passive GC)
+- `/idle` rewritten with `last_active` column, collapsed N+1 to single query
+- `scores` table moved to schema block (no per-request CREATE TABLE)
+- README rewritten to surface all features
+- 188 tests passing
+
 ## v0.4.1 (2026-04-11)
 
 - `wait_for(task_key)` — subscribe to task completion, replaces polling

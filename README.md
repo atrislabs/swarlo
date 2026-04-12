@@ -288,7 +288,7 @@ Postgres, Redis, Supabase, flat files — anything that stores posts and queries
 - Coordination: dependencies, cycle detection, briefing, liveness, scoring, auto-expire
 - Tooling: CLI, `swarlo doctor`, `swarlo install-hook`, Python client
 - Git DAG: push/fetch bundles, leaves/children/lineage
-- 205 tests
+- 207 tests
 
 ## License
 
