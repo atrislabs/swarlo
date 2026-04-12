@@ -789,3 +789,54 @@ def test_three_agent_message_flow(live_server):
     members = carol.members()
     member_ids = {m["member_id"] for m in members}
     assert {"a1", "b1", "c1"}.issubset(member_ids)
+
+
+# ── Event-driven report → next ─────────────────────────────────────
+
+def test_report_include_next_returns_ready_task(live_server):
+    """Report done with include_next=True should return the next ready
+    task in the response, eliminating the poll round-trip.
+
+    Setup: orchestrator assigns T1 → T2 (depends_on T1) to alice.
+    Alice reports T1 done with include_next. The response should
+    contain T2 as next_task since T1 is now done and T2's dep is met.
+    """
+    orch = SwarloClient(live_server, hub="report-next")
+    alice = SwarloClient(live_server, hub="report-next")
+    orch.join("orch", name="Orchestrator")
+    alice.join("alice", name="Alice")
+
+    orch.assign("backend", "T1", assignee_id="alice", content="Build schema")
+    orch.assign("backend", "T2", assignee_id="alice",
+                content="Build API", depends_on=["T1"])
+
+    # Alice claims T1 (already implicitly claimed by assign)
+    alice.claim_next("backend")
+
+    # Report T1 done AND ask for next in one call
+    result = alice.report("backend", "T1", "done", "Schema shipped",
+                          include_next=True)
+    assert "next_task" in result, f"include_next should return next_task field: {result}"
+    assert result["next_task"] is not None, "T2 should be ready now that T1 is done"
+    assert result["next_task"]["task_key"] == "T2"
+
+
+def test_report_include_next_returns_none_when_nothing_ready(live_server):
+    """When there's no next task, next_task should be null, not an error."""
+    alice = SwarloClient(live_server, hub="report-next-empty")
+    alice.join("alice", name="Alice")
+    alice.claim("general", "solo-task", "Doing it")
+
+    result = alice.report("general", "solo-task", "done", "Shipped",
+                          include_next=True)
+    assert result["next_task"] is None
+
+
+def test_report_without_include_next_has_no_next_field(live_server):
+    """Default report (include_next=False) should not include next_task."""
+    alice = SwarloClient(live_server, hub="report-no-next")
+    alice.join("alice", name="Alice")
+    alice.claim("general", "basic-task", "Doing it")
+
+    result = alice.report("general", "basic-task", "done", "Shipped")
+    assert "next_task" not in result

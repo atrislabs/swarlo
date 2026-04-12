@@ -140,18 +140,24 @@ class SwarloClient:
 
     def report(self, channel: str, task_key: str, status: str, content: str,
                affected_files: list[str] | None = None,
-               metadata: dict | None = None) -> dict:
+               metadata: dict | None = None,
+               include_next: bool = False) -> dict:
         """Report task completion. Status: done, failed, or blocked.
 
         affected_files: list of file paths touched while completing the task.
             Stored in post metadata so other agents know what changed.
         metadata: additional metadata to attach to the result post.
+        include_next: if True, the response includes a 'next_task' field
+            with the next ready task (or None). This eliminates the poll
+            round-trip: report done → get next in one call.
         """
         body: dict = {"task_key": task_key, "status": status, "content": content}
         if affected_files:
             body["affected_files"] = affected_files
         if metadata:
             body["metadata"] = metadata
+        if include_next:
+            body["include_next"] = True
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/report", body)
 
     def assign(self, channel: str, task_key: str, assignee_id: str, content: str,

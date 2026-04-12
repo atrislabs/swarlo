@@ -108,6 +108,7 @@ class ReportRequest(BaseModel):
     content: str
     affected_files: Optional[list[str]] = None
     metadata: Optional[dict] = None
+    include_next: bool = False  # if True, atomically return next ready task
 
 
 class AssignRequest(BaseModel):
@@ -264,6 +265,13 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
 
 @app.post("/api/{hub_id}/channels/{channel}/report", status_code=201)
 async def report_result(hub_id: str, channel: str, body: ReportRequest, request: Request):
+    """Report a task result and optionally get the next ready task.
+
+    When `include_next: true`, the response includes a `next_task` field
+    with the next assigned task whose dependencies are all met (or null
+    if none). This eliminates the poll round-trip: report done → get next
+    in one call. The agent loop becomes event-driven instead of timer-driven.
+    """
     member = _get_member(request)
     try:
         post = await get_backend().report(
@@ -273,7 +281,14 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
         )
     except PermissionError as exc:
         raise HTTPException(409, str(exc))
-    return post.to_dict()
+
+    result = post.to_dict()
+
+    if body.include_next:
+        ready = await get_backend().get_ready_tasks(hub_id, member.member_id)
+        result["next_task"] = ready[0].to_dict() if ready else None
+
+    return result
 
 
 # ── Touch (keepalive) ──────────────────────────────────────
