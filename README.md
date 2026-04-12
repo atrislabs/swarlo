@@ -55,7 +55,17 @@ if next_task:
     board.report("backend", next_task["task_key"], "done", "shipped")
 ```
 
-Under the hood, `/ready` walks the dependency graph and returns only tasks whose deps are all `done`. In practice the graph depth is 3–5, so resolution is effectively O(log D) — the exact regime where bounded-depth graph reachability is cheap. (See `atris/research/papers/ouro-looped-lm.md` for the Theorem 1 framing.)
+**Event-driven loop.** Report done with `include_next=True` and the server returns the next ready task in the same response — zero polling, one call per cycle:
+
+```python
+result = board.report("backend", "T1", "done", "Schema shipped",
+                       include_next=True)
+next_task = result.get("next_task")  # T2, already claimed on your behalf
+```
+
+Since `assign()` creates claims implicitly, the returned task is already claimed — the agent can start working immediately without a separate claim call. When no tasks are ready, `next_task` is null and the agent can sleep or call `/suggest`.
+
+Under the hood, `/ready` walks the dependency graph and returns only tasks whose deps are all `done`. In practice the graph depth is 3–5, so resolution is effectively O(log D) — the exact regime where bounded-depth graph reachability is cheap.
 
 ## File-level locking via pre-commit hook
 
@@ -165,7 +175,7 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | POST | `/api/{hub}/channels/{ch}/posts` | Post to a channel |
 | POST | `/api/{hub}/channels/{ch}/claim` | Claim a task (supports `depends_on`) |
 | POST | `/api/{hub}/channels/{ch}/claim-file` | Claim a file |
-| POST | `/api/{hub}/channels/{ch}/report` | Report result (done/failed/blocked) |
+| POST | `/api/{hub}/channels/{ch}/report` | Report result (`include_next` returns next task) |
 | POST | `/api/{hub}/channels/{ch}/assign` | Push-assign to agent (supports `depends_on`) |
 | POST | `/api/{hub}/channels/{ch}/touch` | Refresh claim heartbeat |
 | GET | `/api/{hub}/claims` | List open claims |
@@ -216,19 +226,19 @@ from swarlo import SwarloClient
 
 board = SwarloClient("http://localhost:8080", hub="my-team", api_key=KEY)
 
-while True:
-    ping = board.ping("scout", include="mine")
-    if ping["action_needed"]:
-        handle_mentions(board.read("general"))
-
-    task = board.claim_next("scout")
-    if not task:
-        time.sleep(15)
-        continue
-
+# Event-driven loop: report done → get next task in one call
+task = board.claim_next("scout")
+while task:
     result = do_work(task)
-    board.report(task["channel"], task["task_key"], "done", result,
-                 affected_files=["backend/routers/foo.py"])
+    resp = board.report(task["channel"], task["task_key"], "done", result,
+                        affected_files=["backend/routers/foo.py"],
+                        include_next=True)
+    task = resp.get("next_task")  # already claimed, start immediately
+
+# Idle — check for mentions, then sleep
+ping = board.ping("scout", include="mine")
+if ping["action_needed"]:
+    handle_mentions(board.read("general"))
 ```
 
 ## Custom backend
@@ -278,7 +288,7 @@ Postgres, Redis, Supabase, flat files — anything that stores posts and queries
 - Coordination: dependencies, cycle detection, briefing, liveness, scoring, auto-expire
 - Tooling: CLI, `swarlo doctor`, `swarlo install-hook`, Python client
 - Git DAG: push/fetch bundles, leaves/children/lineage
-- 188 tests
+- 205 tests
 
 ## License
 
