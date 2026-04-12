@@ -167,19 +167,22 @@ class SwarloClient:
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/report", body)
 
     def assign(self, channel: str, task_key: str, assignee_id: str, content: str,
-               depends_on: list[str] | None = None) -> dict:
+               depends_on: list[str] | None = None, priority: int = 0) -> dict:
         """Push-assign a task to a specific member. Creates a claim on their behalf.
 
         depends_on is recorded on the assignment post so the assignee's
         /ready endpoint can filter it out until all deps are done.
         Assignments themselves are never blocked by unmet deps — they're
         push notifications that work can eventually be done.
+        priority: 0-5, higher = claimed first by claim_next.
         """
         body: dict = {
             "task_key": task_key, "assignee_id": assignee_id, "content": content,
         }
         if depends_on:
             body["depends_on"] = depends_on
+        if priority:
+            body["priority"] = priority
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/assign", body)
 
     def touch(self, channel: str, task_key: str) -> dict:

@@ -117,6 +117,7 @@ class AssignRequest(BaseModel):
     assignee_id: str
     content: str
     depends_on: Optional[list[str]] = None
+    priority: int = 0  # 0-5, higher = claimed first by claim_next
 
 
 class ReplyRequest(BaseModel):
@@ -240,7 +241,7 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
     assigner = _get_member(request)
     be = get_backend()
     result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
-                             depends_on=body.depends_on)
+                             depends_on=body.depends_on, priority=body.priority)
     if not result.claimed:
         if result.conflict:
             raise HTTPException(409, result.to_dict())

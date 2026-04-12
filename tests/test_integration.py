@@ -630,6 +630,34 @@ def test_claim_next_picks_ready_and_skips_blocked(live_server):
     assert second is None
 
 
+def test_claim_next_respects_priority(live_server):
+    """When multiple tasks are ready, claim_next should return the
+    highest-priority one first (higher number = higher priority)."""
+    orch = SwarloClient(live_server, hub="priority-test")
+    worker = SwarloClient(live_server, hub="priority-test")
+    orch.join("orch", name="Orch")
+    worker.join("worker", name="Worker")
+
+    # Assign three tasks at different priorities — all ready (no deps)
+    orch.assign("general", "task:low", "worker", "low priority work", priority=1)
+    orch.assign("general", "task:high", "worker", "urgent work", priority=5)
+    orch.assign("general", "task:mid", "worker", "normal work", priority=3)
+
+    # claim_next should return the highest-priority task first
+    first = worker.claim_next("general")
+    assert first is not None
+    assert first["task_key"] == "task:high", (
+        f"Expected task:high (priority=5) first, got {first['task_key']}"
+    )
+
+    worker.report("general", "task:high", "done", "shipped")
+    second = worker.claim_next("general")
+    assert second is not None
+    assert second["task_key"] == "task:mid", (
+        f"Expected task:mid (priority=3) second, got {second['task_key']}"
+    )
+
+
 def test_claim_next_returns_none_when_nothing_is_ready(live_server):
     """claim_next returns None when no assignments have met dependencies."""
     orch = SwarloClient(live_server, hub="claim-next-empty")

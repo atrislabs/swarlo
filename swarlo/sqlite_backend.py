@@ -369,7 +369,8 @@ class SQLiteBackend(SwarloBackend):
 
     async def assign(self, hub_id: str, assigner: Member, channel: str,
                      task_key: str, assignee_id: str, content: str,
-                     depends_on: list[str] | None = None) -> ClaimResult:
+                     depends_on: list[str] | None = None,
+                     priority: int = 0) -> ClaimResult:
         """Push-assign a task to a specific member. Claims first, then posts assignment message.
 
         depends_on is recorded on both the implicit claim AND the visible
@@ -404,6 +405,7 @@ class SQLiteBackend(SwarloBackend):
             metadata={"assignee_id": assignee_id, "claim_post_id": result.post_id},
             assignee_id=assignee_id,
             depends_on=depends_on,
+            priority=priority,
         )
 
         return result
@@ -766,6 +768,8 @@ class SQLiteBackend(SwarloBackend):
             # Set-membership check — O(deps) per candidate, no extra queries
             if all(d in done_set for d in deps):
                 ready.append(self._row_to_post(row))
+        # Higher priority first, then oldest first (FIFO within same priority)
+        ready.sort(key=lambda p: (-p.priority, p.created_at))
         return ready
 
     async def get_my_open_tasks(self, hub_id: str, member_id: str) -> list[Post]:
