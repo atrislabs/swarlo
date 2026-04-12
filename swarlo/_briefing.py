@@ -218,22 +218,29 @@ def v3_prf_tfidf(
     if not top_idx:
         return pass1
 
-    # Centroid of top-k as a TF-IDF vector, minus terms already in q
+    # Centroid of top-k as an AVERAGED TF-IDF vector, minus terms in q.
+    # Fix: previous version summed without averaging, so effective
+    # expansion strength scaled with k_feedback (β=0.5 k=3 → 1.5× expansion).
+    # Dividing by len(top_idx) makes the centroid scale-invariant.
     centroid: dict[str, float] = {}
     for i in top_idx:
         for term, weight in vec(docs[i]).items():
             centroid[term] = centroid.get(term, 0.0) + weight
-    # Averaging is implicit — scaling by k doesn't change cosine ranks
+    k = len(top_idx)
     for term in list(centroid):
+        centroid[term] /= k
         if term in q_vec:
             # Don't re-inject terms already in the query — that's just
             # reinforcement. PRF wants to discover *new* discriminators.
-            centroid.pop(term)
+            centroid.pop(term, None)
 
-    # Pick the n_expand terms with the highest (centroid_weight × idf)
+    # Rank expansion terms by centroid weight alone. Previous version
+    # multiplied by idf(term) — but centroid weight is ALREADY TF·IDF,
+    # so multiplying by IDF again squared the rare-term bias. Classic
+    # Rocchio selects by the centroid weight.
     scored_terms = sorted(
         centroid.items(),
-        key=lambda kv: -(kv[1] * idf(kv[0])),
+        key=lambda kv: -kv[1],
     )[:n_expand]
 
     # Build expanded query: α·q + β·expansion
@@ -317,7 +324,7 @@ def v4_prf_gated(
     if margin < tau_margin:
         return pass1  # no precision edge → pool would drift → stay at v2
 
-    # ── Expansion (same as v3) ───────────────────────────────
+    # ── Expansion (same as v3, with the averaging + IDF fixes) ──
     nonzero_idx = sorted(
         (i for i in range(len(pass1)) if pass1[i] > 0),
         key=lambda i: -pass1[i],
@@ -328,13 +335,16 @@ def v4_prf_gated(
     for i in top_idx:
         for term, weight in vec(docs[i]).items():
             centroid[term] = centroid.get(term, 0.0) + weight
+    k_actual = len(top_idx)
     for term in list(centroid):
+        centroid[term] /= k_actual
         if term in q_vec:
-            centroid.pop(term)
+            centroid.pop(term, None)
 
+    # Rank by centroid weight only — not centroid * idf (double-counts).
     scored_terms = sorted(
         centroid.items(),
-        key=lambda kv: -(kv[1] * idf(kv[0])),
+        key=lambda kv: -kv[1],
     )[:n_expand]
 
     expanded = dict(q_vec)

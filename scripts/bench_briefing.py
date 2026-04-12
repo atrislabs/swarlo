@@ -205,9 +205,9 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int, mode: str = 
 
     tmpdir = tempfile.mkdtemp(prefix="swarlo_bench_")
     db_path = Path(tmpdir) / "bench.db"
-    srv._BACKEND = None
-    import os
-    os.environ["SWARLO_DB"] = str(db_path)
+    prev_backend = getattr(srv, "_backend", None)
+    bench_backend = SQLiteBackend(str(db_path))
+    srv.set_backend(bench_backend)
 
     # Start server in background thread
     config = uvicorn.Config(srv.app, host="127.0.0.1", port=0, log_level="warning")
@@ -248,6 +248,10 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int, mode: str = 
     finally:
         server.should_exit = True
         thread.join(timeout=2)
+        try:
+            bench_backend.close()
+        finally:
+            srv.set_backend(prev_backend)
 
 
 def _aggregate(metrics: list[dict]) -> dict:
