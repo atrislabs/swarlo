@@ -840,3 +840,17 @@ def test_report_without_include_next_has_no_next_field(live_server):
 
     result = alice.report("general", "basic-task", "done", "Shipped")
     assert "next_task" not in result
+
+
+def test_report_suggest_if_empty_returns_suggestions(live_server):
+    """When include_next returns None and suggest_if_empty is True,
+    the response should include a 'suggestions' list."""
+    alice = SwarloClient(live_server, hub="suggest-empty")
+    alice.join("alice", name="Alice")
+    alice.claim("general", "last-task", "Finishing up")
+
+    result = alice.report("general", "last-task", "done", "All done",
+                          include_next=True, suggest_if_empty=True)
+    assert result["next_task"] is None
+    assert "suggestions" in result
+    assert isinstance(result["suggestions"], list)

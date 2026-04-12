@@ -109,6 +109,7 @@ class ReportRequest(BaseModel):
     affected_files: Optional[list[str]] = None
     metadata: Optional[dict] = None
     include_next: bool = False  # if True, atomically return next ready task
+    suggest_if_empty: bool = False  # if True AND include_next returns null, auto-suggest
 
 
 class AssignRequest(BaseModel):
@@ -287,6 +288,13 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
     if body.include_next:
         ready = await get_backend().get_ready_tasks(hub_id, member.member_id)
         result["next_task"] = ready[0].to_dict() if ready else None
+
+        # When the queue is empty and the caller asked for suggestions,
+        # auto-generate task ideas so the agent doesn't go idle. This
+        # addresses the "empty queue = orchestrator failure" feedback.
+        if result["next_task"] is None and body.suggest_if_empty:
+            suggest_resp = await suggest_tasks(hub_id, request)
+            result["suggestions"] = suggest_resp.get("suggestions", [])
 
     return result
 

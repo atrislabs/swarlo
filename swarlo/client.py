@@ -141,7 +141,8 @@ class SwarloClient:
     def report(self, channel: str, task_key: str, status: str, content: str,
                affected_files: list[str] | None = None,
                metadata: dict | None = None,
-               include_next: bool = False) -> dict:
+               include_next: bool = False,
+               suggest_if_empty: bool = False) -> dict:
         """Report task completion. Status: done, failed, or blocked.
 
         affected_files: list of file paths touched while completing the task.
@@ -150,6 +151,9 @@ class SwarloClient:
         include_next: if True, the response includes a 'next_task' field
             with the next ready task (or None). This eliminates the poll
             round-trip: report done → get next in one call.
+        suggest_if_empty: if True AND include_next returns None, the
+            response includes a 'suggestions' list of auto-generated task
+            ideas so the agent doesn't go idle.
         """
         body: dict = {"task_key": task_key, "status": status, "content": content}
         if affected_files:
@@ -158,6 +162,8 @@ class SwarloClient:
             body["metadata"] = metadata
         if include_next:
             body["include_next"] = True
+        if suggest_if_empty:
+            body["suggest_if_empty"] = True
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/report", body)
 
     def assign(self, channel: str, task_key: str, assignee_id: str, content: str,
