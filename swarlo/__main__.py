@@ -218,6 +218,33 @@ def _check(label: str, status: str, detail: str = "", colors: dict | None = None
         print(f"  {tag}  {label}")
 
 
+def _install_precommit_hook(repo_root: str, force: bool = False,
+                            target_path: str | None = None,
+                            quiet: bool = False) -> bool:
+    """Install the swarlo pre-commit hook. Returns True if installed."""
+    from swarlo._precommit_hook_source import SOURCE
+
+    if target_path:
+        target = Path(target_path).expanduser().resolve()
+    else:
+        target = Path(repo_root) / ".git" / "hooks" / "pre-commit"
+
+    if target.exists() and not force:
+        if not quiet:
+            raise SystemExit(
+                f"install-hook: {target} already exists. "
+                "Pass --force to overwrite."
+            )
+        # quiet mode: skip silently (used by init)
+        return False
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(SOURCE)
+    target.chmod(0o755)
+    print(f"Installed swarlo pre-commit hook at {target}")
+    return True
+
+
 def _run_doctor() -> int:
     """Diagnose swarlo setup and print a per-check report.
 
@@ -426,8 +453,15 @@ fi
         else:
             print(f"Hook exists: {hook}")
 
-        print("Swarlo enabled for this repo.")
+        # Install pre-commit hook (skip if already present)
+        _install_precommit_hook(root, force=False, quiet=True)
+
+        # Run doctor to show setup status
+        print()
+        _run_doctor()
+
         if not os.path.exists(os.path.expanduser("~/.swarlo/config.json")):
+            print()
             print("Next: run `swarlo join --server <url> --hub <hub> --member-id <id>` to connect.")
         return
 
@@ -435,12 +469,9 @@ fi
         return _run_doctor()
 
     if args.command == "install-hook":
-        from swarlo._precommit_hook_source import SOURCE
         import subprocess
 
-        if args.path:
-            target = Path(args.path).expanduser().resolve()
-        else:
+        if not args.path:
             try:
                 root = subprocess.run(
                     ["git", "rev-parse", "--show-toplevel"],
@@ -451,18 +482,10 @@ fi
                     "install-hook: not inside a git repo. "
                     "cd into your repo, or pass --path explicitly."
                 )
-            target = Path(root) / ".git" / "hooks" / "pre-commit"
+        else:
+            root = os.getcwd()
 
-        if target.exists() and not args.force:
-            raise SystemExit(
-                f"install-hook: {target} already exists. "
-                "Pass --force to overwrite."
-            )
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(SOURCE)
-        target.chmod(0o755)
-        print(f"Installed swarlo pre-commit hook at {target}")
+        _install_precommit_hook(root, force=args.force, target_path=args.path)
         print()
         print("The hook blocks commits to files claimed by other agents.")
         print("It fail-opens if the swarlo server is unreachable or if")
