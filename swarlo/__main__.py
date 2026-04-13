@@ -406,6 +406,7 @@ def _run_doctor() -> int:
 
 
 def main():
+    """CLI entrypoint: parse args and dispatch to the appropriate command handler."""
     parser = _build_parser()
     args = parser.parse_args()
 

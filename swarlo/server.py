@@ -45,11 +45,13 @@ def get_dag() -> GitDAG:
 
 
 def set_backend(backend: SQLiteBackend):
+    """Set the global SQLite backend instance for server requests."""
     global _backend
     _backend = backend
 
 
 def set_dag(dag: GitDAG):
+    """Set the global GitDAG instance for commit tracking."""
     global _git_dag
     _git_dag = dag
 
