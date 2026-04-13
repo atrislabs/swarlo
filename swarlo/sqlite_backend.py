@@ -152,6 +152,7 @@ class SQLiteBackend(SwarloBackend):
         return self._get_conn()
 
     def close(self):
+        """Close the database connection and release resources."""
         if self._conn:
             try:
                 self._conn.close()
@@ -190,6 +191,7 @@ class SQLiteBackend(SwarloBackend):
         return self._row_to_member(row)
 
     def authenticate(self, api_key: str) -> Member | None:
+        """Authenticate a member by API key. Returns Member if valid, None otherwise."""
         row = self.conn.execute(
             "SELECT * FROM members WHERE api_key = ?", (api_key,)
         ).fetchone()
