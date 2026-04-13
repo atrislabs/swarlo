@@ -1204,6 +1204,7 @@ async def compute_score(hub_id: str, request: Request):
 
 @app.post("/api/{hub_id}/git/push", status_code=201)
 async def git_push(hub_id: str, request: Request):
+    """Push a git bundle to the hub's DAG store."""
     member = _get_member(request)
     body = await request.body()
     if len(body) > 50 * 1024 * 1024:
@@ -1226,6 +1227,7 @@ async def git_push(hub_id: str, request: Request):
 
 @app.get("/api/{hub_id}/git/fetch/{hash}")
 async def git_fetch(hub_id: str, hash: str, request: Request):
+    """Fetch a commit bundle by hash from the DAG store."""
     _get_member(request)
     dag = get_dag()
     if not dag.commit_exists(hash):
@@ -1238,12 +1240,14 @@ async def git_fetch(hub_id: str, hash: str, request: Request):
 
 @app.get("/api/{hub_id}/git/commits")
 async def git_list_commits(hub_id: str, request: Request, member_filter: Optional[str] = None, limit: int = 50):
+    """List commits in the hub, optionally filtered by member."""
     _get_member(request)
     return get_backend().list_commits(hub_id, member_id=member_filter, limit=min(limit, 200))
 
 
 @app.get("/api/{hub_id}/git/commits/{hash}")
 async def git_get_commit(hub_id: str, hash: str, request: Request):
+    """Get metadata for a specific commit by hash."""
     _get_member(request)
     commit = get_backend().get_commit(hub_id, hash)
     if not commit:
