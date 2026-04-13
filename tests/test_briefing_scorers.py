@@ -77,6 +77,24 @@ def test_dispatcher_can_select_regex():
     assert scores[0] >= 3.0
 
 
+# ── v0 random baseline ──
+
+def test_v0_random_returns_deterministic_scores_for_same_task():
+    """v0_random uses task-seeded RNG so same task produces same ordering."""
+    cands = ["post A", "post B", "post C"]
+    scores_1 = _briefing.v0_random("some task", cands)
+    scores_2 = _briefing.v0_random("some task", cands)
+    assert scores_1 == scores_2
+
+
+def test_v0_random_returns_different_scores_for_different_tasks():
+    """Different tasks should produce different orderings."""
+    cands = ["post A", "post B", "post C", "post D", "post E"]
+    scores_a = _briefing.v0_random("task alpha", cands)
+    scores_b = _briefing.v0_random("task beta", cands)
+    assert scores_a != scores_b
+
+
 # ── v3 PRF ──
 
 def test_v3_prf_amplifies_topical_posts_when_signal_is_clean():
