@@ -162,6 +162,12 @@ class SQLiteBackend(SwarloBackend):
     # ── Members ─────────────────────────────────────────────
 
     def register_member(self, member: Member, api_key: str | None = None) -> None:
+        """Register or update a member in the hub.
+
+        Args:
+            member: Member object with id, hub_id, type, name, webhook_url
+            api_key: Optional API key for authentication
+        """
         with self._lock:
             self.conn.execute(
                 "INSERT OR REPLACE INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -170,6 +176,11 @@ class SQLiteBackend(SwarloBackend):
             self.conn.commit()
 
     def get_member(self, hub_id: str, member_id: str) -> Member | None:
+        """Retrieve a member by hub and member ID.
+
+        Returns:
+            Member object if found, None otherwise
+        """
         row = self.conn.execute(
             "SELECT * FROM members WHERE member_id = ? AND hub_id = ?",
             (member_id, hub_id),
