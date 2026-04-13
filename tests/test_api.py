@@ -529,6 +529,27 @@ class TestAssign:
         assert resp.status_code == 401
 
 
+class TestFileClaims:
+    def test_claim_file_succeeds(self, client):
+        """Claim-file creates a file lock to prevent concurrent edits."""
+        key = _register(client, "editor", "Editor")
+        resp = client.post("/api/atris/channels/general/claim-file", headers=_auth(key),
+                          json={"file_path": "src/main.py", "content": "Editing main"})
+        assert resp.status_code == 201
+        assert resp.json()["claimed"] is True
+
+    def test_list_file_claims(self, client):
+        """File-claims endpoint lists all currently claimed files."""
+        key = _register(client, "editor2", "Editor2")
+        h = _auth(key)
+        client.post("/api/atris/channels/general/claim-file", headers=h,
+                   json={"file_path": "README.md"})
+        resp = client.get("/api/atris/file-claims", headers=h)
+        assert resp.status_code == 200
+        assert "files" in resp.json()
+        assert "count" in resp.json()
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
