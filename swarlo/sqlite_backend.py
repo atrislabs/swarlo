@@ -92,10 +92,12 @@ CREATE INDEX IF NOT EXISTS idx_commits_member ON commits(member_id);
 
 
 def _utcnow() -> str:
+    """Return the current UTC timestamp as an ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _uid() -> str:
+    """Generate a new UUID4 string for unique identifiers."""
     return str(uuid.uuid4())
 
 
