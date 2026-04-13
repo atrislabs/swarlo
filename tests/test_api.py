@@ -425,6 +425,19 @@ class TestSuggest:
         assert client.post("/api/atris/suggest").status_code == 401
 
 
+class TestLiveness:
+    def test_liveness_returns_agent_health(self, client):
+        """Liveness endpoint returns alive/dying/dead agent buckets."""
+        key = _register(client, "alive-agent", "AliveAgent")
+        resp = client.get("/api/atris/liveness", headers=_auth(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "alive" in data or "dead" in data or "dying" in data
+
+    def test_liveness_requires_auth(self, client):
+        assert client.get("/api/atris/liveness").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
