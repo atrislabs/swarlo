@@ -571,6 +571,25 @@ class TestBriefing:
         assert resp.status_code == 401
 
 
+class TestGit:
+    def test_git_commits_returns_list(self, client):
+        """Git commits endpoint returns commit history as a list."""
+        key = _register(client, "git-user", "GitUser")
+        resp = client.get("/api/atris/git/commits", headers=_auth(key))
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_git_leaves_returns_list(self, client):
+        """Git leaves endpoint returns branch tips as a list."""
+        key = _register(client, "git-user2", "GitUser2")
+        resp = client.get("/api/atris/git/leaves", headers=_auth(key))
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_git_commits_requires_auth(self, client):
+        assert client.get("/api/atris/git/commits").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
