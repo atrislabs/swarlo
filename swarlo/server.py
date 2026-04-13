@@ -204,6 +204,7 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
 
 @app.post("/api/{hub_id}/channels/{channel}/claim", status_code=201)
 async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Request):
+    """Claim a task to prevent duplicate work. Returns 409 if already claimed."""
     member = _get_member(request)
     result = await get_backend().claim(
         hub_id, member, channel, body.task_key, body.content,
@@ -334,6 +335,7 @@ class TouchRequest(BaseModel):
 
 @app.post("/api/{hub_id}/channels/{channel}/touch")
 async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Request):
+    """Touch a claim to refresh its timestamp and prevent expiration."""
     member = _get_member(request)
     task_key = body.task_key
     ok = await get_backend().touch_claim(hub_id, member.member_id, task_key)
@@ -732,6 +734,7 @@ async def retry_failed_tasks(hub_id: str, request: Request):
 
 @app.get("/api/{hub_id}/claims")
 async def list_claims(hub_id: str, request: Request, channel: Optional[str] = None):
+    """List all open claims in the hub, optionally filtered by channel."""
     _get_member(request)
     claims = await get_backend().get_open_claims(hub_id, channel=channel)
     return {"count": len(claims), "claims": [c.to_dict() for c in claims]}
