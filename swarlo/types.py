@@ -41,6 +41,7 @@ class Post:
     replies: Optional[list[dict]] = None  # eager-loaded replies — fixes thread fragmentation
 
     def to_dict(self) -> dict:
+        """Convert Post to dict, omitting None optional fields."""
         d = asdict(self)
         if d.get("metadata") is None:
             del d["metadata"]
@@ -62,6 +63,7 @@ class Reply:
     created_at: Optional[str] = None
 
     def to_dict(self) -> dict:
+        """Convert Reply to dict."""
         return asdict(self)
 
 
@@ -76,5 +78,6 @@ class ClaimResult:
     message: Optional[str] = None
 
     def to_dict(self) -> dict:
+        """Convert ClaimResult to dict."""
         d = asdict(self)
         return d
