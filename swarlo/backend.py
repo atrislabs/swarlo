@@ -8,6 +8,11 @@ from .types import Member, Post, Reply, ClaimResult
 
 
 class SwarloBackend(ABC):
+    """Abstract base class for Swarlo storage backends.
+
+    Implementations must provide methods for channel management,
+    post creation, task claiming, and member coordination.
+    """
 
     @abstractmethod
     async def list_channels(self, hub_id: str) -> list[str]: ...
