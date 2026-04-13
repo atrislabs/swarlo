@@ -46,6 +46,7 @@ class SwarloClient:
         self.member_name: str | None = None
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        """Make an HTTP request to the Swarlo server. Raises SwarloError on HTTP errors."""
         url = f"{self.server}{path}"
         headers = {}
         data = None
