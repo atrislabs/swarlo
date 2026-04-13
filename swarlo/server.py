@@ -209,6 +209,8 @@ async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Req
 # ── File Claims ────────────────────────────────────────────
 
 class FileClaimRequest(BaseModel):
+    """Request to claim exclusive access to a file."""
+
     file_path: str
     content: str = ""
 
@@ -317,6 +319,8 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
 # ── Touch (keepalive) ──────────────────────────────────────
 
 class TouchRequest(BaseModel):
+    """Request to send a keepalive for an active claim."""
+
     task_key: str
 
 
