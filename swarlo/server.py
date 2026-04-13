@@ -59,6 +59,7 @@ def set_dag(dag: GitDAG):
 # ── Auth ────────────────────────────────────────────────────
 
 def _get_member(request: Request) -> Member:
+    """Authenticate request via Bearer token and return the Member. Raises 401 on failure."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(401, "Missing Authorization: Bearer <api_key>")
