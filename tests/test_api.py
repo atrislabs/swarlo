@@ -511,6 +511,24 @@ class TestTouch:
         assert resp.status_code == 404
 
 
+class TestAssign:
+    def test_assign_creates_claim_for_assignee(self, client):
+        """Assign endpoint creates a claim on behalf of another member."""
+        key_a = _register(client, "manager", "Manager")
+        _register(client, "worker", "Worker")
+        resp = client.post("/api/atris/channels/general/assign", headers=_auth(key_a),
+                          json={"task_key": "task:assigned", "assignee_id": "worker",
+                                "content": "Please do this task"})
+        assert resp.status_code == 201
+        assert resp.json()["claimed"] is True
+
+    def test_assign_requires_auth(self, client):
+        _register(client, "worker3", "Worker3")
+        resp = client.post("/api/atris/channels/general/assign",
+                          json={"task_key": "task:x", "assignee_id": "worker3", "content": "Do it"})
+        assert resp.status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
