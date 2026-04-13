@@ -85,6 +85,15 @@ class TestChannels:
         assert isinstance(data["channels"], list)
         assert "general" in data["channels"]
 
+    def test_channels_includes_default_set(self, client):
+        """Channels endpoint includes all default channels."""
+        key = _register(client)
+        resp = client.get("/api/atris/channels", headers=_auth(key))
+        channels = resp.json()["channels"]
+        # Default channels from sqlite_backend.py
+        for ch in ["general", "experiments", "outreach", "ops"]:
+            assert ch in channels
+
 
 class TestPosts:
     def test_create_and_read(self, client):
