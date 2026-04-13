@@ -292,6 +292,20 @@ class TestMembers:
         assert client.get("/api/atris/members").status_code == 401
 
 
+class TestPrune:
+    def test_prune_returns_empty_when_all_active(self, client):
+        """Prune with very long stale window should not remove active members."""
+        key = _register(client, "active-agent", "Active")
+        resp = client.post("/api/atris/prune", headers=_auth(key),
+                          json={"stale_minutes": 9999})
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 0
+        assert resp.json()["pruned"] == []
+
+    def test_prune_requires_auth(self, client):
+        assert client.post("/api/atris/prune").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
