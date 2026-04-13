@@ -550,6 +550,27 @@ class TestFileClaims:
         assert "count" in resp.json()
 
 
+class TestBriefing:
+    def test_briefing_returns_ranked_posts(self, client):
+        """Briefing endpoint returns posts ranked by task relevance."""
+        key = _register(client, "briefer", "Briefer")
+        h = _auth(key)
+        # Create some posts first
+        client.post("/api/atris/channels/general/posts", headers=h,
+                   json={"content": "Working on the database migration"})
+        resp = client.post("/api/atris/briefing", headers=h,
+                          json={"task": "Fix database issue"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "posts" in data
+        assert "count" in data
+        assert "extracted_keywords" in data
+
+    def test_briefing_requires_auth(self, client):
+        resp = client.post("/api/atris/briefing", json={"task": "Some task"})
+        assert resp.status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
