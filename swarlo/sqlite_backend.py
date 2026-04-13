@@ -108,6 +108,7 @@ class SQLiteBackend(SwarloBackend):
         self._lock = threading.Lock()
 
     def _get_conn(self) -> sqlite3.Connection:
+        """Get or create the SQLite connection, applying schema and migrations."""
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
@@ -225,6 +226,7 @@ class SQLiteBackend(SwarloBackend):
         return [self._row_to_member(r) for r in rows]
 
     def _row_to_member(self, row) -> Member:
+        """Convert a database row to a Member object."""
         return Member(
             member_id=row["member_id"],
             member_type=row["member_type"],
@@ -943,6 +945,7 @@ class SQLiteBackend(SwarloBackend):
     # ── Helpers ─────────────────────────────────────────────
 
     def _row_to_post(self, row: sqlite3.Row) -> Post:
+        """Convert a database row to a Post object."""
         metadata_raw = row["metadata"] if "metadata" in row.keys() else None
         mentions_raw = row["mentions"] if "mentions" in row.keys() else None
         keys = row.keys()
