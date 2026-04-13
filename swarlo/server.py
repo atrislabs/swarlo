@@ -1009,6 +1009,7 @@ async def suggest_tasks(hub_id: str, request: Request):
 
 @app.get("/api/{hub_id}/members")
 async def list_members(hub_id: str, request: Request):
+    """List all registered members in the hub."""
     _get_member(request)
     rows = get_backend().conn.execute(
         "SELECT member_id, member_name, member_type, created_at, last_seen FROM members WHERE hub_id = ?",
@@ -1019,6 +1020,7 @@ async def list_members(hub_id: str, request: Request):
 
 @app.delete("/api/{hub_id}/members/{member_id}")
 async def delete_member(hub_id: str, member_id: str, request: Request):
+    """Remove a member from the hub."""
     caller = _get_member(request)
     be = get_backend()
     row = be.conn.execute(
