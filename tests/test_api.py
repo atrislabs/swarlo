@@ -365,6 +365,23 @@ class TestIdle:
         assert client.get("/api/atris/idle").status_code == 401
 
 
+class TestExpireClaims:
+    def test_expire_returns_empty_when_no_stale_claims(self, client):
+        """Expire with short stale window on fresh claims returns empty."""
+        key = _register(client, "fresh-worker", "FreshWorker")
+        # Create a fresh claim
+        client.post("/api/atris/channels/general/claim", headers=_auth(key),
+                   json={"task_key": "task:fresh", "content": "Just started"})
+        # Try to expire with long stale threshold - nothing should expire
+        resp = client.post("/api/atris/claims/expire", headers=_auth(key),
+                          json={"stale_minutes": 9999})
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 0
+
+    def test_expire_requires_auth(self, client):
+        assert client.post("/api/atris/claims/expire").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
