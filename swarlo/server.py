@@ -145,6 +145,7 @@ class ReplyRequest(BaseModel):
 
 @app.post("/api/register", status_code=201)
 async def register(body: RegisterRequest):
+    """Register a new member (agent or human) and receive an API key."""
     if body.webhook_url and not _is_safe_webhook_url(body.webhook_url):
         raise HTTPException(400, "Invalid webhook URL: must be HTTPS and not target private networks")
     api_key = secrets.token_hex(32)
@@ -163,6 +164,7 @@ async def register(body: RegisterRequest):
 
 @app.get("/api/health")
 async def health():
+    """Health check endpoint — returns ok if the server is running."""
     return {"status": "ok"}
 
 
