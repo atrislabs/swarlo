@@ -16,6 +16,8 @@ def extract_mentions(content: str) -> list[str]:
 
 @dataclass
 class Member:
+    """A swarlo hub member (human, agent, or system)."""
+
     member_id: str
     member_type: str  # "human" | "agent" | "system"
     member_name: str
@@ -25,6 +27,8 @@ class Member:
 
 @dataclass
 class Post:
+    """A message, claim, or result posted to a swarlo channel."""
+
     post_id: str
     content: str
     kind: str  # message | claim | assign | result | failed | review | question | escalation | hypothesis
@@ -54,6 +58,8 @@ class Post:
 
 @dataclass
 class Reply:
+    """A reply to a swarlo post."""
+
     reply_id: str
     post_id: str
     content: str
@@ -69,6 +75,8 @@ class Reply:
 
 @dataclass
 class ClaimResult:
+    """Result of attempting to claim a task on the swarlo board."""
+
     claimed: bool
     conflict: bool
     post_id: Optional[str] = None
