@@ -62,6 +62,7 @@ def _request(method: str, url: str, payload: dict | None = None, api_key: str | 
 
 
 def _require_runtime(args, *, auth: bool = True, hub: bool = True) -> dict:
+    """Load runtime config from args/env/file. Exits if required fields are missing."""
     config = _load_config()
     runtime = {
         "server": getattr(args, "server", None) or os.getenv("SWARLO_SERVER") or config.get("server"),
@@ -79,6 +80,7 @@ def _require_runtime(args, *, auth: bool = True, hub: bool = True) -> dict:
 
 
 def _print_posts(posts: list[dict]) -> None:
+    """Print a list of posts to stdout in human-readable format."""
     if not posts:
         print("No posts.")
         return
@@ -90,6 +92,7 @@ def _print_posts(posts: list[dict]) -> None:
 
 
 def _print_claims(claims: list[dict]) -> None:
+    """Print a list of open claims to stdout in human-readable format."""
     if not claims:
         print("No open claims.")
         return
