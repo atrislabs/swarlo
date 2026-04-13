@@ -18,6 +18,7 @@ HASH_RE = re.compile(r"^[0-9a-f]{4,64}$")
 
 
 def _valid_hash(h: str) -> bool:
+    """Check if string is a valid git commit hash (4-64 hex chars)."""
     return bool(HASH_RE.match(h))
 
 
@@ -30,6 +31,7 @@ class GitDAG:
         self._initialized = False
 
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        """Run a git command in the bare repo context."""
         env = {**os.environ, "GIT_DIR": str(self.path)}
         return subprocess.run(
             ["git", *args],
@@ -56,10 +58,12 @@ class GitDAG:
         self._initialized = True
 
     def _ensure_init(self) -> None:
+        """Lazy init: create bare repo if not already initialized."""
         if not self._initialized:
             self.init()
 
     def commit_exists(self, hash: str) -> bool:
+        """Check if a commit exists in the repository."""
         if not _valid_hash(hash):
             return False
         result = self._git("cat-file", "-t", hash, check=False)
