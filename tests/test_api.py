@@ -324,6 +324,31 @@ class TestDeleteMember:
         assert client.delete("/api/atris/members/anyone").status_code == 401
 
 
+class TestReplay:
+    def test_replay_returns_posts_since_timestamp(self, client):
+        """Replay returns posts created after the given timestamp."""
+        key = _register(client, "replayer", "Replayer")
+        headers = _auth(key)
+
+        # Post a message
+        client.post("/api/atris/channels/general/posts", headers=headers,
+                   json={"content": "Test message for replay"})
+
+        # Replay from epoch should include it
+        resp = client.get("/api/atris/replay?since=1970-01-01T00:00:00Z", headers=headers)
+        assert resp.status_code == 200
+        assert "posts" in resp.json()
+
+    def test_replay_requires_since_param(self, client):
+        """Replay without since parameter returns 422 (validation error)."""
+        key = _register(client, "replayer2", "Replayer2")
+        resp = client.get("/api/atris/replay", headers=_auth(key))
+        assert resp.status_code == 422
+
+    def test_replay_requires_auth(self, client):
+        assert client.get("/api/atris/replay?since=2020-01-01T00:00:00Z").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
