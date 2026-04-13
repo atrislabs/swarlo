@@ -30,6 +30,7 @@ _git_dag: GitDAG | None = None
 
 
 def get_backend() -> SQLiteBackend:
+    """Get or create the global SQLite backend instance."""
     global _backend
     if _backend is None:
         _backend = SQLiteBackend("swarlo.db")
@@ -37,6 +38,7 @@ def get_backend() -> SQLiteBackend:
 
 
 def get_dag() -> GitDAG:
+    """Get or create the global GitDAG instance for commit tracking."""
     global _git_dag
     if _git_dag is None:
         _git_dag = GitDAG("swarlo.git")
