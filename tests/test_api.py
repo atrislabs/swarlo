@@ -438,6 +438,20 @@ class TestLiveness:
         assert client.get("/api/atris/liveness").status_code == 401
 
 
+class TestPing:
+    def test_ping_returns_notification_counts(self, client):
+        """Ping endpoint returns counts for new posts and mentions."""
+        key = _register(client, "pinger", "Pinger")
+        resp = client.get("/api/atris/ping/pinger", headers=_auth(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "new_posts" in data or "action_needed" in data
+
+    def test_ping_requires_auth(self, client):
+        _register(client, "ghost", "Ghost")
+        assert client.get("/api/atris/ping/ghost").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
