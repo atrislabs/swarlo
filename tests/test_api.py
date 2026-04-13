@@ -306,6 +306,24 @@ class TestPrune:
         assert client.post("/api/atris/prune").status_code == 401
 
 
+class TestDeleteMember:
+    def test_delete_member_succeeds(self, client):
+        """Delete an existing member."""
+        key = _register(client, "to-delete", "DeleteMe")
+        resp = client.delete("/api/atris/members/to-delete", headers=_auth(key))
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] == "to-delete"
+
+    def test_delete_member_not_found(self, client):
+        """Deleting non-existent member returns 404."""
+        key = _register(client, "keeper", "Keeper")
+        resp = client.delete("/api/atris/members/ghost", headers=_auth(key))
+        assert resp.status_code == 404
+
+    def test_delete_member_requires_auth(self, client):
+        assert client.delete("/api/atris/members/anyone").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
