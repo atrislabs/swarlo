@@ -793,6 +793,7 @@ async def replay_posts(
 
 @app.get("/api/{hub_id}/summary")
 async def get_summary(hub_id: str, request: Request, limit: int = 10):
+    """Get a personalized summary of recent activity for the authenticated member."""
     member = _get_member(request)
     text = await get_backend().summarize_for_member(hub_id, member.member_id, limit=min(limit, 50))
     return {"summary": text}
@@ -802,6 +803,7 @@ async def get_summary(hub_id: str, request: Request, limit: int = 10):
 
 @app.get("/api/{hub_id}/posts/{post_id}/replies")
 async def list_replies(hub_id: str, post_id: str, request: Request):
+    """List all replies to a specific post."""
     _get_member(request)
     replies = await get_backend().get_replies(hub_id, post_id)
     return {
@@ -813,6 +815,7 @@ async def list_replies(hub_id: str, post_id: str, request: Request):
 
 @app.post("/api/{hub_id}/posts/{post_id}/replies", status_code=201)
 async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: Request):
+    """Create a reply to an existing post."""
     member = _get_member(request)
     reply = await get_backend().reply(hub_id, member, post_id, body.content)
     return reply.to_dict()
