@@ -452,6 +452,26 @@ class TestPing:
         assert client.get("/api/atris/ping/ghost").status_code == 401
 
 
+class TestMine:
+    def test_mine_returns_open_tasks_for_member(self, client):
+        """Mine endpoint returns tasks claimed by or assigned to the member."""
+        key = _register(client, "worker", "Worker")
+        h = _auth(key)
+        # Claim a task
+        client.post("/api/atris/channels/general/claim", headers=h,
+                   json={"task_key": "task:mine-test", "content": "Working on it"})
+        resp = client.get("/api/atris/mine/worker", headers=h)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["member_id"] == "worker"
+        assert "count" in data
+        assert "tasks" in data
+
+    def test_mine_requires_auth(self, client):
+        _register(client, "worker2", "Worker2")
+        assert client.get("/api/atris/mine/worker2").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
