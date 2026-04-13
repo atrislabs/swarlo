@@ -884,6 +884,7 @@ class SQLiteBackend(SwarloBackend):
             self.conn.commit()
 
     def get_commit(self, hub_id: str, hash: str) -> dict | None:
+        """Retrieve a single commit by its hash."""
         row = self.conn.execute(
             "SELECT * FROM commits WHERE hash = ? AND hub_id = ?", (hash, hub_id)
         ).fetchone()
@@ -892,6 +893,7 @@ class SQLiteBackend(SwarloBackend):
         return dict(row)
 
     def list_commits(self, hub_id: str, member_id: str | None = None, limit: int = 50) -> list[dict]:
+        """List recent commits, optionally filtered by member."""
         if member_id:
             rows = self.conn.execute(
                 "SELECT * FROM commits WHERE hub_id = ? AND member_id = ? ORDER BY created_at DESC LIMIT ?",
@@ -905,6 +907,7 @@ class SQLiteBackend(SwarloBackend):
         return [dict(r) for r in rows]
 
     def get_children(self, hub_id: str, hash: str) -> list[dict]:
+        """Get all commits that have this hash as their parent."""
         rows = self.conn.execute(
             "SELECT * FROM commits WHERE hub_id = ? AND parent_hash = ? ORDER BY created_at DESC",
             (hub_id, hash),
@@ -912,6 +915,7 @@ class SQLiteBackend(SwarloBackend):
         return [dict(r) for r in rows]
 
     def get_leaves(self, hub_id: str) -> list[dict]:
+        """Get commits with no children (branch tips)."""
         rows = self.conn.execute("""
             SELECT c.* FROM commits c
             LEFT JOIN commits child ON child.parent_hash = c.hash AND child.hub_id = c.hub_id
@@ -921,6 +925,7 @@ class SQLiteBackend(SwarloBackend):
         return [dict(r) for r in rows]
 
     def get_lineage(self, hub_id: str, hash: str) -> list[dict]:
+        """Walk the parent chain from a commit back to root."""
         lineage = []
         current = hash
         while current:
