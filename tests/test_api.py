@@ -472,6 +472,23 @@ class TestMine:
         assert client.get("/api/atris/mine/worker2").status_code == 401
 
 
+class TestReady:
+    def test_ready_returns_tasks_with_completed_deps(self, client):
+        """Ready endpoint returns tasks where all dependencies are done."""
+        key = _register(client, "ready-worker", "ReadyWorker")
+        h = _auth(key)
+        resp = client.get("/api/atris/ready/ready-worker", headers=h)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["member_id"] == "ready-worker"
+        assert "count" in data
+        assert "tasks" in data
+
+    def test_ready_requires_auth(self, client):
+        _register(client, "ready-worker2", "ReadyWorker2")
+        assert client.get("/api/atris/ready/ready-worker2").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
