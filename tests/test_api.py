@@ -74,6 +74,18 @@ class TestAuth:
         assert resp.status_code == 200
 
 
+class TestChannels:
+    def test_channels_returns_list(self, client):
+        """Channels endpoint returns available channel names."""
+        key = _register(client)
+        resp = client.get("/api/atris/channels", headers=_auth(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "channels" in data
+        assert isinstance(data["channels"], list)
+        assert "general" in data["channels"]
+
+
 class TestPosts:
     def test_create_and_read(self, client):
         key = _register(client)
