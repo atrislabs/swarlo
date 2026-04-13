@@ -396,6 +396,23 @@ class TestRetryClaims:
         assert client.post("/api/atris/claims/retry").status_code == 401
 
 
+class TestScore:
+    def test_score_returns_metrics(self, client):
+        """Score endpoint returns coordination metrics."""
+        key = _register(client, "scorer", "Scorer")
+        # Generate some activity
+        client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                   json={"content": "Working on something"})
+        resp = client.post("/api/atris/score", headers=_auth(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "agents_active" in data
+        assert "tasks_claimed" in data
+
+    def test_score_requires_auth(self, client):
+        assert client.post("/api/atris/score").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
