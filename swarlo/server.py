@@ -1257,24 +1257,28 @@ async def git_get_commit(hub_id: str, hash: str, request: Request):
 
 @app.get("/api/{hub_id}/git/commits/{hash}/children")
 async def git_children(hub_id: str, hash: str, request: Request):
+    """Get all child commits of a given commit hash."""
     _get_member(request)
     return get_backend().get_children(hub_id, hash)
 
 
 @app.get("/api/{hub_id}/git/leaves")
 async def git_leaves(hub_id: str, request: Request):
+    """Get all leaf commits (commits with no children) in the DAG."""
     _get_member(request)
     return get_backend().get_leaves(hub_id)
 
 
 @app.get("/api/{hub_id}/git/commits/{hash}/lineage")
 async def git_lineage(hub_id: str, hash: str, request: Request):
+    """Get the full ancestor chain from a commit back to root."""
     _get_member(request)
     return get_backend().get_lineage(hub_id, hash)
 
 
 @app.get("/api/{hub_id}/git/diff/{hash_a}/{hash_b}")
 async def git_diff(hub_id: str, hash_a: str, hash_b: str, request: Request):
+    """Get the diff between two commits as plain text."""
     _get_member(request)
     dag = get_dag()
     from fastapi.responses import PlainTextResponse
