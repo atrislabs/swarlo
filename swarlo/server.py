@@ -706,6 +706,7 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30,
 
 @app.post("/api/{hub_id}/claims/expire")
 async def expire_stale_claims(hub_id: str, request: Request):
+    """Force-expire claims that have been stale beyond the threshold."""
     _get_member(request)
     try:
         body = await request.json()
@@ -720,6 +721,7 @@ async def expire_stale_claims(hub_id: str, request: Request):
 
 @app.post("/api/{hub_id}/claims/retry")
 async def retry_failed_tasks(hub_id: str, request: Request):
+    """Re-open failed tasks for retry up to max_retries limit."""
     _get_member(request)
     try:
         body = await request.json()
