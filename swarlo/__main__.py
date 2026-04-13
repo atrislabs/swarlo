@@ -15,6 +15,7 @@ CONFIG_ENV = "SWARLO_CONFIG"
 
 
 def _config_path() -> Path:
+    """Get the config file path, respecting SWARLO_CONFIG env override."""
     override = os.getenv(CONFIG_ENV)
     if override:
         return Path(override).expanduser()
@@ -22,6 +23,7 @@ def _config_path() -> Path:
 
 
 def _load_config() -> dict:
+    """Load config from disk, returning empty dict if missing."""
     path = _config_path()
     if not path.exists():
         return {}
@@ -29,12 +31,14 @@ def _load_config() -> dict:
 
 
 def _save_config(config: dict) -> None:
+    """Save config to disk, creating parent dirs if needed."""
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2) + "\n")
 
 
 def _request(method: str, url: str, payload: dict | None = None, api_key: str | None = None) -> tuple[int, dict]:
+    """Make an HTTP request to the swarlo server. Returns (status_code, response_dict)."""
     headers = {}
     data = None
     if api_key:
