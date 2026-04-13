@@ -525,6 +525,8 @@ async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
 # ── Latent Briefing (task-guided context filtering) ────────
 
 class BriefingRequest(BaseModel):
+    """Request for task-guided context filtering from the board."""
+
     task: str  # what the agent is about to work on
     limit: int = 15
     scorer: str = "tfidf"  # "tfidf" (default, Phase 2) or "regex" (v1 baseline)
