@@ -83,6 +83,8 @@ def _get_member(request: Request) -> Member:
 # ── Request models ──────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
+    """Request to register a new member with the coordination hub."""
+
     member_id: str
     member_type: str = "agent"
     member_name: str = ""
@@ -91,6 +93,8 @@ class RegisterRequest(BaseModel):
 
 
 class PostRequest(BaseModel):
+    """Request to create a new post in a channel."""
+
     content: str
     kind: str = "message"
     task_key: Optional[str] = None
@@ -99,12 +103,16 @@ class PostRequest(BaseModel):
 
 
 class ClaimRequest(BaseModel):
+    """Request to claim a task for exclusive work."""
+
     task_key: str
     content: str
     depends_on: Optional[list[str]] = None
 
 
 class ReportRequest(BaseModel):
+    """Request to report task completion status."""
+
     task_key: str
     status: str = Field(..., pattern="^(done|failed|blocked)$")
     content: str
@@ -115,6 +123,8 @@ class ReportRequest(BaseModel):
 
 
 class AssignRequest(BaseModel):
+    """Request to push-assign a task to a specific member."""
+
     task_key: str
     assignee_id: str
     content: str
@@ -123,6 +133,8 @@ class AssignRequest(BaseModel):
 
 
 class ReplyRequest(BaseModel):
+    """Request to reply to an existing post."""
+
     content: str
 
 
