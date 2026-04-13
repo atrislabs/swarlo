@@ -489,6 +489,28 @@ class TestReady:
         assert client.get("/api/atris/ready/ready-worker2").status_code == 401
 
 
+class TestTouch:
+    def test_touch_updates_claim_timestamp(self, client):
+        """Touch endpoint refreshes a claim's last-touched timestamp."""
+        key = _register(client, "toucher", "Toucher")
+        h = _auth(key)
+        # First claim a task
+        client.post("/api/atris/channels/general/claim", headers=h,
+                   json={"task_key": "task:touch-test", "content": "Working"})
+        # Touch the claim
+        resp = client.post("/api/atris/channels/general/touch", headers=h,
+                          json={"task_key": "task:touch-test"})
+        assert resp.status_code == 200
+        assert resp.json()["touched"] is True
+
+    def test_touch_nonexistent_claim_404(self, client):
+        """Touch returns 404 for claims that don't exist."""
+        key = _register(client, "toucher2", "Toucher2")
+        resp = client.post("/api/atris/channels/general/touch", headers=_auth(key),
+                          json={"task_key": "task:no-such-claim"})
+        assert resp.status_code == 404
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
