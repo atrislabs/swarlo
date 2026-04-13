@@ -240,6 +240,7 @@ class SQLiteBackend(SwarloBackend):
     # ── SwarloBackend ───────────────────────────────────────
 
     async def list_channels(self, hub_id: str) -> list[str]:
+        """List all channels for a hub, including defaults and any with posts."""
         rows = self.conn.execute(
             "SELECT DISTINCT channel FROM posts WHERE hub_id = ?", (hub_id,)
         ).fetchall()
