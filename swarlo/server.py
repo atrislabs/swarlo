@@ -172,6 +172,7 @@ async def health():
 
 @app.get("/api/{hub_id}/channels")
 async def list_channels(hub_id: str, request: Request):
+    """List all channels in the hub including defaults and custom."""
     _get_member(request)
     channels = await get_backend().list_channels(hub_id)
     return {"channels": channels}
@@ -181,6 +182,7 @@ async def list_channels(hub_id: str, request: Request):
 
 @app.get("/api/{hub_id}/channels/{channel}/posts")
 async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 10):
+    """List recent posts in a channel, newest first."""
     _get_member(request)
     posts = await get_backend().read_channel(hub_id, channel, limit=min(limit, 50))
     return {"channel": channel, "count": len(posts), "posts": [p.to_dict() for p in posts]}
@@ -190,6 +192,7 @@ async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 1
 
 @app.post("/api/{hub_id}/channels/{channel}/posts", status_code=201)
 async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request, background_tasks: BackgroundTasks):
+    """Create a new post in a channel. Resolves @mentions and fires webhooks."""
     member = _get_member(request)
     post = await get_backend().create_post(hub_id, member, channel, body.content, body.kind, body.task_key, metadata=body.metadata, priority=body.priority)
     if post.mentions:
