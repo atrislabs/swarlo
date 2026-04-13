@@ -413,6 +413,18 @@ class TestScore:
         assert client.post("/api/atris/score").status_code == 401
 
 
+class TestSuggest:
+    def test_suggest_returns_suggestions(self, client):
+        """Suggest endpoint returns task suggestions."""
+        key = _register(client, "suggester", "Suggester")
+        resp = client.post("/api/atris/suggest", headers=_auth(key))
+        assert resp.status_code == 200
+        assert "suggestions" in resp.json()
+
+    def test_suggest_requires_auth(self, client):
+        assert client.post("/api/atris/suggest").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
