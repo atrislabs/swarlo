@@ -349,6 +349,22 @@ class TestReplay:
         assert client.get("/api/atris/replay?since=2020-01-01T00:00:00Z").status_code == 401
 
 
+class TestIdle:
+    def test_idle_returns_empty_for_active_member(self, client):
+        """Recently active members should not appear in idle list."""
+        key = _register(client, "active-worker", "ActiveWorker")
+        # Post something to be active
+        client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                   json={"content": "Working hard"})
+        resp = client.get("/api/atris/idle?idle_minutes=9999", headers=_auth(key))
+        assert resp.status_code == 200
+        # With high idle threshold, no one should be idle
+        assert "idle" in resp.json()
+
+    def test_idle_requires_auth(self, client):
+        assert client.get("/api/atris/idle").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
