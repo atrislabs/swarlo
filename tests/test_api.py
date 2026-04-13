@@ -382,6 +382,20 @@ class TestExpireClaims:
         assert client.post("/api/atris/claims/expire").status_code == 401
 
 
+class TestRetryClaims:
+    def test_retry_returns_empty_when_no_failed_tasks(self, client):
+        """Retry with no failed tasks returns empty list."""
+        key = _register(client, "retry-worker", "RetryWorker")
+        resp = client.post("/api/atris/claims/retry", headers=_auth(key),
+                          json={"max_retries": 3})
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 0
+        assert resp.json()["retried"] == []
+
+    def test_retry_requires_auth(self, client):
+        assert client.post("/api/atris/claims/retry").status_code == 401
+
+
 class TestFullFlow:
     def test_claim_work_report_reclaim(self, client):
         key_a = _register(client, "agent-a", "Hugo")
