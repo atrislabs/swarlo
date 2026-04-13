@@ -348,3 +348,24 @@ class TestClientScore:
 
         result = client.score()
         assert result.get("tasks_shipped", 0) >= 1
+
+
+class TestSwarloError:
+    """Tests for SwarloError message formatting."""
+
+    def test_error_with_message_key(self):
+        err = SwarloError(400, {"message": "Bad request"})
+        assert "Bad request" in str(err)
+        assert err.status_code == 400
+
+    def test_error_with_detail_key(self):
+        err = SwarloError(404, {"detail": "Not found"})
+        assert "Not found" in str(err)
+
+    def test_error_with_error_key(self):
+        err = SwarloError(500, {"error": "Server error"})
+        assert "Server error" in str(err)
+
+    def test_error_fallback_to_dict_str(self):
+        err = SwarloError(422, {"foo": "bar"})
+        assert "foo" in str(err) or "bar" in str(err)
