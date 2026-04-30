@@ -101,6 +101,22 @@ def _uid() -> str:
     return str(uuid.uuid4())
 
 
+def _short_display_id(prefix: str, raw_id: str | None) -> str | None:
+    if not raw_id:
+        return None
+    compact = "".join(ch for ch in str(raw_id) if ch.isalnum()).upper()
+    return f"{prefix}-{compact[:6]}" if compact else None
+
+
+def _post_display_id(kind: str, post_id: str | None) -> str | None:
+    prefix = "C" if kind == "claim" else "R" if kind in {"result", "failed", "blocked"} else "P"
+    return _short_display_id(prefix, post_id)
+
+
+def _task_display_id(task_key: str | None) -> str | None:
+    return _short_display_id("T", task_key)
+
+
 class SQLiteBackend(SwarloBackend):
     """Swarlo backed by a local SQLite database."""
 
@@ -313,6 +329,7 @@ class SQLiteBackend(SwarloBackend):
         mention_names = extract_mentions(content)
         mention_ids = self.resolve_mentions(hub_id, mention_names) if mention_names else []
 
+        post_display_id = _post_display_id(kind, post_id)
         metadata_json = json.dumps(metadata) if metadata is not None else None
         mentions_json = json.dumps(mention_ids) if mention_ids else None
         # Dependencies stored as JSON array of task_keys. None = no deps.
@@ -335,6 +352,7 @@ class SQLiteBackend(SwarloBackend):
             member_id=member.member_id, member_name=member.member_name,
             member_type=member.member_type, task_key=task_key, status=status,
             metadata=metadata, mentions=mention_ids or None, created_at=now,
+            display_id=post_display_id,
         )
 
     async def retry_failed(self, hub_id: str, max_retries: int = 3) -> list[str]:
@@ -383,6 +401,7 @@ class SQLiteBackend(SwarloBackend):
             reply_id=reply_id, post_id=post_id, content=content,
             member_id=member.member_id, member_name=member.member_name,
             member_type=member.member_type, created_at=now,
+            display_id=_short_display_id("Y", reply_id),
         )
 
     async def assign(self, hub_id: str, assigner: Member, channel: str,
@@ -493,7 +512,8 @@ class SQLiteBackend(SwarloBackend):
                 self.conn.commit()
             return ClaimResult(
                 claimed=True, conflict=False,
-                post_id=post_id, channel=channel, kind="claim",
+                post_id=post_id, display_id=_post_display_id("claim", post_id),
+                channel=channel, kind="claim",
             )
         except sqlite3.IntegrityError:
             # Unique index violation — someone else claimed first
@@ -838,6 +858,7 @@ class SQLiteBackend(SwarloBackend):
                 reply_id=r["reply_id"], post_id=r["post_id"], content=r["content"],
                 member_id=r["member_id"], member_name=r["member_name"],
                 member_type=r["member_type"], created_at=r["created_at"],
+                display_id=_short_display_id("Y", r["reply_id"]),
             )
             for r in rows
         ]
@@ -966,4 +987,5 @@ class SQLiteBackend(SwarloBackend):
             metadata=json.loads(metadata_raw) if metadata_raw else None,
             mentions=json.loads(mentions_raw) if mentions_raw else None,
             created_at=row["created_at"],
+            display_id=_post_display_id(row["kind"], row["post_id"]),
         )

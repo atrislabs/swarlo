@@ -123,6 +123,7 @@ class TestClaims:
                           json={"task_key": "task:research", "content": "On it"})
         assert resp.status_code == 201
         assert resp.json()["claimed"] is True
+        assert resp.json()["display_id"].startswith("C-")
 
     def test_duplicate_claim_409(self, client):
         key_a = _register(client, "agent-a", "Hugo")
@@ -143,6 +144,7 @@ class TestClaims:
 
         resp = client.get("/api/atris/claims", headers=h)
         assert resp.json()["count"] == 1
+        assert resp.json()["claims"][0]["display_id"].startswith("C-")
 
 
 class TestReports:

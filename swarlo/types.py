@@ -43,6 +43,7 @@ class Post:
     mentions: Optional[list[str]] = None  # resolved member_ids from @mentions
     created_at: Optional[str] = None
     replies: Optional[list[dict]] = None  # eager-loaded replies — fixes thread fragmentation
+    display_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert Post to dict, omitting None optional fields."""
@@ -53,6 +54,8 @@ class Post:
             del d["mentions"]
         if d.get("replies") is None:
             del d["replies"]
+        if d.get("display_id") is None:
+            del d["display_id"]
         return d
 
 
@@ -67,6 +70,7 @@ class Reply:
     member_name: str
     member_type: str
     created_at: Optional[str] = None
+    display_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert Reply to dict."""
@@ -80,6 +84,7 @@ class ClaimResult:
     claimed: bool
     conflict: bool
     post_id: Optional[str] = None
+    display_id: Optional[str] = None
     channel: Optional[str] = None
     kind: Optional[str] = None
     existing_claim: Optional[Post] = None
