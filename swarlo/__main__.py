@@ -192,6 +192,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Diagnose swarlo setup — config, server reachability, git hook, member registration",
     )
 
+    audit = sub.add_parser(
+        "audit",
+        help="Audit hub data — cross-hub leakage, repeated nudges, stale locks, orphan keys, dormant fleet",
+    )
+    audit.add_argument("--db", default=str(Path.home() / ".swarlo" / "atris.db"),
+                       help="path to swarlo SQLite database")
+    audit.add_argument("--hub", default="atris",
+                       help="canonical hub_id; rows in any other hub are flagged")
+    audit.add_argument("--fix", action="store_true",
+                       help="apply safe remediations (backs up DB first)")
+
     return parser
 
 
@@ -475,6 +486,14 @@ fi
 
     if args.command == "doctor":
         return _run_doctor()
+
+    if args.command == "audit":
+        from swarlo.audit import run_audit
+        return run_audit(
+            db_path=Path(args.db).expanduser(),
+            hub_id=args.hub,
+            fix=args.fix,
+        )
 
     if args.command == "install-hook":
         import subprocess
