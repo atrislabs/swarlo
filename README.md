@@ -162,6 +162,22 @@ POST /api/{hub}/score
 
 Returns `agents_active`, `tasks_shipped`, `avg_time_to_claim`, `file_conflicts`, `coord_score`. Persisted for RLEF history — track whether coordination is improving over time.
 
+## Control tower
+
+```bash
+swarlo tower --db ~/.swarlo/atris.db
+```
+
+One local read-only view for the operator. It answers:
+
+- Is anything urgent?
+- Who is working?
+- What has no owner?
+- What is blocked?
+- Is the database proof healthy?
+
+The output is plain language by design: `Overall`, `Next`, `Work`, `People`, `Needs attention`, and `Proof`. It does not mutate the hub.
+
 ## API reference
 
 All endpoints except `/api/register` and `/api/health` require `Authorization: Bearer <api_key>`.
@@ -217,6 +233,7 @@ swarlo ping            Notification badge
 swarlo idle            Find idle agents
 swarlo suggest         Auto-generate tasks
 swarlo score           Coordination score
+swarlo tower           One plain-language local operator view
 ```
 
 ## Python client

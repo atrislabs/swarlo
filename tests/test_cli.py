@@ -3,7 +3,7 @@ import json
 import sqlite3
 import sys
 import tomllib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -131,6 +131,59 @@ def _insert_speed_live_rows(conn):
     conn.execute(
         "INSERT INTO scores (hub_id, coord_score, computed_at) VALUES (?, ?, ?)",
         ("swarlo-speed-check", 100, "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+
+
+def _insert_tower_rows(conn):
+    now = datetime.now(cli.UTC)
+    recent = (now - timedelta(minutes=5)).isoformat()
+    quiet = (now - timedelta(minutes=25)).isoformat()
+    stale = (now - timedelta(minutes=45)).isoformat()
+    very_old = (now - timedelta(hours=3)).isoformat()
+    conn.execute(
+        "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen, last_active) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("agent-a", "my-team", "agent", "Agent A", recent, recent, recent),
+    )
+    conn.execute(
+        "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen, last_active) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("agent-b", "my-team", "agent", "Agent B", recent, recent, quiet),
+    )
+    conn.execute(
+        "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen, last_active) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("agent-c", "my-team", "agent", "Agent C", recent, very_old, very_old),
+    )
+    rows = [
+        ("msg-1", "ops", "agent-a", "Agent A", "ownerless task", "message", "task:unclaimed", None, None, recent),
+        (
+            "claim-1",
+            "ops",
+            "agent-a",
+            "Agent A",
+            "working but stale",
+            "claim",
+            "task:claimed",
+            "open",
+            json.dumps({"heartbeat_at": stale}),
+            stale,
+        ),
+        ("done-1", "ops", "agent-a", "Agent A", "finished it", "result", "task:done", "done", None, recent),
+        ("blocked-1", "ops", "agent-b", "Agent B", "needs decision", "failed", "task:blocked", "blocked", None, quiet),
+    ]
+    for row in rows:
+        conn.execute(
+            "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+            "content, kind, task_key, status, metadata, created_at) "
+            "VALUES (?, 'my-team', ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?)",
+            row,
+        )
+    conn.execute(
+        "INSERT INTO scores (hub_id, coord_score, tasks_shipped, tasks_blocked, computed_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("my-team", 97, 1, 1, recent),
     )
     conn.commit()
 
@@ -344,6 +397,60 @@ def test_score_history_prints_rows(monkeypatch, tmp_path, capsys):
     assert "42" in out
     assert "+2" in out
     assert "  5.0" in out
+
+
+def test_tower_prints_plain_language_control_view(monkeypatch, tmp_path, capsys):
+    db_path = tmp_path / "swarlo.db"
+    backend = SQLiteBackend(str(db_path))
+    _insert_tower_rows(backend.conn)
+    backend.close()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["swarlo", "tower", "--db", str(db_path), "--hub", "my-team", "--limit", "3"],
+    )
+
+    cli.main()
+
+    out = capsys.readouterr().out
+    assert "Swarlo Tower" in out
+    assert "Overall: Needs attention" in out
+    assert "Next: Reassign or refresh stale claims first." in out
+    assert "Active now:" in out
+    assert "No owner yet:" in out
+    assert "Stale: task:claimed with Agent A" in out
+    assert "No owner: task:unclaimed in ops - ownerless task" in out
+    assert "Blocked: task:blocked - needs decision" in out
+    assert "1. Agent A - 12 XP" in out
+    assert "Status:           Needs attention" in out
+    assert "Fast routes:" in out
+    assert "Data seen:" in out
+
+
+def test_tower_json_exposes_same_operator_state(monkeypatch, tmp_path, capsys):
+    db_path = tmp_path / "swarlo.db"
+    backend = SQLiteBackend(str(db_path))
+    _insert_tower_rows(backend.conn)
+    backend.close()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["swarlo", "tower", "--db", str(db_path), "--hub", "my-team", "--json"],
+    )
+
+    cli.main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hub"] == "my-team"
+    assert payload["health"] == "Needs attention"
+    assert payload["counts"]["stale_claims"] == 1
+    assert payload["counts"]["unclaimed_tasks"] == 1
+    assert payload["counts"]["blocked_tasks"] == 1
+    assert payload["leaderboard"][0]["member_name"] == "Agent A"
+    assert payload["proof"]["ok"] is False
+    assert payload["proof"]["missing"]["row_minimums"]
 
 
 def test_unclaimed_prints_tasks(monkeypatch, tmp_path, capsys):

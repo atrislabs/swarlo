@@ -275,6 +275,417 @@ def _print_claims(claims: list[dict]) -> None:
         print(f"[claim] {claim['task_key']} {claim['member_name']}: {claim['content']}")
 
 
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _age_minutes(value: str | None, now: datetime) -> float | None:
+    parsed = _parse_timestamp(value)
+    if not parsed:
+        return None
+    return max(0.0, (now - parsed).total_seconds() / 60)
+
+
+def _short_age(value: str | None, now: datetime) -> str:
+    minutes = _age_minutes(value, now)
+    if minutes is None:
+        return "unknown"
+    if minutes < 1:
+        return "now"
+    if minutes < 60:
+        return f"{int(minutes)}m"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{int(hours)}h"
+    return f"{int(hours / 24)}d"
+
+
+def _clip_text(value: str | None, width: int = 100) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= width:
+        return text
+    return text[: width - 3].rstrip() + "..."
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(row[1]) for row in rows}
+
+
+def _load_json_object(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _resolve_tower_hub(conn: sqlite3.Connection, requested: str | None) -> str:
+    if requested:
+        return requested
+    config_hub = _load_config().get("hub")
+    if config_hub:
+        return str(config_hub)
+    row = conn.execute(
+        "SELECT hub_id, COUNT(*) AS n FROM posts GROUP BY hub_id ORDER BY n DESC LIMIT 1"
+    ).fetchone()
+    if row and row["hub_id"]:
+        return str(row["hub_id"])
+    row = conn.execute(
+        "SELECT hub_id FROM members GROUP BY hub_id ORDER BY COUNT(*) DESC LIMIT 1"
+    ).fetchone()
+    if row and row["hub_id"]:
+        return str(row["hub_id"])
+    raise SystemExit("tower: no hub found in the database; pass --hub")
+
+
+def _tower_speed_report(db_path: str) -> dict:
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = _run_speed_check(
+            db_path,
+            as_json=True,
+            max_ms=1000,
+            require_planner=True,
+            require_live_data=True,
+            min_rows=[("posts", 1000), ("scores", 10000), ("members", 1)],
+        )
+    try:
+        report = json.loads(out.getvalue())
+    except json.JSONDecodeError:
+        report = {"ok": False, "error": "speed proof did not return JSON"}
+    report["exit_code"] = code
+    return report
+
+
+def _build_tower_state(
+    db_path: str,
+    *,
+    hub: str | None = None,
+    limit: int = 5,
+    stale_minutes: int = 30,
+    idle_minutes: int = 15,
+) -> dict:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        raise SystemExit(f"tower: database not found: {path}")
+
+    now = datetime.now(UTC)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        hub_id = _resolve_tower_hub(conn, hub)
+        post_cols = _table_columns(conn, "posts")
+
+        members = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT member_id, member_name, member_type, last_seen, last_active "
+                "FROM members WHERE hub_id = ? ORDER BY member_name",
+                (hub_id,),
+            ).fetchall()
+        ]
+        open_claims = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT post_id, channel, task_key, member_id, member_name, content, metadata, created_at "
+                "FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open' "
+                "ORDER BY created_at DESC",
+                (hub_id,),
+            ).fetchall()
+        ]
+        open_claim_keys = {
+            row["task_key"]
+            for row in open_claims
+            if row.get("task_key") and not str(row.get("task_key")).startswith("file:")
+        }
+        terminal_rows = conn.execute(
+            "SELECT DISTINCT task_key FROM posts WHERE hub_id = ? AND task_key IS NOT NULL "
+            "AND task_key NOT LIKE 'file:%' AND (kind IN ('result', 'blocked') "
+            "OR status IN ('done', 'failed', 'blocked'))",
+            (hub_id,),
+        ).fetchall()
+        terminal_keys = {row["task_key"] for row in terminal_rows}
+        task_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT channel, task_key, content, created_at FROM posts "
+                "WHERE hub_id = ? AND kind = 'message' AND task_key IS NOT NULL "
+                "AND task_key NOT LIKE 'file:%' ORDER BY created_at DESC",
+                (hub_id,),
+            ).fetchall()
+        ]
+        unclaimed = [
+            row
+            for row in task_rows
+            if row["task_key"] not in open_claim_keys and row["task_key"] not in terminal_keys
+        ][:limit]
+        blocked_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT channel, task_key, member_name, content, created_at FROM posts "
+                "WHERE hub_id = ? AND task_key IS NOT NULL AND task_key NOT LIKE 'file:%' "
+                "AND (kind = 'blocked' OR status = 'blocked') "
+                "ORDER BY created_at DESC LIMIT ?",
+                (hub_id, limit * 5),
+            ).fetchall()
+        ]
+        blocked = []
+        seen_blocked: set[str] = set()
+        for row in blocked_rows:
+            task_key = row.get("task_key")
+            if not task_key or task_key in seen_blocked:
+                continue
+            seen_blocked.add(task_key)
+            blocked.append(row)
+            if len(blocked) >= limit:
+                break
+        latest_score = conn.execute(
+            "SELECT * FROM scores WHERE hub_id = ? ORDER BY computed_at DESC, id DESC LIMIT 1",
+            (hub_id,),
+        ).fetchone()
+
+        xp_by_member: dict[str, dict] = {}
+        event_cols = "member_id, member_name, kind, status, task_key"
+        if "task_key" not in post_cols:
+            event_cols = "member_id, member_name, kind, status, NULL AS task_key"
+        events = conn.execute(f"SELECT {event_cols} FROM posts WHERE hub_id = ?", (hub_id,)).fetchall()
+        for event in events:
+            task_key = event["task_key"]
+            if task_key and str(task_key).startswith("file:"):
+                continue
+            member_id = event["member_id"] or "unknown"
+            row = xp_by_member.setdefault(
+                member_id,
+                {
+                    "member_id": member_id,
+                    "member_name": event["member_name"] or member_id,
+                    "xp": 0,
+                    "shipped": 0,
+                    "claims": 0,
+                    "failed": 0,
+                    "blocked": 0,
+                },
+            )
+            kind = event["kind"]
+            status = event["status"]
+            if kind == "claim" and status != "retracted":
+                row["xp"] += 2
+                row["claims"] += 1
+            elif status == "blocked" or kind == "blocked":
+                row["xp"] -= 1
+                row["blocked"] += 1
+            elif status == "failed" or kind == "failed":
+                row["xp"] -= 3
+                row["failed"] += 1
+            elif status == "done" or kind == "result":
+                row["xp"] += 10
+                row["shipped"] += 1
+
+        claim_by_member = {row["member_id"] for row in open_claims if row.get("member_id")}
+        active, idle, offline = [], [], []
+        for member in members:
+            if member.get("member_type") != "agent":
+                continue
+            seen_age = _age_minutes(member.get("last_seen"), now)
+            active_age = _age_minutes(member.get("last_active"), now)
+            has_claim = member.get("member_id") in claim_by_member
+            entry = {
+                "member_id": member.get("member_id"),
+                "member_name": member.get("member_name") or member.get("member_id"),
+                "last_seen_age": _short_age(member.get("last_seen"), now),
+                "last_active_age": _short_age(member.get("last_active"), now),
+                "has_open_claim": has_claim,
+            }
+            if seen_age is None or seen_age > stale_minutes * 3:
+                offline.append(entry)
+            elif has_claim or (active_age is not None and active_age <= idle_minutes):
+                active.append(entry)
+            else:
+                idle.append(entry)
+
+        stale_claims = []
+        for claim in open_claims:
+            metadata = _load_json_object(claim.get("metadata"))
+            heartbeat_at = metadata.get("heartbeat_at") or claim.get("created_at")
+            if (_age_minutes(heartbeat_at, now) or 0) >= stale_minutes:
+                stale_claims.append(
+                    {
+                        "task_key": claim.get("task_key"),
+                        "member_name": claim.get("member_name"),
+                        "channel": claim.get("channel"),
+                        "age": _short_age(heartbeat_at, now),
+                    }
+                )
+
+        proof = _tower_speed_report(str(path))
+        proof_ok = bool(proof.get("ok"))
+        if stale_claims:
+            next_action = "Reassign or refresh stale claims first."
+        elif unclaimed:
+            next_action = "Give ownerless tasks a clear owner."
+        elif blocked:
+            next_action = "Review blocked tasks and decide unblock, retry, or close."
+        elif not proof_ok:
+            next_action = "Run speed-proof and fix the proof gap before a release."
+        elif idle:
+            next_action = "Give idle agents the next task, or let them stand down."
+        else:
+            next_action = "No owner action needed right now."
+
+        health = "Calm" if next_action == "No owner action needed right now." else "Needs attention"
+        rows = proof.get("database", {}).get("rows", {})
+        index_count = sum(
+            int(item.get("present", 0))
+            for item in (proof.get("indexes") or {}).values()
+            if isinstance(item, dict)
+        )
+        index_total = sum(
+            int(item.get("total", 0))
+            for item in (proof.get("indexes") or {}).values()
+            if isinstance(item, dict)
+        )
+
+        return {
+            "hub": hub_id,
+            "db": str(path),
+            "health": health,
+            "next_action": next_action,
+            "counts": {
+                "agents_active": len(active),
+                "agents_idle": len(idle),
+                "agents_offline": len(offline),
+                "open_claims": len(open_claims),
+                "stale_claims": len(stale_claims),
+                "unclaimed_tasks": len(unclaimed),
+                "blocked_tasks": len(blocked),
+                "coord_score": dict(latest_score).get("coord_score") if latest_score else None,
+            },
+            "people": {
+                "active": active[:limit],
+                "idle": idle[:limit],
+                "offline": offline[:limit],
+            },
+            "leaderboard": sorted(
+                xp_by_member.values(),
+                key=lambda row: (row["xp"], row["shipped"], row["claims"]),
+                reverse=True,
+            )[:limit],
+            "open_claims": [
+                {
+                    "task_key": row.get("task_key"),
+                    "member_name": row.get("member_name"),
+                    "channel": row.get("channel"),
+                    "age": _short_age(row.get("created_at"), now),
+                }
+                for row in open_claims[:limit]
+            ],
+            "stale_claims": stale_claims[:limit],
+            "unclaimed": unclaimed,
+            "blocked": blocked,
+            "proof": {
+                "ok": proof_ok,
+                "elapsed_ms": proof.get("elapsed_ms"),
+                "fast_paths": {
+                    "ok": proof.get("planner", {}).get("ok"),
+                    "total": proof.get("planner", {}).get("expected_total"),
+                },
+                "indexes": {"ok": index_count, "total": index_total},
+                "rows": rows,
+                "missing": {
+                    "indexes": {
+                        table: result.get("missing")
+                        for table, result in (proof.get("indexes") or {}).items()
+                        if isinstance(result, dict) and result.get("missing")
+                    },
+                    "live_data": proof.get("live_data", {}).get("missing") or {},
+                    "row_minimums": proof.get("row_minimums", {}).get("misses") or {},
+                },
+            },
+        }
+    finally:
+        conn.close()
+
+
+def _print_tower(state: dict) -> None:
+    counts = state["counts"]
+    proof = state["proof"]
+    print("Swarlo Tower")
+    print(f"Hub: {state['hub']}")
+    print(f"Overall: {state['health']}")
+    print(f"Next: {state['next_action']}")
+    print()
+    print("Work")
+    print(f"  Active now:       {counts['agents_active']} agent(s)")
+    print(f"  Idle but online:  {counts['agents_idle']} agent(s)")
+    print(f"  Quiet history:    {counts['agents_offline']} older agent record(s)")
+    print(f"  Tasks in hand:    {counts['open_claims']} open claim(s)")
+    print(f"  Stale claims:     {counts['stale_claims']} older claim(s)")
+    print(f"  No owner yet:     {counts['unclaimed_tasks']} task(s)")
+    print(f"  Blocked:          {counts['blocked_tasks']} task(s)")
+    if counts.get("coord_score") is not None:
+        print(f"  Score:            {counts['coord_score']}")
+    print()
+    print("People")
+    if state["leaderboard"]:
+        for idx, row in enumerate(state["leaderboard"], start=1):
+            print(
+                f"  {idx}. {row['member_name']} - {row['xp']} XP "
+                f"({row['shipped']} done, {row['claims']} claimed, {row['blocked']} blocked)"
+            )
+    else:
+        print("  No work history yet.")
+    print()
+    print("Needs attention")
+    if not state["stale_claims"] and not state["unclaimed"] and not state["blocked"]:
+        print("  Nothing urgent.")
+    for row in state["stale_claims"]:
+        print(f"  Stale: {row['task_key']} with {row['member_name']} ({row['age']})")
+    for row in state["unclaimed"]:
+        print(f"  No owner: {row.get('task_key')} in {row.get('channel')} - {_clip_text(row.get('content'))}")
+    for row in state["blocked"]:
+        print(f"  Blocked: {row.get('task_key')} - {_clip_text(row.get('content'))}")
+    print()
+    proof_status = "Good" if proof["ok"] else "Needs attention"
+    print("Proof")
+    print(f"  Status:           {proof_status}")
+    print(
+        f"  Fast routes:      {proof['fast_paths']['ok']}/{proof['fast_paths']['total']} ready"
+    )
+    print(f"  Speed helpers:    {proof['indexes']['ok']}/{proof['indexes']['total']} ready")
+    rows = proof.get("rows") or {}
+    print(
+        "  Data seen:        "
+        f"{rows.get('posts', 0)} posts, {rows.get('scores', 0)} scores, "
+        f"{rows.get('members', 0)} members"
+    )
+    if proof.get("elapsed_ms") is not None:
+        print(f"  Checked in:       {proof['elapsed_ms']} ms")
+    if not proof["ok"]:
+        missing = proof.get("missing") or {}
+        if missing.get("indexes"):
+            print("  Fix first: missing speed indexes.")
+        elif missing.get("live_data"):
+            print("  Fix first: database does not have enough live data.")
+        elif missing.get("row_minimums"):
+            print("  Fix first: database is below release-scale row floors.")
+        else:
+            print("  Fix first: run speed-proof for details.")
+
+
 def _run_speed_check(
     db_path: str,
     *,
@@ -1121,6 +1532,17 @@ def _build_parser() -> argparse.ArgumentParser:
     score.add_argument("--server")
     score.add_argument("--hub")
     score.add_argument("--api-key")
+    tower = sub.add_parser(
+        "tower",
+        help="Show a calm local control tower for the hub",
+        description="Show a calm local control tower: who is working, what needs an owner, what is blocked, and whether the local DB proof is healthy.",
+    )
+    tower.add_argument("--db", default="swarlo.db", help="SQLite database path")
+    tower.add_argument("--hub", help="Hub to show; defaults to config or the busiest hub in the DB")
+    tower.add_argument("--limit", type=int, default=5, help="Rows to show in each section")
+    tower.add_argument("--stale-minutes", type=int, default=30, help="Claim age that counts as stale")
+    tower.add_argument("--idle-minutes", type=int, default=15, help="Agent quiet time that counts as idle")
+    tower.add_argument("--json", action="store_true", help="Emit the tower state as JSON")
     score_history = sub.add_parser(
         "score-history",
         help="Recent persisted coordination scores with score deltas",
@@ -1902,6 +2324,20 @@ fi
                 print(f"    notes:     {notes}")
             if not (arts or decs or qs or notes):
                 print("    (no handoff recorded)")
+        return
+
+    if args.command == "tower":
+        state = _build_tower_state(
+            args.db,
+            hub=args.hub,
+            limit=_bounded_limit(args.limit, default=5, maximum=50),
+            stale_minutes=max(1, int(args.stale_minutes)),
+            idle_minutes=max(1, int(args.idle_minutes)),
+        )
+        if args.json:
+            print(json.dumps(state, indent=2, sort_keys=True))
+        else:
+            _print_tower(state)
         return
 
     if args.command == "score":
