@@ -15,9 +15,33 @@ def extract_mentions(content: str) -> list[str]:
 
 
 @dataclass
-class Member:
-    """A swarlo hub member (human, agent, or system)."""
+class Handoff:
+    """Structured state passed from one agent to the next on task completion.
 
+    Stored serialized inside Post.metadata["handoff"] — no schema migration.
+    Server bundles upstream handoffs into claim_next responses so downstream
+    agents receive predecessor state in one round-trip.
+    """
+    artifacts: list[str] = field(default_factory=list)
+    decisions: list[str] = field(default_factory=list)
+    open_questions: list[str] = field(default_factory=list)
+    notes: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Handoff":
+        return cls(
+            artifacts=list(data.get("artifacts") or []),
+            decisions=list(data.get("decisions") or []),
+            open_questions=list(data.get("open_questions") or []),
+            notes=data.get("notes"),
+        )
+
+
+@dataclass
+class Member:
     member_id: str
     member_type: str  # "human" | "agent" | "system"
     member_name: str
@@ -27,8 +51,6 @@ class Member:
 
 @dataclass
 class Post:
-    """A message, claim, or result posted to a swarlo channel."""
-
     post_id: str
     content: str
     kind: str  # message | claim | assign | result | failed | review | question | escalation | hypothesis
@@ -41,17 +63,19 @@ class Post:
     priority: int = 0  # 0=normal, 1-5=higher priority claimed first
     metadata: Optional[dict] = None  # structured data: steps, artifacts, files
     mentions: Optional[list[str]] = None  # resolved member_ids from @mentions
+    depends_on: Optional[list[str]] = None  # task_keys this post depends on
     created_at: Optional[str] = None
     replies: Optional[list[dict]] = None  # eager-loaded replies — fixes thread fragmentation
     display_id: Optional[str] = None
 
     def to_dict(self) -> dict:
-        """Convert Post to dict, omitting None optional fields."""
         d = asdict(self)
         if d.get("metadata") is None:
             del d["metadata"]
         if d.get("mentions") is None:
             del d["mentions"]
+        if d.get("depends_on") is None:
+            del d["depends_on"]
         if d.get("replies") is None:
             del d["replies"]
         if d.get("display_id") is None:
@@ -61,8 +85,6 @@ class Post:
 
 @dataclass
 class Reply:
-    """A reply to a swarlo post."""
-
     reply_id: str
     post_id: str
     content: str
@@ -73,14 +95,11 @@ class Reply:
     display_id: Optional[str] = None
 
     def to_dict(self) -> dict:
-        """Convert Reply to dict."""
         return asdict(self)
 
 
 @dataclass
 class ClaimResult:
-    """Result of attempting to claim a task on the swarlo board."""
-
     claimed: bool
     conflict: bool
     post_id: Optional[str] = None
@@ -91,6 +110,5 @@ class ClaimResult:
     message: Optional[str] = None
 
     def to_dict(self) -> dict:
-        """Convert ClaimResult to dict."""
         d = asdict(self)
         return d

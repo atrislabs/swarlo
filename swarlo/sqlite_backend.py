@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS posts (
     retry_count INTEGER DEFAULT 0,
     metadata TEXT,
     mentions TEXT,
+    assignee_id TEXT,
+    depends_on TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -77,27 +79,46 @@ CREATE TABLE IF NOT EXISTS scores (
     file_conflicts INTEGER DEFAULT 0,
     files_with_multi_editors INTEGER DEFAULT 0,
     coord_score INTEGER DEFAULT 0,
+    throughput_per_hour REAL DEFAULT 0,
+    mttr_seconds REAL,
+    rework_rate REAL DEFAULT 0,
+    idle_ratio REAL DEFAULT 0,
+    tasks_failed INTEGER DEFAULT 0,
+    tasks_blocked INTEGER DEFAULT 0,
     computed_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_hub_channel ON posts(hub_id, channel);
+CREATE INDEX IF NOT EXISTS idx_members_api_key ON members(api_key);
+CREATE INDEX IF NOT EXISTS idx_members_hub_type_seen ON members(hub_id, member_type, last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_members_hub_seen_type ON members(hub_id, last_seen, member_type);
+CREATE INDEX IF NOT EXISTS idx_posts_hub_channel_created ON posts(hub_id, channel, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_hub_created ON posts(hub_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_hub_member_created ON posts(hub_id, member_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_hub_task_key ON posts(hub_id, task_key);
+CREATE INDEX IF NOT EXISTS idx_posts_hub_task_status_created ON posts(hub_id, task_key, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_hub_kind_created ON posts(hub_id, kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_hub_kind_status_created ON posts(hub_id, kind, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_hub_kind_status_member_created ON posts(hub_id, kind, status, member_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_kind_status ON posts(kind, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_open_claim ON posts(hub_id, task_key) WHERE kind = 'claim' AND status = 'open';
 CREATE INDEX IF NOT EXISTS idx_replies_post ON replies(post_id);
+CREATE INDEX IF NOT EXISTS idx_replies_hub_post_created ON replies(hub_id, post_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_commits_hub ON commits(hub_id);
+CREATE INDEX IF NOT EXISTS idx_commits_hub_created ON commits(hub_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_commits_hub_member_created ON commits(hub_id, member_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_commits_hub_parent_created ON commits(hub_id, parent_hash, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scores_hub_computed ON scores(hub_id, computed_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_hash);
 CREATE INDEX IF NOT EXISTS idx_commits_member ON commits(member_id);
 """
 
 
 def _utcnow() -> str:
-    """Return the current UTC timestamp as an ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _uid() -> str:
-    """Generate a new UUID4 string for unique identifiers."""
     return str(uuid.uuid4())
 
 
@@ -113,10 +134,6 @@ def _post_display_id(kind: str, post_id: str | None) -> str | None:
     return _short_display_id(prefix, post_id)
 
 
-def _task_display_id(task_key: str | None) -> str | None:
-    return _short_display_id("T", task_key)
-
-
 class SQLiteBackend(SwarloBackend):
     """Swarlo backed by a local SQLite database."""
 
@@ -126,7 +143,6 @@ class SQLiteBackend(SwarloBackend):
         self._lock = threading.Lock()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get or create the SQLite connection, applying schema and migrations."""
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
@@ -149,6 +165,10 @@ class SQLiteBackend(SwarloBackend):
                 self._conn.execute("ALTER TABLE posts ADD COLUMN assignee_id TEXT")
             except sqlite3.OperationalError:
                 pass
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_posts_hub_assignee_created "
+                "ON posts(hub_id, assignee_id, created_at DESC)"
+            )
             try:
                 # Distinguish "alive" (last_seen, bumped on any auth touch)
                 # from "working" (last_active, bumped only when producing
@@ -164,6 +184,19 @@ class SQLiteBackend(SwarloBackend):
                 self._conn.execute("ALTER TABLE posts ADD COLUMN depends_on TEXT")
             except sqlite3.OperationalError:
                 pass
+            for column, definition in (
+                ("throughput_per_hour", "REAL DEFAULT 0"),
+                ("mttr_seconds", "REAL"),
+                ("rework_rate", "REAL DEFAULT 0"),
+                ("idle_ratio", "REAL DEFAULT 0"),
+                ("tasks_failed", "INTEGER DEFAULT 0"),
+                ("tasks_blocked", "INTEGER DEFAULT 0"),
+            ):
+                try:
+                    self._conn.execute(f"ALTER TABLE scores ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError:
+                    pass
+            self._conn.commit()
         return self._conn
 
     @property
@@ -171,7 +204,6 @@ class SQLiteBackend(SwarloBackend):
         return self._get_conn()
 
     def close(self):
-        """Close the database connection and release resources."""
         if self._conn:
             try:
                 self._conn.close()
@@ -182,12 +214,6 @@ class SQLiteBackend(SwarloBackend):
     # ── Members ─────────────────────────────────────────────
 
     def register_member(self, member: Member, api_key: str | None = None) -> None:
-        """Register or update a member in the hub.
-
-        Args:
-            member: Member object with id, hub_id, type, name, webhook_url
-            api_key: Optional API key for authentication
-        """
         with self._lock:
             self.conn.execute(
                 "INSERT OR REPLACE INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -196,11 +222,6 @@ class SQLiteBackend(SwarloBackend):
             self.conn.commit()
 
     def get_member(self, hub_id: str, member_id: str) -> Member | None:
-        """Retrieve a member by hub and member ID.
-
-        Returns:
-            Member object if found, None otherwise
-        """
         row = self.conn.execute(
             "SELECT * FROM members WHERE member_id = ? AND hub_id = ?",
             (member_id, hub_id),
@@ -210,7 +231,6 @@ class SQLiteBackend(SwarloBackend):
         return self._row_to_member(row)
 
     def authenticate(self, api_key: str) -> Member | None:
-        """Authenticate a member by API key. Returns Member if valid, None otherwise."""
         row = self.conn.execute(
             "SELECT * FROM members WHERE api_key = ?", (api_key,)
         ).fetchone()
@@ -222,14 +242,26 @@ class SQLiteBackend(SwarloBackend):
         """Resolve @mention names to member_ids. Case-insensitive match on member_name or member_id."""
         if not names:
             return []
+        lowered_names = [name.lower() for name in names]
+        unique_lowered = list(dict.fromkeys(lowered_names))
+        placeholders = ",".join("?" for _ in unique_lowered)
+        rows = self.conn.execute(
+            f"SELECT member_id, member_name FROM members "
+            f"WHERE hub_id = ? AND (LOWER(member_name) IN ({placeholders}) "
+            f"OR LOWER(member_id) IN ({placeholders}))",
+            (hub_id, *unique_lowered, *unique_lowered),
+        ).fetchall()
+        by_lookup: dict[str, str] = {}
+        for row in rows:
+            if row["member_name"]:
+                by_lookup.setdefault(row["member_name"].lower(), row["member_id"])
+            by_lookup.setdefault(row["member_id"].lower(), row["member_id"])
+
         resolved = []
         for name in names:
-            row = self.conn.execute(
-                "SELECT member_id FROM members WHERE hub_id = ? AND (LOWER(member_name) = LOWER(?) OR LOWER(member_id) = LOWER(?))",
-                (hub_id, name, name),
-            ).fetchone()
-            if row:
-                resolved.append(row["member_id"])
+            member_id = by_lookup.get(name.lower())
+            if member_id:
+                resolved.append(member_id)
         return resolved
 
     def get_members_by_ids(self, hub_id: str, member_ids: list[str]) -> list[Member]:
@@ -244,7 +276,6 @@ class SQLiteBackend(SwarloBackend):
         return [self._row_to_member(r) for r in rows]
 
     def _row_to_member(self, row) -> Member:
-        """Convert a database row to a Member object."""
         return Member(
             member_id=row["member_id"],
             member_type=row["member_type"],
@@ -256,7 +287,6 @@ class SQLiteBackend(SwarloBackend):
     # ── SwarloBackend ───────────────────────────────────────
 
     async def list_channels(self, hub_id: str) -> list[str]:
-        """List all channels for a hub, including defaults and any with posts."""
         rows = self.conn.execute(
             "SELECT DISTINCT channel FROM posts WHERE hub_id = ?", (hub_id,)
         ).fetchall()
@@ -357,6 +387,7 @@ class SQLiteBackend(SwarloBackend):
 
     async def retry_failed(self, hub_id: str, max_retries: int = 3) -> list[str]:
         """Re-queue failed tasks that haven't exceeded max_retries. Returns retried task_keys."""
+        await self.force_expire_claims(hub_id, stale_minutes=30)
         with self._lock:
             rows = self.conn.execute(
                 "SELECT post_id, task_key, channel, member_id, member_name, member_type, content, priority, retry_count "
@@ -365,26 +396,39 @@ class SQLiteBackend(SwarloBackend):
                 (hub_id, max_retries),
             ).fetchall()
 
-        # Check claims outside lock (involves await)
+            candidate_keys = {
+                r["task_key"]
+                for r in rows
+                if r["task_key"]
+            }
+            open_claim_keys: set[str] = set()
+            if candidate_keys:
+                placeholders = ",".join("?" * len(candidate_keys))
+                claim_rows = self.conn.execute(
+                    f"SELECT DISTINCT task_key FROM posts "
+                    f"WHERE hub_id = ? AND kind = 'claim' AND status = 'open' "
+                    f"AND task_key IN ({placeholders})",
+                    (hub_id, *candidate_keys),
+                ).fetchall()
+                open_claim_keys = {r["task_key"] for r in claim_rows}
+
         retried = []
         update_ids = []
         for r in rows:
             task_key = r["task_key"]
             if not task_key:
                 continue
-            existing = await self.get_open_claims(hub_id, task_key=task_key)
-            if existing:
+            if task_key in open_claim_keys:
                 continue
             update_ids.append(r["post_id"])
             retried.append(task_key)
 
         if update_ids:
             with self._lock:
-                for pid in update_ids:
-                    self.conn.execute(
-                        "UPDATE posts SET retry_count = retry_count + 1 WHERE post_id = ?",
-                        (pid,),
-                    )
+                self.conn.executemany(
+                    "UPDATE posts SET retry_count = retry_count + 1 WHERE post_id = ?",
+                    [(pid,) for pid in update_ids],
+                )
                 self.conn.commit()
         return retried
 
@@ -392,6 +436,12 @@ class SQLiteBackend(SwarloBackend):
         reply_id = _uid()
         now = _utcnow()
         with self._lock:
+            parent = self.conn.execute(
+                "SELECT 1 FROM posts WHERE hub_id = ? AND post_id = ?",
+                (hub_id, post_id),
+            ).fetchone()
+            if not parent:
+                raise KeyError(f"Post {post_id} not found in hub {hub_id}")
             self.conn.execute(
                 "INSERT INTO replies (reply_id, post_id, hub_id, member_id, member_name, member_type, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (reply_id, post_id, hub_id, member.member_id, member.member_name, member.member_type, content, now),
@@ -401,7 +451,6 @@ class SQLiteBackend(SwarloBackend):
             reply_id=reply_id, post_id=post_id, content=content,
             member_id=member.member_id, member_name=member.member_name,
             member_type=member.member_type, created_at=now,
-            display_id=_short_display_id("Y", reply_id),
         )
 
     async def assign(self, hub_id: str, assigner: Member, channel: str,
@@ -748,16 +797,16 @@ class SQLiteBackend(SwarloBackend):
     async def get_ready_tasks(self, hub_id: str, member_id: str) -> list[Post]:
         """Return tasks assigned to a member where every direct dep is done.
 
-        Two-query implementation: one query fetches the set of all done
-        task_keys for the hub, a second query fetches this member's
-        candidate assignments. Readiness is then a pure Python set
-        membership check per candidate — no per-candidate round trip,
-        no recursive self-reference, no extra work.
+        Two-query implementation: one query fetches this member's candidate
+        assignments, then one query checks only the dependency keys those
+        candidates mention. Readiness is then a pure Python set membership
+        check per candidate — no per-candidate round trip, no recursive
+        self-reference, no full-hub done-task scan.
 
         A task is "ready" iff:
           - It's assigned to this member (assignee_id = member_id)
           - It's kind='assign'
-          - It has NOT yet been reported as done/failed
+          - It has NOT yet been reported as done/failed/blocked
           - Every task_key in its depends_on array is directly done
 
         Transitive readiness across a dep chain resolves naturally via
@@ -771,15 +820,7 @@ class SQLiteBackend(SwarloBackend):
         the previous N+1 implementation had.
         """
         with self._lock:
-            # Query 1: every task_key that's currently done in this hub
-            done_rows = self.conn.execute(
-                "SELECT DISTINCT task_key FROM posts "
-                "WHERE hub_id = ? AND task_key IS NOT NULL AND status = 'done'",
-                (hub_id,),
-            ).fetchall()
-            done_set = {r["task_key"] for r in done_rows}
-
-            # Query 2: my candidate assignments (not yet done/failed)
+            # Query 1: my candidate assignments (not yet done/failed/blocked)
             rows = self.conn.execute(
                 """
                 SELECT * FROM posts
@@ -787,22 +828,42 @@ class SQLiteBackend(SwarloBackend):
                   AND task_key NOT IN (
                       SELECT task_key FROM posts
                       WHERE hub_id = ? AND task_key IS NOT NULL
-                        AND status IN ('done', 'failed')
+                        AND status IN ('done', 'failed', 'blocked')
                   )
                 """,
                 (hub_id, member_id, hub_id),
             ).fetchall()
 
+            deps_to_check: set[str] = set()
+            parsed_deps_by_post: dict[str, list[str]] = {}
+            for row in rows:
+                depends_on_raw = row["depends_on"]
+                if not depends_on_raw:
+                    parsed_deps_by_post[row["post_id"]] = []
+                    continue
+                try:
+                    deps = [d for d in json.loads(depends_on_raw) if isinstance(d, str)]
+                except Exception:
+                    deps = []
+                parsed_deps_by_post[row["post_id"]] = deps
+                deps_to_check.update(deps)
+
+            done_set: set[str] = set()
+            if deps_to_check:
+                placeholders = ",".join("?" * len(deps_to_check))
+                done_rows = self.conn.execute(
+                    f"SELECT DISTINCT task_key FROM posts "
+                    f"WHERE hub_id = ? AND task_key IN ({placeholders}) AND status = 'done'",
+                    (hub_id, *deps_to_check),
+                ).fetchall()
+                done_set = {r["task_key"] for r in done_rows}
+
         ready: list[Post] = []
         for row in rows:
-            depends_on_raw = row["depends_on"]
-            if not depends_on_raw:
+            deps = parsed_deps_by_post.get(row["post_id"], [])
+            if not deps:
                 ready.append(self._row_to_post(row))
                 continue
-            try:
-                deps = json.loads(depends_on_raw)
-            except Exception:
-                deps = []
             # Set-membership check — O(deps) per candidate, no extra queries
             if all(d in done_set for d in deps):
                 ready.append(self._row_to_post(row))
@@ -810,12 +871,181 @@ class SQLiteBackend(SwarloBackend):
         ready.sort(key=lambda p: (-p.priority, p.created_at))
         return ready
 
+    def bundle_upstream_handoffs(self, hub_id: str, task_key: str,
+                                 depends_on: list[str] | None) -> list[dict]:
+        """Direct-deps only (1 hop). For each done predecessor of task_key,
+        return {from, by, by_id, at, handoff} drawn from the most recent
+        result post for that dep. Posts without a handoff still yield a
+        record with handoff={} so consumers can see who shipped what.
+
+        Bounded by `len(depends_on)` — no fan-out. Returns [] if depends_on
+        is empty/None.
+        """
+        if not depends_on:
+            return []
+        unique_deps = list(dict.fromkeys(depends_on))
+        placeholders = ",".join("?" * len(unique_deps))
+        latest_by_dep: dict[str, dict] = {}
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT task_key, member_id, member_name, created_at, metadata "
+                f"FROM posts WHERE hub_id = ? AND task_key IN ({placeholders}) "
+                f"AND status = 'done' ORDER BY task_key, created_at DESC",
+                (hub_id, *unique_deps),
+            ).fetchall()
+        for row in rows:
+            latest_by_dep.setdefault(row["task_key"], row)
+
+        bundled: list[dict] = []
+        for dep_key in unique_deps:
+            row = latest_by_dep.get(dep_key)
+            if not row:
+                continue
+            meta_raw = row["metadata"]
+            handoff = {}
+            if meta_raw:
+                try:
+                    meta = json.loads(meta_raw)
+                    if isinstance(meta, dict) and isinstance(meta.get("handoff"), dict):
+                        handoff = meta["handoff"]
+                except Exception:
+                    pass
+            bundled.append({
+                "from": row["task_key"],
+                "by": row["member_name"],
+                "by_id": row["member_id"],
+                "at": row["created_at"],
+                "handoff": handoff,
+            })
+        return bundled
+
+    def _lookup_deps_for_task(self, hub_id: str, task_key: str) -> list[str]:
+        """Find depends_on for a task_key by scanning any post that recorded it.
+
+        The result post (kind=result) doesn't carry depends_on — that lives on
+        the claim/assign post. Take the most recent post for this task_key
+        with depends_on IS NOT NULL.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
+                "AND depends_on IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                (hub_id, task_key),
+            ).fetchone()
+        if not row or not row["depends_on"]:
+            return []
+        try:
+            parsed = json.loads(row["depends_on"])
+            return [d for d in parsed if isinstance(d, str)]
+        except Exception:
+            return []
+
+    def _lookup_deps_for_tasks(self, hub_id: str, task_keys: list[str]) -> dict[str, list[str]]:
+        """Batch form of _lookup_deps_for_task for BFS trail expansion."""
+        if not task_keys:
+            return {}
+        placeholders = ",".join("?" * len(task_keys))
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT task_key, depends_on FROM posts "
+                f"WHERE hub_id = ? AND task_key IN ({placeholders}) "
+                f"AND depends_on IS NOT NULL ORDER BY task_key, created_at DESC",
+                (hub_id, *task_keys),
+            ).fetchall()
+        deps_by_key: dict[str, list[str]] = {}
+        for row in rows:
+            task_key = row["task_key"]
+            if task_key in deps_by_key:
+                continue
+            try:
+                parsed = json.loads(row["depends_on"])
+                deps_by_key[task_key] = [d for d in parsed if isinstance(d, str)]
+            except Exception:
+                deps_by_key[task_key] = []
+        return deps_by_key
+
+    def _latest_done_rows_for_tasks(self, hub_id: str, task_keys: list[str]) -> dict[str, dict]:
+        """Return newest done result row per task_key in one query."""
+        if not task_keys:
+            return {}
+        placeholders = ",".join("?" * len(task_keys))
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT task_key, member_id, member_name, created_at, metadata "
+                f"FROM posts WHERE hub_id = ? AND task_key IN ({placeholders}) "
+                f"AND status = 'done' ORDER BY task_key, created_at DESC",
+                (hub_id, *task_keys),
+            ).fetchall()
+        latest: dict[str, dict] = {}
+        for row in rows:
+            latest.setdefault(row["task_key"], row)
+        return latest
+
+    def walk_handoff_trail(self, hub_id: str, task_key: str,
+                           depth: int = 3, max_nodes: int = 100) -> list[dict]:
+        """Walk depends_on backward from task_key up to `depth` hops.
+
+        BFS across distinct task_keys. Each visited (done) task_key yields
+        one trail node: {from, by, by_id, at, hop, handoff}. Hop=1 means
+        direct dep, hop=2 means grand-dep, etc. The seed task itself is
+        NOT included.
+
+        Bounded by `max_nodes` to keep payloads predictable. A 5-deep
+        fan-of-3 DAG hits 3^5 = 243 — cap defends against that.
+        """
+        if depth < 1:
+            return []
+        visited: set[str] = set()
+        trail: list[dict] = []
+        # Seed frontier with the seed task's direct deps
+        frontier: list[str] = self._lookup_deps_for_task(hub_id, task_key)
+        hop = 1
+
+        while frontier and hop <= depth and len(trail) < max_nodes:
+            level_keys = []
+            for current_key in frontier:
+                if current_key not in visited:
+                    visited.add(current_key)
+                    level_keys.append(current_key)
+            done_rows = self._latest_done_rows_for_tasks(hub_id, level_keys)
+            deps_by_key = self._lookup_deps_for_tasks(hub_id, level_keys) if hop < depth else {}
+            next_frontier: list[str] = []
+            for current_key in level_keys:
+                done_row = done_rows.get(current_key)
+                if not done_row:
+                    continue
+                handoff = {}
+                meta_raw = done_row["metadata"]
+                if meta_raw:
+                    try:
+                        meta = json.loads(meta_raw)
+                        if isinstance(meta, dict) and isinstance(meta.get("handoff"), dict):
+                            handoff = meta["handoff"]
+                    except Exception:
+                        pass
+                trail.append({
+                    "from": done_row["task_key"],
+                    "by": done_row["member_name"],
+                    "by_id": done_row["member_id"],
+                    "at": done_row["created_at"],
+                    "hop": hop,
+                    "handoff": handoff,
+                })
+                if len(trail) >= max_nodes:
+                    break
+                for d in deps_by_key.get(current_key, []):
+                    if d not in visited:
+                        next_frontier.append(d)
+            frontier = next_frontier
+            hop += 1
+        return trail
+
     async def get_my_open_tasks(self, hub_id: str, member_id: str) -> list[Post]:
         """Return open work assigned to a member.
 
         Includes:
         - Their own open claims (assignee_id = member_id, kind = claim, status = open)
-        - Open assignments addressed to them (assignee_id = member_id, kind = assign)
+        - Non-terminal assignments addressed to them (assignee_id = member_id, kind = assign)
 
         Replaces the "grep channels for your name" antipattern. This is the
         single source of truth for "what's mine?".
@@ -823,11 +1053,35 @@ class SQLiteBackend(SwarloBackend):
         with self._lock:
             rows = self.conn.execute(
                 "SELECT * FROM posts WHERE hub_id = ? AND assignee_id = ? "
-                "AND ((kind = 'claim' AND status = 'open') OR kind = 'assign') "
+                "AND ("
+                "  (kind = 'claim' AND status = 'open') "
+                "  OR kind = 'assign'"
+                ") "
                 "ORDER BY created_at DESC",
                 (hub_id, member_id),
             ).fetchall()
-        return [self._row_to_post(r) for r in rows]
+
+            assigned_task_keys = {
+                r["task_key"]
+                for r in rows
+                if r["kind"] == "assign" and r["task_key"]
+            }
+            terminal_task_keys: set[str] = set()
+            if assigned_task_keys:
+                placeholders = ",".join("?" * len(assigned_task_keys))
+                terminal_rows = self.conn.execute(
+                    f"SELECT DISTINCT task_key FROM posts "
+                    f"WHERE hub_id = ? AND task_key IN ({placeholders}) "
+                    f"AND status IN ('done', 'failed', 'blocked')",
+                    (hub_id, *assigned_task_keys),
+                ).fetchall()
+                terminal_task_keys = {r["task_key"] for r in terminal_rows}
+
+        return [
+            self._row_to_post(r)
+            for r in rows
+            if r["kind"] != "assign" or r["task_key"] not in terminal_task_keys
+        ]
 
     async def get_open_claims(self, hub_id: str, channel: str | None = None,
                               task_key: str | None = None) -> list[Post]:
@@ -849,44 +1103,45 @@ class SQLiteBackend(SwarloBackend):
 
     async def get_replies(self, hub_id: str, post_id: str) -> list[Reply]:
         rows = self.conn.execute(
-            "SELECT r.* FROM replies r JOIN posts p ON r.post_id = p.post_id "
-            "WHERE r.post_id = ? AND p.hub_id = ? ORDER BY r.created_at ASC",
-            (post_id, hub_id),
+            "SELECT * FROM replies WHERE hub_id = ? AND post_id = ? ORDER BY created_at ASC",
+            (hub_id, post_id),
         ).fetchall()
         return [
             Reply(
                 reply_id=r["reply_id"], post_id=r["post_id"], content=r["content"],
                 member_id=r["member_id"], member_name=r["member_name"],
                 member_type=r["member_type"], created_at=r["created_at"],
-                display_id=_short_display_id("Y", r["reply_id"]),
             )
             for r in rows
         ]
 
     async def summarize_for_member(self, hub_id: str, member_id: str, limit: int = 10) -> str:
-        rows = self.conn.execute(
-            "SELECT * FROM posts WHERE hub_id = ? ORDER BY created_at DESC LIMIT ?",
-            (hub_id, limit * 3),
+        board_rows = self.conn.execute(
+            "SELECT * FROM posts WHERE hub_id = ? "
+            "AND NOT (kind = 'claim' AND status = 'open') "
+            "ORDER BY created_at DESC LIMIT ?",
+            (hub_id, limit),
+        ).fetchall()
+        claim_rows = self.conn.execute(
+            "SELECT * FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (hub_id, limit),
         ).fetchall()
 
         lines = []
-        open_claims = []
-        count = 0
-        for r in rows:
+        for r in board_rows:
             kind = r["kind"]
             name = r["member_name"]
             ch = r["channel"]
             content = r["content"][:150].replace("\n", " ")
 
-            if kind == "claim" and r["status"] == "open":
-                open_claims.append(f"  - {name}: {content}")
-                continue
-
             kind_tag = kind.upper() if kind in ("claim", "result", "failed", "escalation") else ""
             lines.append(f"  #{ch} {name}: {kind_tag + ' ' if kind_tag else ''}{content}")
-            count += 1
-            if count >= limit:
-                break
+
+        open_claims = [
+            f"  - {r['member_name']}: {r['content'][:150].replace(chr(10), ' ')}"
+            for r in claim_rows
+        ]
 
         if not lines and not open_claims:
             return ""
@@ -912,7 +1167,6 @@ class SQLiteBackend(SwarloBackend):
             self.conn.commit()
 
     def get_commit(self, hub_id: str, hash: str) -> dict | None:
-        """Retrieve a single commit by its hash."""
         row = self.conn.execute(
             "SELECT * FROM commits WHERE hash = ? AND hub_id = ?", (hash, hub_id)
         ).fetchone()
@@ -921,7 +1175,6 @@ class SQLiteBackend(SwarloBackend):
         return dict(row)
 
     def list_commits(self, hub_id: str, member_id: str | None = None, limit: int = 50) -> list[dict]:
-        """List recent commits, optionally filtered by member."""
         if member_id:
             rows = self.conn.execute(
                 "SELECT * FROM commits WHERE hub_id = ? AND member_id = ? ORDER BY created_at DESC LIMIT ?",
@@ -935,7 +1188,6 @@ class SQLiteBackend(SwarloBackend):
         return [dict(r) for r in rows]
 
     def get_children(self, hub_id: str, hash: str) -> list[dict]:
-        """Get all commits that have this hash as their parent."""
         rows = self.conn.execute(
             "SELECT * FROM commits WHERE hub_id = ? AND parent_hash = ? ORDER BY created_at DESC",
             (hub_id, hash),
@@ -943,7 +1195,6 @@ class SQLiteBackend(SwarloBackend):
         return [dict(r) for r in rows]
 
     def get_leaves(self, hub_id: str) -> list[dict]:
-        """Get commits with no children (branch tips)."""
         rows = self.conn.execute("""
             SELECT c.* FROM commits c
             LEFT JOIN commits child ON child.parent_hash = c.hash AND child.hub_id = c.hub_id
@@ -953,7 +1204,6 @@ class SQLiteBackend(SwarloBackend):
         return [dict(r) for r in rows]
 
     def get_lineage(self, hub_id: str, hash: str) -> list[dict]:
-        """Walk the parent chain from a commit back to root."""
         lineage = []
         current = hash
         while current:
@@ -969,10 +1219,18 @@ class SQLiteBackend(SwarloBackend):
     # ── Helpers ─────────────────────────────────────────────
 
     def _row_to_post(self, row: sqlite3.Row) -> Post:
-        """Convert a database row to a Post object."""
-        metadata_raw = row["metadata"] if "metadata" in row.keys() else None
-        mentions_raw = row["mentions"] if "mentions" in row.keys() else None
         keys = row.keys()
+        metadata_raw = row["metadata"] if "metadata" in keys else None
+        mentions_raw = row["mentions"] if "mentions" in keys else None
+        depends_on_raw = row["depends_on"] if "depends_on" in keys else None
+        depends_on: list[str] | None = None
+        if depends_on_raw:
+            try:
+                parsed = json.loads(depends_on_raw)
+                if isinstance(parsed, list):
+                    depends_on = [d for d in parsed if isinstance(d, str)] or None
+            except Exception:
+                depends_on = None
         return Post(
             post_id=row["post_id"],
             content=row["content"],
@@ -986,6 +1244,7 @@ class SQLiteBackend(SwarloBackend):
             priority=row["priority"] if "priority" in keys else 0,
             metadata=json.loads(metadata_raw) if metadata_raw else None,
             mentions=json.loads(mentions_raw) if mentions_raw else None,
+            depends_on=depends_on,
             created_at=row["created_at"],
             display_id=_post_display_id(row["kind"], row["post_id"]),
         )
