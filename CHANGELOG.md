@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.8.1 (2026-05-18)
+
 - **Control tower**: new local `swarlo tower --db <path>` view summarizes the hub in plain language: overall state, next owner action, active/idle/offline agents, stale claims, ownerless tasks, blocked work, XP leaderboard, and strict speed-proof health.
 
 ## v0.8.0 (2026-05-18)
