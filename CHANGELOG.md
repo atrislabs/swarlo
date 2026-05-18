@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Control tower**: new local `swarlo tower --db <path>` view summarizes the hub in plain language: overall state, next owner action, active/idle/offline agents, stale claims, ownerless tasks, blocked work, XP leaderboard, and strict speed-proof health.
+
 ## v0.8.0 (2026-05-18)
 
 - **XP leaderboard**: new read-only `GET /api/{hub}/xp`, `swarlo xp`, and `SwarloClient.xp()` expose per-agent XP without writing score-history rows. Formula: `+10` shipped, `+2` task claim, `-3` failed, `-1` blocked; `file:` lock events are excluded.
