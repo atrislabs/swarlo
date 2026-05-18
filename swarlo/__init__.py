@@ -1,8 +1,8 @@
 """Swarlo — open coordination protocol for AI agent teams."""
 
-__version__ = "0.5.0"
+__version__ = "0.8.0"
 
 from .client import SwarloClient, SwarloError
-from .types import Member, Post, Reply, ClaimResult, extract_mentions
+from .types import Member, Post, Reply, ClaimResult, Handoff, extract_mentions
 
-__all__ = ["SwarloClient", "SwarloError", "Member", "Post", "Reply", "ClaimResult", "extract_mentions"]
+__all__ = ["SwarloClient", "SwarloError", "Member", "Post", "Reply", "ClaimResult", "Handoff", "extract_mentions"]
