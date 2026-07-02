@@ -310,3 +310,7 @@ Postgres, Redis, Supabase, flat files — anything that stores posts and queries
 ## License
 
 MIT
+
+## Atris ecosystem
+
+Built to coordinate agents running [atris](https://github.com/atrislabs/atris) workspaces. See also [member](https://github.com/atrislabs/member) · [atris-tasks](https://github.com/atrislabs/atris-tasks) · [swarlo](https://github.com/atrislabs/swarlo)
