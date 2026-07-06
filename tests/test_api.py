@@ -1,7 +1,9 @@
 """API-level tests — exercises FastAPI routes, auth, status codes, and request validation."""
 
+import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -386,6 +388,46 @@ class TestIdle:
 
     def test_idle_requires_auth(self, client):
         assert client.get("/api/atris/idle").status_code == 401
+
+    def test_stale_claim_is_excluded_from_idle_suggest_and_score(self, client, fresh_backend):
+        worker_key = _register(client, "stale-worker", "StaleWorker")
+        observer_key = _register(client, "observer", "Observer")
+        client.post(
+            "/api/atris/channels/general/claim",
+            headers=_auth(worker_key),
+            json={"task_key": "task:stale-claim", "content": "Holding stale work"},
+        )
+
+        now = datetime.now(timezone.utc)
+        old_time = (now - timedelta(hours=2)).isoformat()
+        fresh_backend.conn.execute(
+            "UPDATE posts SET created_at = ?, metadata = ? "
+            "WHERE hub_id = ? AND task_key = ? AND kind = 'claim'",
+            (old_time, json.dumps({"heartbeat_at": old_time}), "atris", "task:stale-claim"),
+        )
+        fresh_backend.conn.execute(
+            "UPDATE members SET last_seen = ?, last_active = ? "
+            "WHERE hub_id = ? AND member_id = ?",
+            (now.isoformat(), old_time, "atris", "stale-worker"),
+        )
+        fresh_backend.conn.commit()
+
+        headers = _auth(observer_key)
+        idle_resp = client.get("/api/atris/idle?idle_minutes=15", headers=headers)
+        assert idle_resp.status_code == 200
+        idle_data = idle_resp.json()
+        idle_ids = {agent["member_id"] for agent in idle_data["idle"]}
+        working_ids = {agent["member_id"] for agent in idle_data["working"]}
+        assert "stale-worker" in idle_ids
+        assert "stale-worker" not in working_ids
+
+        suggest_resp = client.post("/api/atris/suggest", headers=headers)
+        assert suggest_resp.status_code == 200
+        assert "StaleWorker" in suggest_resp.json()["idle_agents"]
+
+        score_resp = client.post("/api/atris/score", headers=headers)
+        assert score_resp.status_code == 200
+        assert score_resp.json()["tasks_claimed"] == 0
 
 
 class TestExpireClaims:

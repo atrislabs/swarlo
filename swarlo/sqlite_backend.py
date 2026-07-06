@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -147,30 +148,95 @@ class SQLiteBackend(SwarloBackend):
         self._local = threading.local()
         self._schema_lock = threading.Lock()
         self._write_lock = threading.Lock()
-        self._connections: list[sqlite3.Connection] = []
+        self._connections: dict[int, sqlite3.Connection] = {}
+        self._connection_finalizers: dict[int, weakref.finalize] = {}
+        self._connection_generation = 0
         self._connections_lock = threading.Lock()
 
     def _get_conn(self) -> sqlite3.Connection:
+        thread = threading.current_thread()
+        thread_key = id(thread)
         conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = sqlite3.connect(
-                self.db_path,
-                check_same_thread=False,
-                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
-            )
-            conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            with self._schema_lock:
-                conn.executescript(SCHEMA)
-                self._run_migrations(conn)
-                conn.commit()
-            self._local.conn = conn
+        local_generation = getattr(self._local, "generation", None)
+        with self._connections_lock:
+            current_generation = self._connection_generation
+        if conn is not None and local_generation == current_generation:
+            return conn
+
+        if conn is not None:
+            self._untrack_thread_connection(thread_key, conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        with self._schema_lock:
+            conn.executescript(SCHEMA)
+            self._run_migrations(conn)
+            conn.commit()
+        finalizer = weakref.finalize(
+            thread,
+            SQLiteBackend._finalize_thread_connection,
+            weakref.ref(self),
+            thread_key,
+            conn,
+        )
+        with self._connections_lock:
+            current_generation = self._connection_generation
+            previous = self._connections.pop(thread_key, None)
+            previous_finalizer = self._connection_finalizers.pop(thread_key, None)
+            self._connections[thread_key] = conn
+            self._connection_finalizers[thread_key] = finalizer
             self._conn = conn
-            with self._connections_lock:
-                self._connections.append(conn)
+        if previous_finalizer is not None:
+            previous_finalizer.detach()
+        if previous is not None and previous is not conn:
+            try:
+                previous.close()
+            except Exception:
+                pass
+        self._local.conn = conn
+        self._local.generation = current_generation
         return conn
+
+    @staticmethod
+    def _finalize_thread_connection(
+        backend_ref: weakref.ReferenceType["SQLiteBackend"],
+        thread_key: int,
+        conn: sqlite3.Connection,
+    ) -> None:
+        backend = backend_ref()
+        if backend is not None:
+            with backend._connections_lock:
+                if backend._connections.get(thread_key) is conn:
+                    backend._connections.pop(thread_key, None)
+                    backend._connection_finalizers.pop(thread_key, None)
+                    if backend._conn is conn:
+                        backend._conn = None
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _untrack_thread_connection(self, thread_key: int, conn: sqlite3.Connection) -> None:
+        with self._connections_lock:
+            finalizer = None
+            if self._connections.get(thread_key) is conn:
+                self._connections.pop(thread_key, None)
+                finalizer = self._connection_finalizers.pop(thread_key, None)
+                if self._conn is conn:
+                    self._conn = None
+        if finalizer is not None:
+            finalizer.detach()
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
         """Apply additive migrations and indexes for existing databases."""
@@ -228,16 +294,23 @@ class SQLiteBackend(SwarloBackend):
 
     def close(self):
         with self._connections_lock:
-            connections = list(self._connections)
+            self._connection_generation += 1
+            connections = list(self._connections.values())
+            finalizers = list(self._connection_finalizers.values())
             self._connections.clear()
+            self._connection_finalizers.clear()
+            self._conn = None
+        for finalizer in finalizers:
+            finalizer.detach()
         for conn in connections:
             try:
                 conn.close()
             except Exception:
                 pass  # cross-thread close in test teardown
-        self._conn = None
         if hasattr(self._local, "conn"):
             delattr(self._local, "conn")
+        if hasattr(self._local, "generation"):
+            delattr(self._local, "generation")
 
     # ── Members ─────────────────────────────────────────────
 

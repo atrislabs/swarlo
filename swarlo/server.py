@@ -30,10 +30,25 @@ _backend: SQLiteBackend | None = None
 _git_dag: GitDAG | None = None
 BRIEFING_LOOKBACK_DAYS = 14
 REPLAY_MAX_LOOKBACK_DAYS = 7
+OPEN_CLAIM_STALE_MINUTES = 30
 
 
 def _utc_cutoff(days: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _open_claim_cutoff(now: datetime | None = None) -> str:
+    reference = now or datetime.now(timezone.utc)
+    return (reference - timedelta(minutes=OPEN_CLAIM_STALE_MINUTES)).isoformat()
+
+
+def _open_claim_predicate(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"{prefix}kind = 'claim' AND {prefix}status = 'open' "
+        f"AND COALESCE(json_extract({prefix}metadata, '$.heartbeat_at'), "
+        f"{prefix}created_at) >= ?"
+    )
 
 
 def _bounded_replay_since(since: str) -> str:
@@ -508,20 +523,21 @@ async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
     now = datetime.now(timezone.utc)
     alive_cutoff = (now - timedelta(minutes=30)).isoformat()
     idle_cutoff = (now - timedelta(minutes=idle_minutes)).isoformat()
+    open_claim_cutoff = _open_claim_cutoff(now)
 
     # Single query: alive agents with their last_active and any open claim.
     # LEFT JOIN folds the open-claim lookup into one round trip.
     rows = be.conn.execute(
-        """
+        f"""
         SELECT m.member_id, m.member_name, m.last_active,
-               (SELECT task_key FROM posts
-                WHERE hub_id = m.hub_id AND member_id = m.member_id
-                  AND kind = 'claim' AND status = 'open'
+               (SELECT p.task_key FROM posts p
+                WHERE p.hub_id = m.hub_id AND p.member_id = m.member_id
+                  AND {_open_claim_predicate('p')}
                 LIMIT 1) AS open_claim
         FROM members m
         WHERE m.hub_id = ? AND m.last_seen > ? AND m.member_type = 'agent'
         """,
-        (hub_id, alive_cutoff),
+        (open_claim_cutoff, hub_id, alive_cutoff),
     ).fetchall()
 
     idle, working = [], []
@@ -940,8 +956,9 @@ async def suggest_tasks(hub_id: str, request: Request):
     # 1. Find idle agents
     alive_cutoff = (now - timedelta(minutes=30)).isoformat()
     idle_cutoff = (now - timedelta(minutes=15)).isoformat()
+    open_claim_cutoff = _open_claim_cutoff(now)
     idle_rows = be.conn.execute(
-        """
+        f"""
         WITH alive AS (
             SELECT member_id, member_name
             FROM members
@@ -958,7 +975,7 @@ async def suggest_tasks(hub_id: str, request: Request):
             SELECT DISTINCT p.member_id
             FROM posts p
             JOIN alive a ON a.member_id = p.member_id
-            WHERE p.hub_id = ? AND p.kind = 'claim' AND p.status = 'open'
+            WHERE p.hub_id = ? AND {_open_claim_predicate('p')}
         )
         SELECT a.member_name
         FROM alive a
@@ -968,7 +985,7 @@ async def suggest_tasks(hub_id: str, request: Request):
           AND (lp.last_post_at IS NULL OR lp.last_post_at < ?)
         ORDER BY a.member_name
         """,
-        (hub_id, alive_cutoff, hub_id, hub_id, idle_cutoff),
+        (hub_id, alive_cutoff, hub_id, hub_id, open_claim_cutoff, idle_cutoff),
     ).fetchall()
     idle_agents = [row["member_name"] for row in idle_rows]
 
@@ -1118,8 +1135,11 @@ async def compute_score(hub_id: str, request: Request):
     be = get_backend()
     from datetime import datetime, timezone, timedelta
 
+    now = datetime.now(timezone.utc)
+    open_claim_cutoff = _open_claim_cutoff(now)
+
     # Active agents (seen in last 60 minutes)
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+    cutoff = (now - timedelta(minutes=60)).isoformat()
     agents_active = be.conn.execute(
         "SELECT COUNT(*) FROM members WHERE hub_id = ? AND last_seen > ? AND member_type = 'agent'",
         (hub_id, cutoff),
@@ -1127,8 +1147,8 @@ async def compute_score(hub_id: str, request: Request):
 
     # Open claims
     tasks_claimed = be.conn.execute(
-        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open'",
-        (hub_id,),
+        f"SELECT COUNT(*) FROM posts p WHERE p.hub_id = ? AND {_open_claim_predicate('p')}",
+        (hub_id, open_claim_cutoff),
     ).fetchone()[0]
 
     # Completed results
@@ -1176,12 +1196,12 @@ async def compute_score(hub_id: str, request: Request):
     # Conflict detection: find file claims that were contested (409'd)
     # and edits to same file by different agents within 30 min
     file_conflicts = be.conn.execute(
-        """
-        SELECT COUNT(DISTINCT task_key) FROM posts
-        WHERE hub_id = ? AND task_key LIKE 'file:%'
-        AND kind = 'claim' AND status = 'open'
+        f"""
+        SELECT COUNT(DISTINCT task_key) FROM posts p
+        WHERE p.hub_id = ? AND p.task_key LIKE 'file:%'
+        AND {_open_claim_predicate('p')}
         """,
-        (hub_id,),
+        (hub_id, open_claim_cutoff),
     ).fetchone()[0]
 
     # Detect revert patterns: same file edited by 2+ different agents

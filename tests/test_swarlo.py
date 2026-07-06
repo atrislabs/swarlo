@@ -1,6 +1,7 @@
 """Tests for standalone Swarlo server."""
 
 import asyncio
+import gc
 import os
 import tempfile
 import threading
@@ -140,6 +141,73 @@ class TestSQLiteConcurrency:
             assert len(posts) == thread_count * posts_per_thread
         finally:
             verifier.close()
+
+    def test_thread_churn_prunes_dead_thread_connections(self, tmp_path):
+        db_path = tmp_path / "thread-churn.db"
+        backend = SQLiteBackend(str(db_path))
+        errors: list[str] = []
+        errors_lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                backend.conn.execute("SELECT 1").fetchone()
+            except Exception as exc:
+                with errors_lock:
+                    errors.append(repr(exc))
+
+        try:
+            for _ in range(20):
+                thread = threading.Thread(target=worker)
+                thread.start()
+                thread.join()
+                del thread
+                for _ in range(3):
+                    gc.collect()
+
+                with backend._connections_lock:
+                    tracked_connections = len(backend._connections)
+                assert tracked_connections <= 1
+
+            assert errors == []
+        finally:
+            backend.close()
+
+    def test_close_then_reuse_from_second_thread_reconnects(self, tmp_path):
+        db_path = tmp_path / "close-reuse.db"
+        backend = SQLiteBackend(str(db_path))
+        ready = threading.Event()
+        closed = threading.Event()
+        errors: list[str] = []
+        conn_ids: list[int] = []
+
+        def worker() -> None:
+            try:
+                first_conn = backend.conn
+                first_conn.execute("SELECT 1").fetchone()
+                conn_ids.append(id(first_conn))
+                ready.set()
+                assert closed.wait(5)
+                second_conn = backend.conn
+                second_conn.execute("SELECT 1").fetchone()
+                conn_ids.append(id(second_conn))
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        thread = threading.Thread(target=worker)
+        try:
+            thread.start()
+            assert ready.wait(5)
+            backend.close()
+            closed.set()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            assert errors == []
+            assert len(conn_ids) == 2
+            assert conn_ids[0] != conn_ids[1]
+        finally:
+            closed.set()
+            thread.join(timeout=5)
+            backend.close()
 
 
 class TestClaims:
