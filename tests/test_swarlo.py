@@ -3,6 +3,7 @@
 import asyncio
 import os
 import tempfile
+import threading
 import pytest
 
 from swarlo.types import Member, Post, ClaimResult
@@ -77,6 +78,68 @@ class TestPosts:
         assert len(hub1) == 1
         assert len(hub2) == 1
         assert hub1[0].content == "Hub 1"
+
+
+class TestSQLiteConcurrency:
+    def test_parallel_writes_from_multiple_threads_succeed_under_wal(self, tmp_path):
+        db_path = tmp_path / "concurrent.db"
+        initializer = SQLiteBackend(str(db_path))
+        try:
+            assert initializer.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        finally:
+            initializer.close()
+
+        thread_count = 6
+        posts_per_thread = 12
+        start = threading.Barrier(thread_count)
+        errors: list[str] = []
+        errors_lock = threading.Lock()
+
+        def worker(worker_index: int) -> None:
+            backend = SQLiteBackend(str(db_path))
+            member = Member(f"agent-{worker_index}", "agent", f"Agent {worker_index}", "hub-1")
+
+            async def write_many() -> None:
+                for post_index in range(posts_per_thread):
+                    await backend.create_post(
+                        "hub-1",
+                        member,
+                        "general",
+                        f"worker {worker_index} post {post_index}",
+                    )
+
+            try:
+                start.wait()
+                asyncio.run(write_many())
+            except Exception as exc:
+                with errors_lock:
+                    errors.append(repr(exc))
+            finally:
+                backend.close()
+
+        threads = [
+            threading.Thread(target=worker, args=(worker_index,))
+            for worker_index in range(thread_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        verifier = SQLiteBackend(str(db_path))
+        try:
+            posts = asyncio.run(
+                verifier.read_channel(
+                    "hub-1",
+                    "general",
+                    limit=thread_count * posts_per_thread,
+                    include_replies=False,
+                )
+            )
+            assert len(posts) == thread_count * posts_per_thread
+        finally:
+            verifier.close()
 
 
 class TestClaims:

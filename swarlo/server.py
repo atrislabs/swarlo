@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -27,6 +28,26 @@ app = FastAPI(title="Swarlo", description="Open coordination protocol for AI age
 
 _backend: SQLiteBackend | None = None
 _git_dag: GitDAG | None = None
+BRIEFING_LOOKBACK_DAYS = 14
+REPLAY_MAX_LOOKBACK_DAYS = 7
+
+
+def _utc_cutoff(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _bounded_replay_since(since: str) -> str:
+    oldest_allowed = datetime.now(timezone.utc) - timedelta(days=REPLAY_MAX_LOOKBACK_DAYS)
+    try:
+        parsed = datetime.fromisoformat(since.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return oldest_allowed.isoformat()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    if parsed < oldest_allowed:
+        return oldest_allowed.isoformat()
+    return parsed.isoformat()
 
 
 def get_backend() -> SQLiteBackend:
@@ -483,7 +504,6 @@ async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
     """
     _get_member(request)
     be = get_backend()
-    from datetime import datetime, timezone, timedelta
 
     now = datetime.now(timezone.utc)
     alive_cutoff = (now - timedelta(minutes=30)).isoformat()
@@ -568,8 +588,9 @@ async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
     extracted_keywords = sorted(raw_words - _briefing._STOPWORDS)[:20]
 
     rows = be.conn.execute(
-        "SELECT * FROM posts WHERE hub_id = ? ORDER BY created_at DESC LIMIT 200",
-        (hub_id,),
+        "SELECT * FROM posts WHERE hub_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC LIMIT 200",
+        (hub_id, _utc_cutoff(BRIEFING_LOOKBACK_DAYS)),
     ).fetchall()
     if not rows:
         return {
@@ -765,18 +786,19 @@ async def replay_posts(
         raise HTTPException(400, "since query param is required (ISO8601 timestamp)")
 
     safe_limit = max(1, min(int(limit), 500))
+    query_since = _bounded_replay_since(since)
     be = get_backend()
     if channel:
         rows = be.conn.execute(
             "SELECT * FROM posts WHERE hub_id = ? AND channel = ? AND created_at > ? "
             "ORDER BY created_at ASC LIMIT ?",
-            (hub_id, channel, since, safe_limit),
+            (hub_id, channel, query_since, safe_limit),
         ).fetchall()
     else:
         rows = be.conn.execute(
             "SELECT * FROM posts WHERE hub_id = ? AND created_at > ? "
             "ORDER BY created_at ASC LIMIT ?",
-            (hub_id, since, safe_limit),
+            (hub_id, query_since, safe_limit),
         ).fetchall()
 
     posts = [be._row_to_post(r).to_dict() for r in rows]
@@ -918,23 +940,37 @@ async def suggest_tasks(hub_id: str, request: Request):
     # 1. Find idle agents
     alive_cutoff = (now - timedelta(minutes=30)).isoformat()
     idle_cutoff = (now - timedelta(minutes=15)).isoformat()
-    alive = be.conn.execute(
-        "SELECT member_id, member_name FROM members WHERE hub_id = ? AND last_seen > ? AND member_type = 'agent'",
-        (hub_id, alive_cutoff),
+    idle_rows = be.conn.execute(
+        """
+        WITH alive AS (
+            SELECT member_id, member_name
+            FROM members
+            WHERE hub_id = ? AND last_seen > ? AND member_type = 'agent'
+        ),
+        last_posts AS (
+            SELECT p.member_id, MAX(p.created_at) AS last_post_at
+            FROM posts p
+            JOIN alive a ON a.member_id = p.member_id
+            WHERE p.hub_id = ?
+            GROUP BY p.member_id
+        ),
+        open_claims AS (
+            SELECT DISTINCT p.member_id
+            FROM posts p
+            JOIN alive a ON a.member_id = p.member_id
+            WHERE p.hub_id = ? AND p.kind = 'claim' AND p.status = 'open'
+        )
+        SELECT a.member_name
+        FROM alive a
+        LEFT JOIN last_posts lp ON lp.member_id = a.member_id
+        LEFT JOIN open_claims oc ON oc.member_id = a.member_id
+        WHERE oc.member_id IS NULL
+          AND (lp.last_post_at IS NULL OR lp.last_post_at < ?)
+        ORDER BY a.member_name
+        """,
+        (hub_id, alive_cutoff, hub_id, hub_id, idle_cutoff),
     ).fetchall()
-
-    idle_agents = []
-    for a in alive:
-        last_post = be.conn.execute(
-            "SELECT created_at FROM posts WHERE hub_id = ? AND member_id = ? ORDER BY created_at DESC LIMIT 1",
-            (hub_id, a["member_id"]),
-        ).fetchone()
-        has_claim = be.conn.execute(
-            "SELECT 1 FROM posts WHERE hub_id = ? AND member_id = ? AND kind = 'claim' AND status = 'open'",
-            (hub_id, a["member_id"]),
-        ).fetchone()
-        if not has_claim and (not last_post or last_post["created_at"] < idle_cutoff):
-            idle_agents.append(a["member_name"])
+    idle_agents = [row["member_name"] for row in idle_rows]
 
     # 2. Find channels with no recent activity
     quiet_channels = []
