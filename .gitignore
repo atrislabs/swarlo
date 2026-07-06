@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+build/
+dist/
+.DS_Store
+swarlo.git/
+dist/

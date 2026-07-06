@@ -1,0 +1,3 @@
+timestamp	trial	status	old_score	new_score	proposal	description
+2026-03-12T10:37:18.806487+00:00	1	reverted	0.8000	0.8000	bad_patch.py	applied bad summary-quality proposal
+2026-03-12T10:37:18.886093+00:00	2	kept	0.8000	1.0000	fix_patch.py	applied good summary-quality proposal
