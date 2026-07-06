@@ -9,3 +9,6 @@ dist/
 .DS_Store
 swarlo.git/
 dist/
+
+# atris worktree metadata
+.atris/
