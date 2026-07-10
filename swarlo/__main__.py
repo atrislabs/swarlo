@@ -389,19 +389,41 @@ def _build_tower_state(
     try:
         hub_id = _resolve_tower_hub(conn, hub)
         post_cols = _table_columns(conn, "posts")
+        member_cols = _table_columns(conn, "members")
+        # Old local DBs may predate last_seen / last_active. SELECT only
+        # what exists so tower stays usable instead of crashing.
+        member_select = ["member_id", "member_name", "member_type"]
+        for col in ("last_seen", "last_active"):
+            if col in member_cols:
+                member_select.append(col)
+            else:
+                member_select.append(f"NULL AS {col}")
 
         members = [
             dict(row)
             for row in conn.execute(
-                "SELECT member_id, member_name, member_type, last_seen, last_active "
+                f"SELECT {', '.join(member_select)} "
                 "FROM members WHERE hub_id = ? ORDER BY member_name",
                 (hub_id,),
             ).fetchall()
         ]
+        claim_select = [
+            "post_id",
+            "channel",
+            "task_key",
+            "member_id",
+            "member_name",
+            "content",
+            "created_at",
+        ]
+        if "metadata" in post_cols:
+            claim_select.insert(-1, "metadata")
+        else:
+            claim_select.insert(-1, "NULL AS metadata")
         open_claims = [
             dict(row)
             for row in conn.execute(
-                "SELECT post_id, channel, task_key, member_id, member_name, content, metadata, created_at "
+                f"SELECT {', '.join(claim_select)} "
                 "FROM posts WHERE hub_id = ? AND kind = 'claim' AND status = 'open' "
                 "ORDER BY created_at DESC",
                 (hub_id,),
@@ -1858,6 +1880,52 @@ def _run_doctor() -> int:
                            "warn",
                            "could not import swarlo._precommit_hook_source",
                            colors)
+
+    # Check 8: local control-tower DB has liveness columns (last_seen /
+    # last_active). Pre-liveness DBs make tower crash and idle/liveness
+    # lie. WARN only — opening the DB via serve migrates them.
+    db_candidates: list[Path] = []
+    if in_git and repo_root is not None:
+        db_candidates.append(repo_root / "swarlo.db")
+    db_candidates.append(Path.cwd() / "swarlo.db")
+    seen_db: set[Path] = set()
+    for db_path in db_candidates:
+        try:
+            resolved = db_path.resolve()
+        except OSError:
+            continue
+        if resolved in seen_db or not resolved.is_file():
+            continue
+        seen_db.add(resolved)
+        try:
+            conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+            try:
+                cols = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(members)").fetchall()
+                }
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            _check(f"local DB schema at {resolved}", "warn",
+                   f"unreadable: {exc}", colors)
+            continue
+        if not cols:
+            _check(f"local DB schema at {resolved}", "warn",
+                   "no members table — tower has nothing to show", colors)
+            continue
+        missing = [c for c in ("last_seen", "last_active") if c not in cols]
+        if missing:
+            _check(
+                f"local DB liveness columns at {resolved}",
+                "warn",
+                f"missing {', '.join(missing)} — run `swarlo serve` once to migrate "
+                "(tower stays up, but agents look offline until then)",
+                colors,
+            )
+        else:
+            _check(f"local DB liveness columns at {resolved}", "ok",
+                   "last_seen, last_active present", colors)
 
     print()
     if any_fail:

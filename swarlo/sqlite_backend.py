@@ -93,8 +93,8 @@ CREATE TABLE IF NOT EXISTS scores (
 
 CREATE INDEX IF NOT EXISTS idx_posts_hub_channel ON posts(hub_id, channel);
 CREATE INDEX IF NOT EXISTS idx_members_api_key ON members(api_key);
-CREATE INDEX IF NOT EXISTS idx_members_hub_type_seen ON members(hub_id, member_type, last_seen DESC);
-CREATE INDEX IF NOT EXISTS idx_members_hub_seen_type ON members(hub_id, last_seen, member_type);
+-- last_seen indexes are created in _run_migrations after the column is
+-- guaranteed to exist on both fresh and pre-liveness databases.
 CREATE INDEX IF NOT EXISTS idx_posts_hub_channel_created ON posts(hub_id, channel, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_hub_created ON posts(hub_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_hub_created_at ON posts(hub_id, created_at);
@@ -105,7 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_posts_hub_kind_created ON posts(hub_id, kind, cre
 CREATE INDEX IF NOT EXISTS idx_posts_hub_kind_status_created ON posts(hub_id, kind, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_hub_kind_status_member_created ON posts(hub_id, kind, status, member_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_kind_status ON posts(kind, status);
-CREATE INDEX IF NOT EXISTS idx_posts_open_claims_expiry ON posts(hub_id, COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at), post_id) WHERE kind = 'claim' AND status = 'open';
+-- idx_posts_open_claims_expiry needs posts.metadata; created in _run_migrations.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_open_claim ON posts(hub_id, task_key) WHERE kind = 'claim' AND status = 'open';
 CREATE INDEX IF NOT EXISTS idx_replies_post ON replies(post_id);
 CREATE INDEX IF NOT EXISTS idx_replies_hub_post_created ON replies(hub_id, post_id, created_at ASC);
@@ -240,53 +240,53 @@ class SQLiteBackend(SwarloBackend):
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
         """Apply additive migrations and indexes for existing databases."""
-        # Migrations for existing DBs
-        try:
-            conn.execute("ALTER TABLE posts ADD COLUMN priority INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-        try:
-            conn.execute("ALTER TABLE posts ADD COLUMN retry_count INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-        try:
-            # First-class assignee column. Set on claim (= claimer) and
-            # assign (= target). Lets agents query "what's mine?" without
-            # grepping channels.
-            conn.execute("ALTER TABLE posts ADD COLUMN assignee_id TEXT")
-        except sqlite3.OperationalError:
-            pass
+        # Column migrations first — SCHEMA indexes that depend on these
+        # columns are created below, after the columns are guaranteed.
+        for table, column, definition in (
+            ("posts", "priority", "INTEGER DEFAULT 0"),
+            ("posts", "retry_count", "INTEGER DEFAULT 0"),
+            # First-class assignee. Set on claim (= claimer) and assign.
+            ("posts", "assignee_id", "TEXT"),
+            # Heartbeat / claim extras JSON; open-claims expiry index needs it.
+            ("posts", "metadata", "TEXT"),
+            # @mention targets for webhook fan-out.
+            ("posts", "mentions", "TEXT"),
+            # Dependency edge for the coordination graph (JSON task_key list).
+            ("posts", "depends_on", "TEXT"),
+            # Pre-liveness DBs omitted last_seen; tower/idle need it.
+            ("members", "last_seen", "TEXT"),
+            # Working vs connected: bumped only on post/claim/report.
+            ("members", "last_active", "TEXT"),
+            ("members", "webhook_url", "TEXT"),
+            ("scores", "throughput_per_hour", "REAL DEFAULT 0"),
+            ("scores", "mttr_seconds", "REAL"),
+            ("scores", "rework_rate", "REAL DEFAULT 0"),
+            ("scores", "idle_ratio", "REAL DEFAULT 0"),
+            ("scores", "tasks_failed", "INTEGER DEFAULT 0"),
+            ("scores", "tasks_blocked", "INTEGER DEFAULT 0"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_posts_hub_assignee_created "
             "ON posts(hub_id, assignee_id, created_at DESC)"
         )
-        try:
-            # Distinguish "alive" (last_seen, bumped on any auth touch)
-            # from "working" (last_active, bumped only when producing
-            # a post/claim/report). Fixes the idle/liveness lying problem.
-            conn.execute("ALTER TABLE members ADD COLUMN last_active TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            # Dependency edge for the coordination graph. JSON-encoded
-            # list of task_keys this task waits on. Enables recursive
-            # CTE reachability queries — "what can I claim right now?"
-            # — in O(log D) iterations where D is the dep-chain depth.
-            conn.execute("ALTER TABLE posts ADD COLUMN depends_on TEXT")
-        except sqlite3.OperationalError:
-            pass
-        for column, definition in (
-            ("throughput_per_hour", "REAL DEFAULT 0"),
-            ("mttr_seconds", "REAL"),
-            ("rework_rate", "REAL DEFAULT 0"),
-            ("idle_ratio", "REAL DEFAULT 0"),
-            ("tasks_failed", "INTEGER DEFAULT 0"),
-            ("tasks_blocked", "INTEGER DEFAULT 0"),
-        ):
-            try:
-                conn.execute(f"ALTER TABLE scores ADD COLUMN {column} {definition}")
-            except sqlite3.OperationalError:
-                pass
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_members_hub_type_seen "
+            "ON members(hub_id, member_type, last_seen DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_members_hub_seen_type "
+            "ON members(hub_id, last_seen, member_type)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_open_claims_expiry ON posts("
+            "hub_id, COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at), post_id"
+            ") WHERE kind = 'claim' AND status = 'open'"
+        )
 
     @property
     def conn(self) -> sqlite3.Connection:

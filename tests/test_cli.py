@@ -3551,3 +3551,172 @@ def test_doctor_reports_hook_drift(monkeypatch, tmp_path, capsys):
     # (also fine). In both cases doctor ran to completion.
     assert exit_code in (0, 1)
     assert "config file" in out
+
+
+def test_tower_survives_members_missing_last_seen(monkeypatch, tmp_path, capsys):
+    """Pre-liveness DBs lack last_seen — tower must not crash."""
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE members (
+            member_id TEXT NOT NULL,
+            hub_id TEXT NOT NULL,
+            member_type TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            api_key TEXT,
+            created_at TEXT NOT NULL,
+            last_active TEXT,
+            PRIMARY KEY (member_id, hub_id)
+        );
+        CREATE TABLE posts (
+            post_id TEXT PRIMARY KEY,
+            hub_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            member_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'message',
+            task_key TEXT,
+            status TEXT,
+            metadata TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hub_id TEXT NOT NULL,
+            coord_score INTEGER DEFAULT 0,
+            computed_at TEXT NOT NULL
+        );
+        """
+    )
+    now = datetime.now(cli.UTC).isoformat()
+    conn.execute(
+        "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_active) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("agent-a", "my-team", "agent", "Agent A", now, now),
+    )
+    conn.execute(
+        "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+        "content, kind, task_key, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("msg-1", "my-team", "ops", "agent-a", "Agent A", "agent",
+         "ownerless", "message", "task:legacy", None, now),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["swarlo", "tower", "--db", str(db_path), "--hub", "my-team", "--json"],
+    )
+    cli.main()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hub"] == "my-team"
+    assert payload["counts"]["unclaimed_tasks"] >= 1
+
+
+def test_migration_adds_last_seen_to_legacy_members(tmp_path):
+    """Opening SQLiteBackend migrates pre-liveness members + posts tables."""
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE members (
+            member_id TEXT NOT NULL,
+            hub_id TEXT NOT NULL,
+            member_type TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            api_key TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (member_id, hub_id)
+        );
+        CREATE TABLE posts (
+            post_id TEXT PRIMARY KEY,
+            hub_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            member_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'message',
+            task_key TEXT,
+            status TEXT,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("a1", "h1", "agent", "A", "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    backend = SQLiteBackend(str(db_path))
+    try:
+        member_cols = {
+            str(row[1])
+            for row in backend.conn.execute("PRAGMA table_info(members)").fetchall()
+        }
+        post_cols = {
+            str(row[1])
+            for row in backend.conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert "last_seen" in member_cols
+        assert "last_active" in member_cols
+        assert "metadata" in post_cols
+        assert "mentions" in post_cols
+        indexes = {
+            str(row[1])
+            for row in backend.conn.execute("PRAGMA index_list(members)").fetchall()
+        }
+        post_indexes = {
+            str(row[1])
+            for row in backend.conn.execute("PRAGMA index_list(posts)").fetchall()
+        }
+        assert "idx_members_hub_type_seen" in indexes
+        assert "idx_members_hub_seen_type" in indexes
+        assert "idx_posts_open_claims_expiry" in post_indexes
+    finally:
+        backend.close()
+
+
+def test_doctor_warns_on_missing_liveness_columns(monkeypatch, tmp_path, capsys):
+    """Doctor surfaces local DB schema drift for last_seen / last_active."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://127.0.0.1:1",
+        "hub": "atris",
+        "member_id": "navigator",
+        "api_key": "fake-key",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    legacy = tmp_path / "swarlo.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute(
+        """
+        CREATE TABLE members (
+            member_id TEXT NOT NULL,
+            hub_id TEXT NOT NULL,
+            member_type TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (member_id, hub_id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "doctor"])
+    exit_code = cli.main()
+    out = capsys.readouterr().out
+
+    assert exit_code == 1  # server still unreachable
+    assert "liveness columns" in out
+    assert "last_seen" in out
