@@ -473,9 +473,156 @@ class TestScore:
         data = resp.json()
         assert "agents_active" in data
         assert "tasks_claimed" in data
+        assert "per_agent_xp" in data
 
     def test_score_requires_auth(self, client):
         assert client.post("/api/atris/score").status_code == 401
+
+
+class TestUnclaimedXpScores:
+    def test_unclaimed_lists_ownerless_tasks(self, client):
+        key = _register(client, "claimer", "Claimer")
+        headers = _auth(key)
+        client.post(
+            "/api/atris/channels/ops/posts",
+            headers=headers,
+            json={"content": "needs owner", "task_key": "task:open-1"},
+        )
+        client.post(
+            "/api/atris/channels/ops/posts",
+            headers=headers,
+            json={"content": "already owned", "task_key": "task:owned-1"},
+        )
+        client.post(
+            "/api/atris/channels/ops/claim",
+            headers=headers,
+            json={"task_key": "task:owned-1", "content": "mine"},
+        )
+        resp = client.get("/api/atris/unclaimed?limit=10", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        keys = {t["task_key"] for t in data["tasks"]}
+        assert "task:open-1" in keys
+        assert "task:owned-1" not in keys
+
+    def test_unclaimed_requires_auth(self, client):
+        assert client.get("/api/atris/unclaimed").status_code == 401
+
+    def test_xp_leaderboard_and_member_filter(self, client):
+        key = _register(client, "xp-a", "Agent A")
+        headers = _auth(key)
+        client.post(
+            "/api/atris/channels/ops/posts",
+            headers=headers,
+            json={"content": "do it", "task_key": "task:xp-1"},
+        )
+        client.post(
+            "/api/atris/channels/ops/claim",
+            headers=headers,
+            json={"task_key": "task:xp-1", "content": "claiming"},
+        )
+        client.post(
+            "/api/atris/channels/ops/report",
+            headers=headers,
+            json={"task_key": "task:xp-1", "status": "done", "content": "shipped"},
+        )
+        resp = client.get("/api/atris/xp?limit=5", headers=headers)
+        assert resp.status_code == 200
+        rows = resp.json()["per_agent_xp"]
+        assert rows
+        assert rows[0]["member_id"] == "xp-a"
+        assert rows[0]["xp"] >= 12  # claim +2, done +10
+        assert rows[0]["shipped"] >= 1
+        filtered = client.get("/api/atris/xp?member_id=xp-a", headers=headers)
+        assert filtered.status_code == 200
+        assert filtered.json()["count"] == 1
+        empty = client.get("/api/atris/xp?member_id=nobody", headers=headers)
+        assert empty.json()["count"] == 0
+
+    def test_xp_requires_auth(self, client):
+        assert client.get("/api/atris/xp").status_code == 401
+
+    def test_scores_history_after_score(self, client):
+        key = _register(client, "historian", "Historian")
+        headers = _auth(key)
+        assert client.post("/api/atris/score", headers=headers).status_code == 200
+        assert client.post("/api/atris/score", headers=headers).status_code == 200
+        resp = client.get("/api/atris/scores?limit=5", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] >= 2
+        assert "coord_score" in data["scores"][0]
+        assert "computed_at" in data["scores"][0]
+
+    def test_scores_requires_auth(self, client):
+        assert client.get("/api/atris/scores").status_code == 401
+
+
+class TestHandoffTrail:
+    def test_handoff_trail_walks_depends_on(self, client, fresh_backend):
+        key = _register(client, "walker", "Walker")
+        headers = _auth(key)
+        # T1 done with handoff metadata
+        client.post(
+            "/api/atris/channels/ops/posts",
+            headers=headers,
+            json={"content": "upstream", "task_key": "T1"},
+        )
+        client.post(
+            "/api/atris/channels/ops/claim",
+            headers=headers,
+            json={"task_key": "T1", "content": "claim T1"},
+        )
+        client.post(
+            "/api/atris/channels/ops/report",
+            headers=headers,
+            json={
+                "task_key": "T1",
+                "status": "done",
+                "content": "shipped T1",
+                "metadata": {
+                    "handoff": {
+                        "artifacts": ["t1.py"],
+                        "decisions": ["use sqlite"],
+                        "open_questions": [],
+                    }
+                },
+            },
+        )
+        # T2 depends on T1
+        client.post(
+            "/api/atris/channels/ops/posts",
+            headers=headers,
+            json={
+                "content": "downstream",
+                "task_key": "T2",
+                "depends_on": ["T1"],
+            },
+        )
+        client.post(
+            "/api/atris/channels/ops/claim",
+            headers=headers,
+            json={"task_key": "T2", "content": "claim T2", "depends_on": ["T1"]},
+        )
+        resp = client.get("/api/atris/handoff_trail/T2?depth=3", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["task_key"] == "T2"
+        assert data["count"] >= 1
+        assert data["trail"][0]["from"] == "T1"
+        assert data["trail"][0]["hop"] == 1
+        assert data["trail"][0]["handoff"]["artifacts"] == ["t1.py"]
+
+    def test_handoff_trail_empty_when_no_deps(self, client):
+        key = _register(client, "lonely", "Lonely")
+        headers = _auth(key)
+        resp = client.get("/api/atris/handoff_trail/orphan-task?depth=2", headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 0
+        assert resp.json()["trail"] == []
+
+    def test_handoff_trail_requires_auth(self, client):
+        assert client.get("/api/atris/handoff_trail/T1").status_code == 401
 
 
 class TestSuggest:

@@ -500,6 +500,23 @@ async def my_open_tasks(hub_id: str, member_id: str, request: Request):
     }
 
 
+@app.get("/api/{hub_id}/handoff_trail/{task_key:path}")
+async def handoff_trail(hub_id: str, task_key: str, request: Request, depth: int = 3):
+    """Walk depends_on backward from task_key (BFS, capped).
+
+    Powers `swarlo handoff`. Backend already implements the walk;
+    this route was documented and CLI-wired but never mounted.
+    """
+    _get_member(request)
+    depth = max(1, min(int(depth), 10))
+    trail = get_backend().walk_handoff_trail(hub_id, task_key, depth=depth)
+    return {
+        "task_key": task_key,
+        "depth": depth,
+        "count": len(trail),
+        "trail": trail,
+    }
+
 
 # ── Idle Detection ─────────────────────────────────────────
 
@@ -1242,6 +1259,8 @@ async def compute_score(hub_id: str, request: Request):
     except Exception:
         pass  # Non-critical
 
+    per_agent_xp = _compute_per_agent_xp(be, hub_id)
+
     return {
         "hub_id": hub_id,
         "agents_active": agents_active,
@@ -1253,7 +1272,168 @@ async def compute_score(hub_id: str, request: Request):
         "unclaimed_tasks": unclaimed_tasks,
         "coord_score": coord_score,
         "computed_at": now,
+        "per_agent_xp": per_agent_xp[:20],
     }
+
+
+def _compute_per_agent_xp(be: SQLiteBackend, hub_id: str) -> list[dict]:
+    """XP ledger matching CLI mechanics: claim +2, done +10, failed -3, blocked -1.
+
+    file: task keys are excluded. Order is XP desc, then member_id.
+    """
+    events = be.conn.execute(
+        "SELECT member_id, member_name, kind, status, task_key FROM posts WHERE hub_id = ?",
+        (hub_id,),
+    ).fetchall()
+    by_member: dict[str, dict] = {}
+    for event in events:
+        task_key = event["task_key"]
+        if task_key and str(task_key).startswith("file:"):
+            continue
+        member_id = event["member_id"] or "unknown"
+        row = by_member.setdefault(
+            member_id,
+            {
+                "member_id": member_id,
+                "member_name": event["member_name"] or member_id,
+                "xp": 0,
+                "shipped": 0,
+                "claims": 0,
+                "failed": 0,
+                "blocked": 0,
+            },
+        )
+        kind = event["kind"]
+        status = event["status"]
+        if kind == "claim" and status != "retracted":
+            row["xp"] += 2
+            row["claims"] += 1
+        elif status == "blocked" or kind == "blocked":
+            row["xp"] -= 1
+            row["blocked"] += 1
+        elif status == "failed" or kind == "failed":
+            row["xp"] -= 3
+            row["failed"] += 1
+        elif status == "done" or kind == "result":
+            row["xp"] += 10
+            row["shipped"] += 1
+    return sorted(
+        by_member.values(),
+        key=lambda r: (-int(r["xp"]), str(r["member_id"])),
+    )
+
+
+def _list_unclaimed_tasks(
+    be: SQLiteBackend,
+    hub_id: str,
+    *,
+    limit: int = 20,
+    channel: str | None = None,
+) -> list[dict]:
+    """Message tasks with no open claim and no terminal report/status."""
+    open_claim_keys = {
+        row["task_key"]
+        for row in be.conn.execute(
+            "SELECT task_key FROM posts WHERE hub_id = ? AND kind = 'claim' "
+            "AND status = 'open' AND task_key IS NOT NULL AND task_key NOT LIKE 'file:%'",
+            (hub_id,),
+        ).fetchall()
+        if row["task_key"]
+    }
+    terminal_keys = {
+        row["task_key"]
+        for row in be.conn.execute(
+            "SELECT DISTINCT task_key FROM posts WHERE hub_id = ? AND task_key IS NOT NULL "
+            "AND task_key NOT LIKE 'file:%' AND (kind IN ('result', 'blocked') "
+            "OR status IN ('done', 'failed', 'blocked'))",
+            (hub_id,),
+        ).fetchall()
+        if row["task_key"]
+    }
+    params: list = [hub_id]
+    channel_sql = ""
+    if channel:
+        channel_sql = "AND channel = ? "
+        params.append(channel)
+    rows = be.conn.execute(
+        "SELECT channel, task_key, content, created_at, member_name FROM posts "
+        f"WHERE hub_id = ? AND kind = 'message' AND task_key IS NOT NULL "
+        f"AND task_key NOT LIKE 'file:%' {channel_sql}"
+        "ORDER BY created_at DESC",
+        params,
+    ).fetchall()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        task_key = row["task_key"]
+        if not task_key or task_key in seen:
+            continue
+        if task_key in open_claim_keys or task_key in terminal_keys:
+            continue
+        seen.add(task_key)
+        out.append(
+            {
+                "channel": row["channel"],
+                "task_key": task_key,
+                "content": row["content"],
+                "created_at": row["created_at"],
+                "member_name": row["member_name"],
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+@app.get("/api/{hub_id}/unclaimed")
+async def list_unclaimed(
+    hub_id: str,
+    request: Request,
+    limit: int = 20,
+    channel: Optional[str] = None,
+):
+    """List message tasks that still need an owner."""
+    _get_member(request)
+    limit = max(1, min(int(limit), 500))
+    tasks = _list_unclaimed_tasks(
+        get_backend(), hub_id, limit=limit, channel=channel or None
+    )
+    return {"count": len(tasks), "tasks": tasks}
+
+
+@app.get("/api/{hub_id}/xp")
+async def list_xp(
+    hub_id: str,
+    request: Request,
+    limit: int = 20,
+    member_id: Optional[str] = None,
+):
+    """Per-agent XP leaderboard (same mechanics as CLI `swarlo xp`)."""
+    _get_member(request)
+    limit = max(1, min(int(limit), 500))
+    rows = _compute_per_agent_xp(get_backend(), hub_id)
+    if member_id:
+        rows = [r for r in rows if r["member_id"] == member_id]
+    rows = rows[:limit]
+    return {"count": len(rows), "per_agent_xp": rows}
+
+
+@app.get("/api/{hub_id}/scores")
+async def list_scores(hub_id: str, request: Request, limit: int = 10):
+    """Persisted coordination score history for `swarlo score-history`."""
+    _get_member(request)
+    limit = max(1, min(int(limit), 500))
+    be = get_backend()
+    rows = be.conn.execute(
+        "SELECT hub_id, agents_active, tasks_claimed, tasks_shipped, "
+        "avg_time_to_claim, file_conflicts, files_with_multi_editors, "
+        "coord_score, throughput_per_hour, mttr_seconds, rework_rate, "
+        "idle_ratio, tasks_failed, tasks_blocked, computed_at "
+        "FROM scores WHERE hub_id = ? ORDER BY computed_at DESC, id DESC LIMIT ?",
+        (hub_id, limit),
+    ).fetchall()
+    scores = [dict(row) for row in rows]
+    return {"count": len(scores), "scores": scores}
 
 
 # ── Git DAG ─────────────────────────────────────────────────
