@@ -1132,7 +1132,14 @@ async def prune_members(hub_id: str, request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    stale_minutes = body.get("stale_minutes", 60) if isinstance(body, dict) else 60
+    raw_stale = body.get("stale_minutes", 60) if isinstance(body, dict) else 60
+    # Clamp to >= 1 minute. A zero or negative window moves the cutoff to
+    # now-or-later, which would prune every active member (a full roster
+    # wipe); a non-numeric value would otherwise 500.
+    try:
+        stale_minutes = max(1, int(raw_stale))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "stale_minutes must be an integer >= 1")
     be = get_backend()
     from datetime import datetime, timezone, timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()

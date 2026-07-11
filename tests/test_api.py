@@ -352,6 +352,22 @@ class TestPrune:
         assert resp.json()["count"] == 0
         assert resp.json()["pruned"] == []
 
+    def test_prune_negative_window_does_not_wipe_roster(self, client):
+        """A negative/zero window must be clamped, not prune every active member."""
+        _register(client, "keeper-a", "KeeperA")
+        key_b = _register(client, "keeper-b", "KeeperB")
+        for window in (0, -5):
+            resp = client.post("/api/atris/prune", headers=_auth(key_b),
+                              json={"stale_minutes": window})
+            assert resp.status_code == 200, f"window={window}"
+            assert resp.json()["pruned"] == [], f"window={window} wiped the roster"
+
+    def test_prune_rejects_non_numeric_window(self, client):
+        key = _register(client, "pruner", "Pruner")
+        resp = client.post("/api/atris/prune", headers=_auth(key),
+                          json={"stale_minutes": "soon"})
+        assert resp.status_code == 400
+
     def test_prune_requires_auth(self, client):
         assert client.post("/api/atris/prune").status_code == 401
 
