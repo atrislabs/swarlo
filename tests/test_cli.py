@@ -479,6 +479,45 @@ def test_unclaimed_prints_tasks(monkeypatch, tmp_path, capsys):
     assert "needs owner" in out
 
 
+def test_replay_prints_posts(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert method == "GET"
+        assert url == "http://localhost:8080/api/my-team/replay?since=2026-07-10T00%3A00%3A00%2B00%3A00&limit=200&channel=ops"
+        return 200, {
+            "posts": [{
+                "id": "p1",
+                "kind": "message",
+                "member_name": "Agent A",
+                "channel": "ops",
+                "content": "missed message",
+            }]
+        }
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "replay", "2026-07-10T00:00:00+00:00", "--channel", "ops"])
+
+    cli.main()
+    out = capsys.readouterr().out
+    assert "missed message" in out
+
+
+def test_replay_empty_prints_notice(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: (200, {"posts": []}))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "replay", "2099-01-01T00:00:00+00:00"])
+
+    cli.main()
+    out = capsys.readouterr().out
+    assert "No posts since" in out
+
+
 def test_read_command_limits_are_clamped(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

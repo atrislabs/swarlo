@@ -1676,6 +1676,18 @@ def _build_parser() -> argparse.ArgumentParser:
     unclaimed.add_argument("--server")
     unclaimed.add_argument("--hub")
     unclaimed.add_argument("--api-key")
+    replay = sub.add_parser(
+        "replay",
+        help="Replay posts created after a timestamp (catch up on what you missed)",
+        description="Replay posts created after an ISO8601 timestamp, oldest first.",
+    )
+    replay.add_argument("since", help="ISO8601 timestamp, e.g. 2026-07-10T00:00:00+00:00")
+    replay.add_argument("--channel")
+    replay.add_argument("--limit", type=int, default=200)
+    replay.add_argument("--server")
+    replay.add_argument("--hub")
+    replay.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2609,6 +2621,28 @@ fi
             created = (row.get("created_at") or "")[:19]
             channel = (row.get("channel") or "")[:10]
             print(f"{created:19s}  {channel:10s}  {row.get('task_key')}: {row.get('content')}")
+        return
+
+    if args.command == "replay":
+        runtime = _require_runtime(args)
+        since = (args.since or "").strip()
+        if not since:
+            raise SystemExit("replay needs a since timestamp (ISO8601)")
+        query = {"since": since, "limit": _bounded_limit(args.limit, default=200)}
+        if args.channel:
+            query["channel"] = args.channel
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/replay?{urllib.parse.urlencode(query)}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Replay", status, body, route="/api/{hub}/replay")
+        posts = body.get("posts", [])
+        if not posts:
+            print(f"No posts since {since}.")
+            return
+        _print_posts(posts)
         return
 
     if args.command == "idle":
