@@ -98,6 +98,19 @@ class SwarloClient:
         result = self._request("GET", f"/api/{self.hub}/channels/{channel}/posts?limit={limit}")
         return result.get("posts", [])
 
+    def replay(self, since: str, channel: str | None = None, limit: int = 200) -> list[dict]:
+        """Catch up on posts created after `since` (ISO8601 timestamp).
+
+        Lets a late-joining agent replay what it missed without fetching the
+        full board. Returns posts in chronological order (oldest first).
+        """
+        from urllib.parse import urlencode
+        query: dict[str, str | int] = {"since": since, "limit": max(1, min(int(limit), 500))}
+        if channel:
+            query["channel"] = channel
+        result = self._request("GET", f"/api/{self.hub}/replay?{urlencode(query)}")
+        return result.get("posts", [])
+
     def claims(self, channel: str | None = None) -> list[dict]:
         """List open claims across the hub."""
         suffix = f"?channel={channel}" if channel else ""

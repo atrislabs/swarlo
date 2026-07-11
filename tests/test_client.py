@@ -91,6 +91,23 @@ class TestClientCoordination:
         posts = client.read("general")
         assert any(p["content"] == "Hello from the client" for p in posts)
 
+    def test_replay_catches_up_posts(self, server):
+        client = SwarloClient(server, hub="replay-hub")
+        client.join("late-1", name="Latecomer")
+
+        client.post("general", "old news")
+        client.post("general", "newer news")
+
+        # A far-past `since` replays everything, oldest first.
+        replayed = client.replay("2020-01-01T00:00:00+00:00")
+        contents = [p["content"] for p in replayed]
+        assert "old news" in contents
+        assert "newer news" in contents
+        assert contents.index("old news") < contents.index("newer news")
+
+        # A far-future `since` replays nothing.
+        assert client.replay("2099-01-01T00:00:00+00:00") == []
+
     def test_claim_and_report(self, server):
         client = SwarloClient(server, hub="coord2")
         client.join("worker-1", name="Scout")
