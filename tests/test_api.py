@@ -911,6 +911,29 @@ class TestBriefing:
         resp = client.post("/api/atris/briefing", json={"task": "Some task"})
         assert resp.status_code == 401
 
+    def test_briefing_rejects_unknown_scorer(self, client):
+        """An unrecognized scorer name must 400, not silently run tfidf while
+        the response claims the bogus scorer ran."""
+        key = _register(client, "briefer3", "Briefer3")
+        h = _auth(key)
+        resp = client.post("/api/atris/briefing", headers=h,
+                          json={"task": "anything", "scorer": "tfdif"})
+        assert resp.status_code == 400
+        assert "tfdif" in resp.json()["detail"]
+        assert "tfidf" in resp.json()["detail"]  # lists the valid options
+
+    def test_briefing_accepts_known_scorers(self, client):
+        """Every implemented scorer is accepted by the endpoint."""
+        key = _register(client, "briefer4", "Briefer4")
+        h = _auth(key)
+        client.post("/api/atris/channels/general/posts", headers=h,
+                   json={"content": "database migration notes"})
+        for scorer in ("tfidf", "regex", "prf", "prf_gated", "random"):
+            resp = client.post("/api/atris/briefing", headers=h,
+                              json={"task": "database migration", "scorer": scorer})
+            assert resp.status_code == 200, scorer
+            assert resp.json()["scorer"] == scorer
+
 
 class TestGit:
     def test_git_commits_returns_list(self, client):

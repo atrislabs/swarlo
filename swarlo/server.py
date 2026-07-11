@@ -621,6 +621,18 @@ async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
     member = _get_member(request)
     be = get_backend()
 
+    # Reject unknown scorers instead of silently falling back to tfidf.
+    # _briefing.score() defaults any unrecognized name to v2_tfidf, but the
+    # response echoes body.scorer verbatim — so a typo ("tfdif") or a not-yet-
+    # implemented scorer ("attention") would return tfidf results while the
+    # response claims a scorer that never ran. Fail fast with the valid set.
+    if body.scorer not in _briefing.SCORERS:
+        raise HTTPException(
+            400,
+            f"Unknown scorer '{body.scorer}'. Valid scorers: "
+            f"{', '.join(sorted(_briefing.SCORERS))}",
+        )
+
     # Diagnostic extracts — kept in response for debugging/observability.
     file_pats = _re.findall(r'[\w./]+\.(?:py|ts|js|md|json|yaml|sql)\b', body.task)
     dir_pats = _re.findall(r'(?:backend|atris|swarlo|scripts|tests)/[\w/]+', body.task)
