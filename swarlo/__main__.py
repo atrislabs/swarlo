@@ -1616,6 +1616,18 @@ def _build_parser() -> argparse.ArgumentParser:
     ready.add_argument("--hub")
     ready.add_argument("--api-key")
 
+    claim_next = sub.add_parser(
+        "claim-next",
+        help="Claim the next ready task (deps done, highest priority first)",
+        description="Agent loop primitive: GET /ready then claim first available task.",
+    )
+    claim_next.add_argument("--channel", default="general",
+                            help="channel to claim on (default: general)")
+    claim_next.add_argument("--member-id", help="Override member ID")
+    claim_next.add_argument("--server")
+    claim_next.add_argument("--hub")
+    claim_next.add_argument("--api-key")
+
     briefing = sub.add_parser(
         "briefing",
         help="Rank board posts by relevance to a task description",
@@ -1855,6 +1867,16 @@ def _build_parser() -> argparse.ArgumentParser:
     leaves.add_argument("--server")
     leaves.add_argument("--hub")
     leaves.add_argument("--api-key")
+
+    children = sub.add_parser(
+        "children",
+        help="List direct child commits of a hash in the shared git DAG",
+        description="Show commits that build immediately on the given parent hash.",
+    )
+    children.add_argument("hash")
+    children.add_argument("--server")
+    children.add_argument("--hub")
+    children.add_argument("--api-key")
 
     lineage = sub.add_parser(
         "lineage",
@@ -2700,6 +2722,59 @@ fi
             print(f"  READY: {t.get('task_key')} — {(t.get('content') or '')[:60]}{dep_s}")
         return
 
+    if args.command == "claim-next":
+        runtime = _require_runtime(args)
+        member_id = args.member_id or runtime.get("member_id")
+        if not member_id:
+            raise SystemExit("claim-next needs --member-id or a joined config member_id")
+        channel = args.channel or "general"
+        member_path = urllib.parse.quote(member_id, safe="")
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/ready/{member_path}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Claim-next", status, body, route="/api/{hub}/ready/{member_id}")
+        tasks = list(body.get("tasks") or [])
+        tasks.sort(
+            key=lambda t: (-(t.get("priority") or 0), t.get("created_at") or "")
+        )
+        channel_path = urllib.parse.quote(channel, safe="")
+        for task in tasks:
+            task_key = task.get("task_key")
+            if not task_key:
+                continue
+            content = f"Claiming ready task: {task.get('content') or task_key}"
+            claim_status, claim_body = _request(
+                "POST",
+                f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/"
+                f"{channel_path}/claim",
+                {"task_key": task_key, "content": content},
+                api_key=runtime["api_key"],
+            )
+            if claim_status in (200, 201):
+                print(f"CLAIMED: {task_key} on #{channel} — {(task.get('content') or '')[:60]}")
+                return
+            if claim_status == 409:
+                # Already ours (assign path) → treat as owned; else skip race.
+                detail = claim_body.get("detail") if isinstance(claim_body, dict) else None
+                existing = {}
+                if isinstance(detail, dict):
+                    existing = detail.get("existing_claim") or {}
+                elif isinstance(claim_body, dict):
+                    existing = claim_body.get("existing_claim") or {}
+                if existing.get("member_id") == member_id:
+                    print(
+                        f"ALREADY YOURS: {task_key} on #{channel} — "
+                        f"{(task.get('content') or '')[:60]}"
+                    )
+                    return
+                continue
+            raise SystemExit(f"Claim-next failed ({claim_status}): {claim_body}")
+        print("No ready task claimed (queue empty or all raced away).")
+        return
+
     if args.command == "briefing":
         runtime = _require_runtime(args)
         task = (args.task or "").strip()
@@ -2785,7 +2860,7 @@ fi
             print(f"  #{ch}" if not str(ch).startswith("#") else f"  {ch}")
         return
 
-    if args.command in ("commits", "leaves", "lineage"):
+    if args.command in ("commits", "leaves", "lineage", "children"):
         runtime = _require_runtime(args)
         base = f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}"
         if args.command == "commits":
@@ -2797,6 +2872,14 @@ fi
         elif args.command == "leaves":
             url = f"{base}/git/leaves"
             route, label, empty = "/api/{hub}/git/leaves", "Leaves", "No leaf commits."
+        elif args.command == "children":
+            h = urllib.parse.quote(args.hash, safe="")
+            url = f"{base}/git/commits/{h}/children"
+            route, label, empty = (
+                "/api/{hub}/git/commits/{hash}/children",
+                "Children",
+                "No child commits.",
+            )
         else:  # lineage
             h = urllib.parse.quote(args.hash, safe="")
             url = f"{base}/git/commits/{h}/lineage"
@@ -2804,7 +2887,7 @@ fi
         status, body = _request("GET", url, api_key=runtime["api_key"])
         if status != 200:
             _raise_http_failure(label, status, body, route=route)
-        rows = body if isinstance(body, list) else (body.get("commits") or [])
+        rows = body if isinstance(body, list) else (body.get("commits") or body.get("children") or [])
         if not rows:
             print(empty)
             return

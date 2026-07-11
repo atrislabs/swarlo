@@ -4380,3 +4380,84 @@ def test_members_and_channels_print(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sys, "argv", ["swarlo", "summary"])
     cli.main()
     assert "Board is quiet." in capsys.readouterr().out
+
+
+def test_claim_next_claims_highest_priority(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+        "member_id": "agent-a",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+    calls = []
+
+    def fake_request(method, url, payload=None, api_key=None):
+        calls.append((method, url, payload))
+        if method == "GET" and "/ready/" in url:
+            return 200, {
+                "tasks": [
+                    {"task_key": "low", "content": "later", "priority": 0,
+                     "created_at": "2026-07-11T00:00:00+00:00"},
+                    {"task_key": "high", "content": "first", "priority": 5,
+                     "created_at": "2026-07-11T00:01:00+00:00"},
+                ]
+            }
+        if method == "POST" and url.endswith("/claim"):
+            assert payload["task_key"] == "high"
+            return 201, {"task_key": "high"}
+        raise AssertionError((method, url))
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "claim-next", "--channel", "ops"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "CLAIMED: high on #ops" in out
+    assert any(c[0] == "POST" and c[2]["task_key"] == "high" for c in calls)
+
+
+def test_claim_next_treats_own_409_as_already_yours(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+        "member_id": "agent-a",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        if method == "GET" and "/ready/" in url:
+            return 200, {"tasks": [{"task_key": "T1", "content": "mine already", "priority": 1}]}
+        if method == "POST" and url.endswith("/claim"):
+            return 409, {"detail": {"existing_claim": {"member_id": "agent-a"}}}
+        raise AssertionError((method, url))
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "claim-next"])
+    cli.main()
+    assert "ALREADY YOURS: T1" in capsys.readouterr().out
+
+
+def test_children_prints_child_commits(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert method == "GET"
+        assert "/git/commits/abc123/children" in url
+        return 200, [{"hash": "def4567890ab", "member_name": "Builder", "message": "next"}]
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "children", "abc123"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "def4567890ab" in out
+    assert "Builder" in out
+    assert "next" in out
