@@ -497,6 +497,28 @@ class TestExpireClaims:
         assert resp.status_code == 200
         assert resp.json()["count"] == 0
 
+    def test_expire_negative_window_does_not_wipe_fresh_claims(self, client):
+        """A zero/negative window must be clamped, not expire every open claim.
+
+        Without clamping, a negative stale_minutes pushes the cutoff into the
+        future so `created_at < cutoff` is true for every fresh, actively-held
+        claim — expiring in-flight work.
+        """
+        key = _register(client, "busy-worker", "BusyWorker")
+        client.post("/api/atris/channels/general/claim", headers=_auth(key),
+                   json={"task_key": "task:in-flight", "content": "Working"})
+        for window in (0, -5):
+            resp = client.post("/api/atris/claims/expire", headers=_auth(key),
+                              json={"stale_minutes": window})
+            assert resp.status_code == 200, f"window={window}"
+            assert resp.json()["expired"] == [], f"window={window} wiped a fresh claim"
+
+    def test_expire_rejects_non_numeric_window(self, client):
+        key = _register(client, "expirer", "Expirer")
+        resp = client.post("/api/atris/claims/expire", headers=_auth(key),
+                          json={"stale_minutes": "soon"})
+        assert resp.status_code == 400
+
     def test_expire_requires_auth(self, client):
         assert client.post("/api/atris/claims/expire").status_code == 401
 
