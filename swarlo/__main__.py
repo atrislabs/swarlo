@@ -1816,6 +1816,36 @@ def _build_parser() -> argparse.ArgumentParser:
     retry.add_argument("--hub")
     retry.add_argument("--api-key")
 
+    commits = sub.add_parser(
+        "commits",
+        help="List indexed commits in the shared git DAG (newest first)",
+        description="List commits pushed to the hub's shared DAG, newest first.",
+    )
+    commits.add_argument("--member", help="only show commits from this member id")
+    commits.add_argument("--limit", type=int, default=50)
+    commits.add_argument("--server")
+    commits.add_argument("--hub")
+    commits.add_argument("--api-key")
+
+    leaves = sub.add_parser(
+        "leaves",
+        help="List leaf commits (tips with no children) in the shared git DAG",
+        description="Show the DAG tips — commits nothing else builds on yet.",
+    )
+    leaves.add_argument("--server")
+    leaves.add_argument("--hub")
+    leaves.add_argument("--api-key")
+
+    lineage = sub.add_parser(
+        "lineage",
+        help="Walk a commit's ancestor chain back to root (newest first)",
+        description="Print the ancestor chain from a commit hash back to root.",
+    )
+    lineage.add_argument("hash")
+    lineage.add_argument("--server")
+    lineage.add_argument("--hub")
+    lineage.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2680,6 +2710,36 @@ fi
             return
         for ch in rows:
             print(f"  #{ch}" if not str(ch).startswith("#") else f"  {ch}")
+        return
+
+    if args.command in ("commits", "leaves", "lineage"):
+        runtime = _require_runtime(args)
+        base = f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}"
+        if args.command == "commits":
+            query = {"limit": max(1, min(int(args.limit), 200))}
+            if args.member:
+                query["member_filter"] = args.member
+            url = f"{base}/git/commits?{urllib.parse.urlencode(query)}"
+            route, label, empty = "/api/{hub}/git/commits", "Commits", "No commits."
+        elif args.command == "leaves":
+            url = f"{base}/git/leaves"
+            route, label, empty = "/api/{hub}/git/leaves", "Leaves", "No leaf commits."
+        else:  # lineage
+            h = urllib.parse.quote(args.hash, safe="")
+            url = f"{base}/git/commits/{h}/lineage"
+            route, label, empty = "/api/{hub}/git/commits/{hash}/lineage", "Lineage", "No lineage."
+        status, body = _request("GET", url, api_key=runtime["api_key"])
+        if status != 200:
+            _raise_http_failure(label, status, body, route=route)
+        rows = body if isinstance(body, list) else (body.get("commits") or [])
+        if not rows:
+            print(empty)
+            return
+        print(f"{len(rows)} commit(s):")
+        for c in rows:
+            h = str(c.get("hash", ""))[:12]
+            msg = (c.get("message") or "").splitlines()[0] if c.get("message") else ""
+            print(f"  {h}  {c.get('member_name') or c.get('member_id') or '?'}  {msg}")
         return
 
     if args.command == "ping":

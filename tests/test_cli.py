@@ -448,6 +448,68 @@ def test_retry_clamps_negative_max_retries(monkeypatch, tmp_path):
     assert called["payload"]["max_retries"] == 0
 
 
+def test_commits_lists_dag(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called["url"] = url
+        return 200, [
+            {"hash": "abcdef123456789", "member_name": "Alice", "message": "first commit\nbody"},
+            {"hash": "0011223344556677", "member_id": "bob-1", "message": "second"},
+        ]
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "commits", "--member", "alice-1", "--limit", "5"])
+
+    cli.main()
+    assert "/git/commits?" in called["url"]
+    assert "limit=5" in called["url"] and "member_filter=alice-1" in called["url"]
+    out = capsys.readouterr().out
+    assert "2 commit(s):" in out
+    assert "abcdef123456" in out  # short hash, 12 chars
+    assert "first commit" in out and "body" not in out  # only first line of message
+    assert "bob-1" in out  # falls back to member_id when no name
+
+
+def test_leaves_reports_empty(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert url.endswith("/git/leaves")
+        return 200, []
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "leaves"])
+
+    cli.main()
+    assert "No leaf commits." in capsys.readouterr().out
+
+
+def test_lineage_walks_from_hash(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called["url"] = url
+        return 200, [{"hash": "tip0000", "member_name": "Ann", "message": "tip"}]
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "lineage", "tip0000"])
+
+    cli.main()
+    assert called["url"].endswith("/git/commits/tip0000/lineage")
+    assert "1 commit(s):" in capsys.readouterr().out
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
