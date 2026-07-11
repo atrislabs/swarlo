@@ -795,7 +795,16 @@ async def retry_failed_tasks(hub_id: str, request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    max_retries = body.get("max_retries", 3) if isinstance(body, dict) else 3
+    raw_max = body.get("max_retries", 3) if isinstance(body, dict) else 3
+    # Coerce to a non-negative int. A non-numeric value is especially
+    # dangerous here: the backend filters `retry_count < max_retries`, and
+    # SQLite orders every INTEGER before any TEXT, so a string max_retries
+    # makes that predicate true for *every* failed task — silently bypassing
+    # the retry cap and re-queuing poison tasks that already exhausted it.
+    try:
+        max_retries = max(0, int(raw_max))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "max_retries must be a non-negative integer")
     retried = await get_backend().retry_failed(hub_id, max_retries=max_retries)
     return {"retried": retried, "count": len(retried)}
 

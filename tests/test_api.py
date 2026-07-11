@@ -533,6 +533,27 @@ class TestRetryClaims:
         assert resp.json()["count"] == 0
         assert resp.json()["retried"] == []
 
+    def test_retry_rejects_non_numeric_max_retries(self, client):
+        """A non-numeric max_retries must 400, not silently bypass the cap.
+
+        The backend filters `retry_count < max_retries`, and SQLite orders
+        every INTEGER before any TEXT, so a string max_retries would make that
+        predicate true for every failed task — re-queuing poison tasks that
+        already exhausted their retries.
+        """
+        key = _register(client, "retry-guard", "RetryGuard")
+        resp = client.post("/api/atris/claims/retry", headers=_auth(key),
+                          json={"max_retries": "lots"})
+        assert resp.status_code == 400
+
+    def test_retry_negative_max_retries_retries_nothing(self, client):
+        """A negative max_retries clamps to 0 and re-queues nothing (200)."""
+        key = _register(client, "retry-neg", "RetryNeg")
+        resp = client.post("/api/atris/claims/retry", headers=_auth(key),
+                          json={"max_retries": -5})
+        assert resp.status_code == 200
+        assert resp.json()["retried"] == []
+
     def test_retry_requires_auth(self, client):
         assert client.post("/api/atris/claims/retry").status_code == 401
 
