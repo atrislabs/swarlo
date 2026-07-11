@@ -315,6 +315,55 @@ def test_touch_missing_claim_exits(monkeypatch, tmp_path):
         cli.main()
 
 
+def test_liveness_prints_health(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called["url"] = url
+        return 200, {
+            "alive": [{"member_name": "A"}],
+            "dying": [{"member_name": "B", "last_seen": "2026-07-11T00:00:00+00:00"}],
+            "dead": [],
+            "orphaned_claims": [{"task_key": "task:x", "member_name": "B"}],
+            "expired_on_sweep": [],
+            "recommendation": "Ping 1 dying agent(s). Reassign 1 orphaned claim(s).",
+        }
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "liveness", "--stale-minutes", "45"])
+
+    cli.main()
+    assert "stale_minutes=45" in called["url"]
+    assert "auto_expire=true" in called["url"]
+    out = capsys.readouterr().out
+    assert "alive 1  dying 1  dead 0" in out
+    assert "DYING: B" in out
+    assert "ORPHAN: task:x held by B" in out
+
+
+def test_liveness_no_expire_observes_only(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called["url"] = url
+        return 200, {"alive": [], "dying": [], "dead": [], "orphaned_claims": [],
+                     "expired_on_sweep": [], "recommendation": "All agents healthy."}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "liveness", "--no-expire"])
+
+    cli.main()
+    assert "auto_expire=false" in called["url"]
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

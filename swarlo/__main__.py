@@ -1728,6 +1728,19 @@ def _build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--hub")
     prune.add_argument("--api-key")
 
+    liveness = sub.add_parser(
+        "liveness",
+        help="Show which agents are alive, dying, or dead (and orphaned claims)",
+        description="Health view of the swarm. By default also expires stale "
+                    "claims (the sweep GC); pass --no-expire to observe only.",
+    )
+    liveness.add_argument("--stale-minutes", type=int, default=30)
+    liveness.add_argument("--no-expire", action="store_true",
+                          help="observe only; do not expire stale claims")
+    liveness.add_argument("--server")
+    liveness.add_argument("--hub")
+    liveness.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2761,6 +2774,32 @@ fi
         print(f"Pruned {len(pruned)} member(s) stale beyond {stale_minutes}m:")
         for member_id in pruned:
             print(f"  removed: {member_id}")
+        return
+
+    if args.command == "liveness":
+        runtime = _require_runtime(args)
+        stale_minutes = max(1, int(args.stale_minutes))
+        auto_expire = "false" if args.no_expire else "true"
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/liveness"
+            f"?stale_minutes={stale_minutes}&auto_expire={auto_expire}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Liveness", status, body, route="/api/{hub}/liveness")
+        alive, dying, dead = body.get("alive", []), body.get("dying", []), body.get("dead", [])
+        print(f"alive {len(alive)}  dying {len(dying)}  dead {len(dead)}")
+        for a in dying:
+            print(f"  DYING: {a['member_name']} (last seen {a.get('last_seen')})")
+        for a in dead:
+            print(f"  DEAD:  {a['member_name']} (last seen {a.get('last_seen')})")
+        for c in body.get("orphaned_claims", []):
+            print(f"  ORPHAN: {c['task_key']} held by {c['member_name']}")
+        expired = body.get("expired_on_sweep", [])
+        if expired:
+            print(f"  expired on sweep: {', '.join(expired)}")
+        print(body.get("recommendation", ""))
         return
 
     if args.command == "idle":
