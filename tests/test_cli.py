@@ -518,6 +518,36 @@ def test_replay_empty_prints_notice(monkeypatch, tmp_path, capsys):
     assert "No posts since" in out
 
 
+def test_remove_member_prints_confirmation(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert method == "DELETE"
+        assert url == "http://localhost:8080/api/my-team/members/ghost%20one"
+        return 200, {"deleted": "ghost one"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "remove", "ghost one"])
+
+    cli.main()
+    out = capsys.readouterr().out
+    assert "Removed member: ghost one" in out
+
+
+def test_remove_missing_member_errors(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: (404, {"detail": "Member nope not found"}))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "remove", "nope"])
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
 def test_prune_lists_removed_members(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

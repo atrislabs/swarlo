@@ -1688,6 +1688,16 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--hub")
     replay.add_argument("--api-key")
 
+    remove = sub.add_parser(
+        "remove",
+        help="Remove one member from the hub by id (deletes the member)",
+        description="Remove a single member from the hub by member id.",
+    )
+    remove.add_argument("member_id", help="Member id to remove")
+    remove.add_argument("--server")
+    remove.add_argument("--hub")
+    remove.add_argument("--api-key")
+
     prune = sub.add_parser(
         "prune",
         help="Remove non-human members not seen in --stale-minutes (deletes members)",
@@ -2653,6 +2663,21 @@ fi
             print(f"No posts since {since}.")
             return
         _print_posts(posts)
+        return
+
+    if args.command == "remove":
+        runtime = _require_runtime(args)
+        member_id = (args.member_id or "").strip()
+        if not member_id:
+            raise SystemExit("remove needs a member id")
+        status, body = _request(
+            "DELETE",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/members/{urllib.parse.quote(member_id, safe='')}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Remove", status, body, route="/api/{hub}/members/{member_id}")
+        print(f"Removed member: {body.get('deleted', member_id)}")
         return
 
     if args.command == "prune":
