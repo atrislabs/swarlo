@@ -207,6 +207,34 @@ def _request_text(method: str, url: str, api_key: str | None = None) -> tuple[in
         return err.code, payload
 
 
+def _request_bytes(
+    method: str,
+    url: str,
+    *,
+    data: bytes | None = None,
+    api_key: str | None = None,
+    content_type: str | None = None,
+    timeout: float = 60.0,
+) -> tuple[int, bytes | dict]:
+    """Raw-bytes request for git bundles. Success → (status, bytes); error → (code, detail dict)."""
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if content_type:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        body = err.read().decode()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            payload = {"error": body}
+        return err.code, payload
+
+
 # Routes the CLI needs that older hubs may not have mounted yet.
 _CLI_SERVER_ROUTES = (
     ("GET", "/api/{hub}/unclaimed"),
@@ -1628,6 +1656,22 @@ def _build_parser() -> argparse.ArgumentParser:
     claim_next.add_argument("--hub")
     claim_next.add_argument("--api-key")
 
+    wait_for = sub.add_parser(
+        "wait-for",
+        help="Block until a task ships or fails (polls the channel)",
+        description="Subscribe-to-task stopgap: poll until a result/failed post appears.",
+    )
+    wait_for.add_argument("task_key")
+    wait_for.add_argument("--channel", default="general")
+    wait_for.add_argument("--timeout", type=float, default=300.0,
+                          help="seconds to wait (default 300)")
+    wait_for.add_argument("--poll-interval", type=float, default=2.0,
+                          help="seconds between polls (default 2)")
+    wait_for.add_argument("--json", action="store_true", help="Emit the result post as JSON")
+    wait_for.add_argument("--server")
+    wait_for.add_argument("--hub")
+    wait_for.add_argument("--api-key")
+
     briefing = sub.add_parser(
         "briefing",
         help="Rank board posts by relevance to a task description",
@@ -1909,6 +1953,29 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--server")
     diff.add_argument("--hub")
     diff.add_argument("--api-key")
+
+    push = sub.add_parser(
+        "push",
+        help="Upload a git bundle into the hub's shared DAG",
+        description="POST a .bundle file to the hub; indexes the commits it contains.",
+    )
+    push.add_argument("bundle", help="path to a git bundle file")
+    push.add_argument("--server")
+    push.add_argument("--hub")
+    push.add_argument("--api-key")
+
+    fetch = sub.add_parser(
+        "fetch",
+        help="Download a commit's git bundle from the hub's shared DAG",
+        description="Write the bundle for a commit hash to --output (or stdout).",
+    )
+    fetch.add_argument("hash")
+    fetch.add_argument("--output", "-o", help="write bytes to this path (default: <hash>.bundle)")
+    fetch.add_argument("--stdout", action="store_true",
+                       help="write raw bytes to stdout instead of a file")
+    fetch.add_argument("--server")
+    fetch.add_argument("--hub")
+    fetch.add_argument("--api-key")
 
     claim_file = sub.add_parser(
         "claim-file",
@@ -2786,6 +2853,51 @@ fi
         print("No ready task claimed (queue empty or all raced away).")
         return
 
+    if args.command == "wait-for":
+        import time as _time
+        runtime = _require_runtime(args)
+        task_key = (args.task_key or "").strip()
+        if not task_key:
+            raise SystemExit("wait-for needs a task_key")
+        channel = args.channel or "general"
+        timeout = max(0.1, float(args.timeout))
+        poll = max(0.1, float(args.poll_interval))
+        deadline = _time.monotonic() + timeout
+        channel_path = urllib.parse.quote(channel, safe="")
+        while _time.monotonic() < deadline:
+            status, body = _request(
+                "GET",
+                f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/"
+                f"{channel_path}/posts?limit=50",
+                api_key=runtime["api_key"],
+            )
+            if status != 200:
+                _raise_http_failure(
+                    "Wait-for",
+                    status,
+                    body,
+                    route="/api/{hub}/channels/{channel}/posts",
+                )
+            for post in body.get("posts") or []:
+                if post.get("task_key") != task_key:
+                    continue
+                kind = post.get("kind")
+                st = post.get("status")
+                if kind in ("result", "failed") or st in ("done", "failed", "blocked"):
+                    if args.json:
+                        print(json.dumps(post, indent=2, sort_keys=True))
+                    else:
+                        print(
+                            f"{st or kind}: {task_key} by {post.get('member_name')} — "
+                            f"{(post.get('content') or '')[:80]}"
+                        )
+                    return
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            _time.sleep(min(poll, remaining))
+        raise SystemExit(f"timed out after {timeout:g}s waiting for {task_key}")
+
     if args.command == "briefing":
         runtime = _require_runtime(args)
         task = (args.task or "").strip()
@@ -2954,6 +3066,72 @@ fi
             print("message:")
             for line in str(msg).splitlines() or [msg]:
                 print(f"  {line}")
+        return
+
+    if args.command == "push":
+        runtime = _require_runtime(args)
+        bundle_path = Path(args.bundle).expanduser()
+        if not bundle_path.is_file():
+            raise SystemExit(f"push: bundle not found: {bundle_path}")
+        data = bundle_path.read_bytes()
+        if not data:
+            raise SystemExit(f"push: bundle is empty: {bundle_path}")
+        if len(data) > 50 * 1024 * 1024:
+            raise SystemExit("push: bundle too large (max 50MB)")
+        status, body = _request_bytes(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/git/push",
+            data=data,
+            api_key=runtime["api_key"],
+            content_type="application/octet-stream",
+        )
+        if status not in (200, 201):
+            _raise_http_failure(
+                "Push",
+                status,
+                body if isinstance(body, dict) else {"error": str(body)},
+                route="/api/{hub}/git/push",
+            )
+        payload: dict = {}
+        if isinstance(body, dict):
+            payload = body
+        elif isinstance(body, (bytes, bytearray)):
+            try:
+                parsed = json.loads(bytes(body).decode())
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
+        hashes = payload.get("hashes") or []
+        print(f"Pushed {len(hashes)} commit(s) from {bundle_path.name}")
+        for h in hashes[:20]:
+            print(f"  {h}")
+        if len(hashes) > 20:
+            print(f"  … +{len(hashes) - 20} more")
+        return
+
+    if args.command == "fetch":
+        runtime = _require_runtime(args)
+        h = urllib.parse.quote(args.hash, safe="")
+        status, body = _request_bytes(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/git/fetch/{h}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure(
+                "Fetch",
+                status,
+                body if isinstance(body, dict) else {"error": str(body)},
+                route="/api/{hub}/git/fetch/{hash}",
+            )
+        raw = body if isinstance(body, (bytes, bytearray)) else b""
+        if args.stdout:
+            sys.stdout.buffer.write(raw)
+            return
+        out_path = Path(args.output).expanduser() if args.output else Path(f"{args.hash}.bundle")
+        out_path.write_bytes(raw)
+        print(f"Wrote {len(raw)} bytes to {out_path}")
         return
 
     if args.command == "claim-file":

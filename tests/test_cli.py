@@ -4491,3 +4491,98 @@ def test_show_prints_commit_metadata(monkeypatch, tmp_path, capsys):
     assert "parent:  (root)" in out
     assert "Builder" in out
     assert "root commit" in out
+
+
+def test_wait_for_returns_when_result_appears(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+    polls = {"n": 0}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        polls["n"] += 1
+        assert method == "GET"
+        assert "/channels/ops/posts" in url
+        if polls["n"] == 1:
+            return 200, {"posts": [{"task_key": "T1", "kind": "claim", "status": "open"}]}
+        return 200, {"posts": [{
+            "task_key": "T1", "kind": "result", "status": "done",
+            "member_name": "Worker", "content": "shipped it",
+        }]}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    import time as time_mod
+    monkeypatch.setattr(time_mod, "sleep", lambda *_: None)
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "wait-for", "T1", "--channel", "ops",
+        "--timeout", "5", "--poll-interval", "0.01",
+    ])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "done: T1" in out
+    assert "Worker" in out
+    assert polls["n"] >= 2
+
+
+def test_wait_for_times_out(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        return 200, {"posts": []}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    import time as time_mod
+    # Force immediate timeout: first monotonic is start, next checks are past deadline.
+    clock = iter([100.0, 100.0, 200.0, 200.0, 200.0])
+    monkeypatch.setattr(time_mod, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(time_mod, "sleep", lambda *_: None)
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "wait-for", "missing", "--timeout", "1", "--poll-interval", "0.01",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert "timed out" in str(exc.value)
+
+
+def test_push_and_fetch_bundle_roundtrip_cli(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+    bundle = tmp_path / "x.bundle"
+    bundle.write_bytes(b"GITBUNDLEFAKE")
+
+    def fake_bytes(method, url, data=None, api_key=None, content_type=None, timeout=60.0):
+        if method == "POST" and url.endswith("/git/push"):
+            assert data == b"GITBUNDLEFAKE"
+            assert content_type == "application/octet-stream"
+            return 201, json.dumps({"hashes": ["aaa", "bbb"]}).encode()
+        if method == "GET" and "/git/fetch/" in url:
+            return 200, b"GITBUNDLEFAKE"
+        raise AssertionError((method, url))
+
+    monkeypatch.setattr(cli, "_request_bytes", fake_bytes)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "push", str(bundle)])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "Pushed 2 commit(s)" in out
+    assert "aaa" in out
+
+    out_path = tmp_path / "out.bundle"
+    monkeypatch.setattr(sys, "argv", ["swarlo", "fetch", "aaa", "-o", str(out_path)])
+    cli.main()
+    assert out_path.read_bytes() == b"GITBUNDLEFAKE"
+    assert "Wrote 13 bytes" in capsys.readouterr().out
