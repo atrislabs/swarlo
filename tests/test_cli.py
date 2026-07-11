@@ -364,6 +364,48 @@ def test_liveness_no_expire_observes_only(monkeypatch, tmp_path):
     assert "auto_expire=false" in called["url"]
 
 
+def test_expire_reports_freed_claims(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called.update({"url": url, "payload": payload})
+        return 200, {"expired": ["task:a", "task:b"], "count": 2}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "expire", "--stale-minutes", "15"])
+
+    cli.main()
+    assert called["url"] == "http://localhost:8080/api/my-team/claims/expire"
+    assert called["payload"]["stale_minutes"] == 15
+    out = capsys.readouterr().out
+    assert "EXPIRED: task:a" in out
+    assert "Expired 2 stale claim(s)." in out
+
+
+def test_expire_clamps_negative_stale_minutes(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called["payload"] = payload
+        return 200, {"expired": [], "count": 0}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "expire", "--stale-minutes", "-5"])
+
+    cli.main()
+    # Client-side floor mirrors the server clamp so a negative window can't
+    # be sent as a claim-wipe request.
+    assert called["payload"]["stale_minutes"] == 1
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

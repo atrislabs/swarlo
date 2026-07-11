@@ -1741,6 +1741,16 @@ def _build_parser() -> argparse.ArgumentParser:
     liveness.add_argument("--hub")
     liveness.add_argument("--api-key")
 
+    expire = sub.add_parser(
+        "expire",
+        help="Force-expire claims stale beyond --stale-minutes (frees them to reclaim)",
+        description="Expire open claims with no heartbeat older than --stale-minutes.",
+    )
+    expire.add_argument("--stale-minutes", type=int, default=30)
+    expire.add_argument("--server")
+    expire.add_argument("--hub")
+    expire.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2800,6 +2810,24 @@ fi
         if expired:
             print(f"  expired on sweep: {', '.join(expired)}")
         print(body.get("recommendation", ""))
+        return
+
+    if args.command == "expire":
+        runtime = _require_runtime(args)
+        stale_minutes = max(1, int(args.stale_minutes))
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/claims/expire",
+            {"stale_minutes": stale_minutes},
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Expire", status, body, route="/api/{hub}/claims/expire")
+        expired = body.get("expired", [])
+        if expired:
+            for key in expired:
+                print(f"  EXPIRED: {key}")
+        print(f"Expired {body.get('count', len(expired))} stale claim(s).")
         return
 
     if args.command == "idle":
