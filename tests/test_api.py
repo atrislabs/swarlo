@@ -127,6 +127,31 @@ class TestClaims:
         assert resp.json()["claimed"] is True
         assert resp.json()["display_id"].startswith("C-")
 
+    def test_claim_rejects_empty_task_key(self, client):
+        key = _register(client)
+        for bad in ("", "   ", "\t\n"):
+            resp = client.post("/api/atris/channels/experiments/claim", headers=_auth(key),
+                              json={"task_key": bad, "content": "no key"})
+            assert resp.status_code == 422, f"expected 422 for task_key={bad!r}"
+
+    def test_claim_strips_task_key_whitespace(self, client):
+        """A padded task_key normalizes so it can't fork into a second lock."""
+        key_a = _register(client, "agent-a", "Hugo")
+        key_b = _register(client, "agent-b", "Gideon")
+        r1 = client.post("/api/atris/channels/experiments/claim", headers=_auth(key_a),
+                         json={"task_key": "task:pad", "content": "mine"})
+        assert r1.status_code == 201
+        # Same key with surrounding whitespace must collide, not create a new claim.
+        r2 = client.post("/api/atris/channels/experiments/claim", headers=_auth(key_b),
+                         json={"task_key": "  task:pad  ", "content": "also mine"})
+        assert r2.status_code == 409
+
+    def test_report_rejects_empty_task_key(self, client):
+        key = _register(client)
+        resp = client.post("/api/atris/channels/experiments/report", headers=_auth(key),
+                          json={"task_key": "   ", "status": "done", "content": "x"})
+        assert resp.status_code == 422
+
     def test_duplicate_claim_409(self, client):
         key_a = _register(client, "agent-a", "Hugo")
         key_b = _register(client, "agent-b", "Gideon")

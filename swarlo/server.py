@@ -12,11 +12,17 @@ import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
+
+# A task identifier that must be non-empty. Leading/trailing whitespace is
+# stripped so "task:foo " and "task:foo" name the same lock, and a
+# whitespace-only key is rejected (422) instead of creating a phantom
+# shared claim that every empty-key claimant collides on.
+TaskKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 from .sqlite_backend import SQLiteBackend
 from .git_dag import GitDAG
@@ -144,7 +150,7 @@ class PostRequest(BaseModel):
 class ClaimRequest(BaseModel):
     """Request to claim a task for exclusive work."""
 
-    task_key: str
+    task_key: TaskKey
     content: str
     depends_on: Optional[list[str]] = None
 
@@ -152,7 +158,7 @@ class ClaimRequest(BaseModel):
 class ReportRequest(BaseModel):
     """Request to report task completion status."""
 
-    task_key: str
+    task_key: TaskKey
     status: str = Field(..., pattern="^(done|failed|blocked)$")
     content: str
     affected_files: Optional[list[str]] = None
@@ -164,7 +170,7 @@ class ReportRequest(BaseModel):
 class AssignRequest(BaseModel):
     """Request to push-assign a task to a specific member."""
 
-    task_key: str
+    task_key: TaskKey
     assignee_id: str
     content: str
     depends_on: Optional[list[str]] = None
