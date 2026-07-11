@@ -406,6 +406,48 @@ def test_expire_clamps_negative_stale_minutes(monkeypatch, tmp_path):
     assert called["payload"]["stale_minutes"] == 1
 
 
+def test_retry_reports_requeued_tasks(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called.update({"url": url, "payload": payload})
+        return 200, {"retried": ["task:x", "task:y"], "count": 2}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "retry", "--max-retries", "5"])
+
+    cli.main()
+    assert called["url"] == "http://localhost:8080/api/my-team/claims/retry"
+    assert called["payload"]["max_retries"] == 5
+    out = capsys.readouterr().out
+    assert "RETRY: task:x" in out
+    assert "Re-queued 2 failed task(s)." in out
+
+
+def test_retry_clamps_negative_max_retries(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called["payload"] = payload
+        return 200, {"retried": [], "count": 0}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "retry", "--max-retries", "-3"])
+
+    cli.main()
+    # Client-side floor mirrors the server's max(0, ...) coercion so a negative
+    # cap can't be sent (a string/negative max_retries can bypass the SQLite cap).
+    assert called["payload"]["max_retries"] == 0
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

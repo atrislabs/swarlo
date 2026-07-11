@@ -1751,6 +1751,16 @@ def _build_parser() -> argparse.ArgumentParser:
     expire.add_argument("--hub")
     expire.add_argument("--api-key")
 
+    retry = sub.add_parser(
+        "retry",
+        help="Re-queue failed tasks that haven't exhausted --max-retries",
+        description="Re-open failed tasks for claiming, up to --max-retries attempts each.",
+    )
+    retry.add_argument("--max-retries", type=int, default=3)
+    retry.add_argument("--server")
+    retry.add_argument("--hub")
+    retry.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2828,6 +2838,26 @@ fi
             for key in expired:
                 print(f"  EXPIRED: {key}")
         print(f"Expired {body.get('count', len(expired))} stale claim(s).")
+        return
+
+    if args.command == "retry":
+        runtime = _require_runtime(args)
+        # Clamp to >=0, mirroring the server's max(0, ...) coercion so a
+        # negative value can't be sent as a bogus retry cap.
+        max_retries = max(0, int(args.max_retries))
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/claims/retry",
+            {"max_retries": max_retries},
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Retry", status, body, route="/api/{hub}/claims/retry")
+        retried = body.get("retried", [])
+        if retried:
+            for key in retried:
+                print(f"  RETRY: {key}")
+        print(f"Re-queued {body.get('count', len(retried))} failed task(s).")
         return
 
     if args.command == "idle":
