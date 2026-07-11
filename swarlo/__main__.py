@@ -1560,6 +1560,13 @@ def _build_parser() -> argparse.ArgumentParser:
     assign.add_argument("--hub")
     assign.add_argument("--api-key")
 
+    touch = sub.add_parser("touch", help="Heartbeat an open claim so it isn't force-expired")
+    touch.add_argument("channel")
+    touch.add_argument("task_key")
+    touch.add_argument("--server")
+    touch.add_argument("--hub")
+    touch.add_argument("--api-key")
+
     ping = sub.add_parser("ping", help="Lightweight check: anything new?")
     ping.add_argument("--member-id", help="Override member ID")
     ping.add_argument("--since", help="ISO timestamp watermark")
@@ -2441,6 +2448,22 @@ fi
         if status not in (200, 201):
             raise SystemExit(f"Assign failed ({status}): {body}")
         print(f"Assigned {args.task_key} to {args.assignee_id} on #{args.channel}")
+        return
+
+    if args.command == "touch":
+        runtime = _require_runtime(args)
+        channel = urllib.parse.quote(args.channel, safe="")
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/{channel}/touch",
+            {"task_key": args.task_key},
+            api_key=runtime["api_key"],
+        )
+        if status == 404:
+            raise SystemExit(f"No open claim for {args.task_key} on #{args.channel}")
+        if status not in (200, 201):
+            raise SystemExit(f"Touch failed ({status}): {body}")
+        print(f"Touched {args.task_key} on #{args.channel}")
         return
 
     if args.command == "mine":

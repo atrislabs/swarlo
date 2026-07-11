@@ -282,6 +282,39 @@ def test_assign_conflict_exits(monkeypatch, tmp_path):
         cli.main()
 
 
+def test_touch_uses_saved_runtime(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called.update({"method": method, "url": url, "payload": payload, "api_key": api_key})
+        return 200, {"touched": True, "task_key": "task:1"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "touch", "ops lane", "task:1"])
+
+    cli.main()
+    assert called["url"] == "http://localhost:8080/api/my-team/channels/ops%20lane/touch"
+    assert called["payload"]["task_key"] == "task:1"
+    assert called["api_key"] == "secret"
+    assert "Touched task:1" in capsys.readouterr().out
+
+
+def test_touch_missing_claim_exits(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: (404, {"detail": "none"}))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "touch", "general", "task:gone"])
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
