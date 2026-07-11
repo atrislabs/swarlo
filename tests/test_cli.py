@@ -510,6 +510,38 @@ def test_lineage_walks_from_hash(monkeypatch, tmp_path, capsys):
     assert "1 commit(s):" in capsys.readouterr().out
 
 
+def test_diff_prints_plaintext(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request_text(method, url, api_key=None):
+        called["url"] = url
+        return 200, "diff --git a/f b/f\n-hello\n+world\n"
+
+    monkeypatch.setattr(cli, "_request_text", fake_request_text)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "diff", "aaa111", "bbb222"])
+
+    cli.main()
+    assert called["url"].endswith("/git/diff/aaa111/bbb222")
+    out = capsys.readouterr().out
+    assert "-hello" in out and "+world" in out
+
+
+def test_diff_empty_reports_no_differences(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request_text", lambda method, url, api_key=None: (200, "   \n"))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "diff", "aaa", "bbb"])
+
+    cli.main()
+    assert "(no differences)" in capsys.readouterr().out
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

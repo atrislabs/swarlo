@@ -187,6 +187,26 @@ def _request(method: str, url: str, payload: dict | None = None, api_key: str | 
         return err.code, payload
 
 
+def _request_text(method: str, url: str, api_key: str | None = None) -> tuple[int, str | dict]:
+    """Like _request but returns the raw response text on success — for endpoints
+    (git diff) whose body is plaintext, not JSON. On error returns the parsed
+    JSON detail (or {'error': body}) so _raise_http_failure formats it the same."""
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as err:
+        body = err.read().decode()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            payload = {"error": body}
+        return err.code, payload
+
+
 # Routes the CLI needs that older hubs may not have mounted yet.
 _CLI_SERVER_ROUTES = (
     ("GET", "/api/{hub}/unclaimed"),
@@ -1846,6 +1866,17 @@ def _build_parser() -> argparse.ArgumentParser:
     lineage.add_argument("--hub")
     lineage.add_argument("--api-key")
 
+    diff = sub.add_parser(
+        "diff",
+        help="Show the plaintext diff between two commits in the shared git DAG",
+        description="Print the diff between two commit hashes (hash_a..hash_b).",
+    )
+    diff.add_argument("hash_a")
+    diff.add_argument("hash_b")
+    diff.add_argument("--server")
+    diff.add_argument("--hub")
+    diff.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2740,6 +2771,24 @@ fi
             h = str(c.get("hash", ""))[:12]
             msg = (c.get("message") or "").splitlines()[0] if c.get("message") else ""
             print(f"  {h}  {c.get('member_name') or c.get('member_id') or '?'}  {msg}")
+        return
+
+    if args.command == "diff":
+        runtime = _require_runtime(args)
+        a = urllib.parse.quote(args.hash_a, safe="")
+        b = urllib.parse.quote(args.hash_b, safe="")
+        status, body = _request_text(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/git/diff/{a}/{b}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Diff", status, body, route="/api/{hub}/git/diff/{a}/{b}")
+        text = body if isinstance(body, str) else str(body)
+        if text.strip():
+            print(text, end="" if text.endswith("\n") else "\n")
+        else:
+            print("(no differences)")
         return
 
     if args.command == "ping":
