@@ -373,6 +373,19 @@ class TestReplay:
     def test_replay_requires_auth(self, client):
         assert client.get("/api/atris/replay?since=2020-01-01T00:00:00Z").status_code == 401
 
+    def test_replay_rejects_malformed_since(self, client):
+        """A malformed since must 400, not silently return the whole lookback window."""
+        key = _register(client, "replayer3", "Replayer3")
+        resp = client.get("/api/atris/replay?since=not-a-timestamp", headers=_auth(key))
+        assert resp.status_code == 400
+        assert "ISO8601" in resp.json()["detail"]
+
+    def test_replay_clamps_valid_but_old_since(self, client):
+        """A valid but too-old timestamp still succeeds (clamped, not rejected)."""
+        key = _register(client, "replayer4", "Replayer4")
+        resp = client.get("/api/atris/replay?since=1970-01-01T00:00:00Z", headers=_auth(key))
+        assert resp.status_code == 200
+
 
 class TestIdle:
     def test_idle_returns_empty_for_active_member(self, client):

@@ -817,6 +817,14 @@ async def replay_posts(
     _get_member(request)
     if not since or not since.strip():
         raise HTTPException(400, "since query param is required (ISO8601 timestamp)")
+    try:
+        datetime.fromisoformat(since.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            400,
+            f"since is not a valid ISO8601 timestamp: {since!r} "
+            "(e.g. 2026-07-10T00:00:00+00:00)",
+        )
 
     safe_limit = max(1, min(int(limit), 500))
     query_since = _bounded_replay_since(since)
