@@ -1877,6 +1877,27 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--hub")
     diff.add_argument("--api-key")
 
+    claim_file = sub.add_parser(
+        "claim-file",
+        help="Claim a file so no other agent edits it at the same time",
+        description="Lock a file path on a channel (soft lock via the claim system).",
+    )
+    claim_file.add_argument("channel")
+    claim_file.add_argument("file_path")
+    claim_file.add_argument("--content", default="", help="what you're doing to the file")
+    claim_file.add_argument("--server")
+    claim_file.add_argument("--hub")
+    claim_file.add_argument("--api-key")
+
+    file_claims = sub.add_parser(
+        "file-claims",
+        help="List every file currently claimed across all channels",
+        description="Show which files are locked, by whom, and since when.",
+    )
+    file_claims.add_argument("--server")
+    file_claims.add_argument("--hub")
+    file_claims.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2789,6 +2810,44 @@ fi
             print(text, end="" if text.endswith("\n") else "\n")
         else:
             print("(no differences)")
+        return
+
+    if args.command == "claim-file":
+        runtime = _require_runtime(args)
+        channel = urllib.parse.quote(args.channel, safe="")
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/{channel}/claim-file",
+            {"file_path": args.file_path, "content": args.content},
+            api_key=runtime["api_key"],
+        )
+        if status == 409:
+            holder = body.get("member_name") or body.get("member_id") or "another agent"
+            raise SystemExit(f"File already claimed by {holder}: {args.file_path}")
+        if status not in (200, 201):
+            raise SystemExit(f"Claim-file failed ({status}): {body}")
+        print(f"Claimed file {args.file_path} on #{args.channel}")
+        return
+
+    if args.command == "file-claims":
+        runtime = _require_runtime(args)
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/file-claims",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("File-claims", status, body, route="/api/{hub}/file-claims")
+        files = body.get("files") or []
+        if not files:
+            print("No files claimed.")
+            return
+        print(f"{body.get('count', len(files))} file(s) claimed:")
+        for f in files:
+            print(
+                f"  {f.get('file_path')}  by {f.get('claimed_by') or f.get('member_id')}  "
+                f"on #{f.get('channel')}  since {f.get('claimed_at')}"
+            )
         return
 
     if args.command == "ping":

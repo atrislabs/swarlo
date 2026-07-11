@@ -542,6 +542,75 @@ def test_diff_empty_reports_no_differences(monkeypatch, tmp_path, capsys):
     assert "(no differences)" in capsys.readouterr().out
 
 
+def test_claim_file_locks_a_path(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called.update({"url": url, "payload": payload})
+        return 201, {"task_key": "file:src/app.py"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "claim-file", "general", "src/app.py", "--content", "refactor"])
+
+    cli.main()
+    assert called["url"].endswith("/channels/general/claim-file")
+    assert called["payload"] == {"file_path": "src/app.py", "content": "refactor"}
+    assert "Claimed file src/app.py on #general" in capsys.readouterr().out
+
+
+def test_claim_file_conflict_names_holder(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        return 409, {"conflict": True, "member_name": "Bob"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "claim-file", "general", "src/app.py"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert "already claimed by Bob" in str(exc.value)
+
+
+def test_file_claims_lists_locked_files(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert url.endswith("/file-claims")
+        return 200, {"count": 1, "files": [
+            {"file_path": "src/app.py", "claimed_by": "Ann", "member_id": "ann-1",
+             "channel": "general", "claimed_at": "2026-07-11T00:00:00Z"},
+        ]}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "file-claims"])
+
+    cli.main()
+    out = capsys.readouterr().out
+    assert "1 file(s) claimed:" in out
+    assert "src/app.py" in out and "by Ann" in out and "#general" in out
+
+
+def test_file_claims_empty(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: (200, {"count": 0, "files": []}))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "file-claims"])
+
+    cli.main()
+    assert "No files claimed." in capsys.readouterr().out
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
