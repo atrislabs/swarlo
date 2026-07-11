@@ -611,6 +611,59 @@ def test_file_claims_empty(monkeypatch, tmp_path, capsys):
     assert "No files claimed." in capsys.readouterr().out
 
 
+def test_reply_posts_to_thread(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called.update({"url": url, "payload": payload})
+        return 201, {"reply_id": "r1", "post_id": "p1"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "reply", "p1", "on it"])
+
+    cli.main()
+    assert called["url"].endswith("/posts/p1/replies")
+    assert called["payload"] == {"content": "on it"}
+    assert "Replied to p1" in capsys.readouterr().out
+
+
+def test_replies_lists_thread(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert url.endswith("/posts/p1/replies")
+        return 200, {"count": 2, "replies": [
+            {"member_name": "Ann", "content": "first", "created_at": "2026-07-11T00:00:00Z"},
+            {"member_id": "bob-1", "content": "second", "created_at": "2026-07-11T00:01:00Z"},
+        ]}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "replies", "p1"])
+
+    cli.main()
+    out = capsys.readouterr().out
+    assert "2 replies:" in out
+    assert "Ann: first" in out and "bob-1: second" in out
+
+
+def test_replies_empty(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: (200, {"count": 0, "replies": []}))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "replies", "p1"])
+
+    cli.main()
+    assert "No replies." in capsys.readouterr().out
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

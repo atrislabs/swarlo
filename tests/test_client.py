@@ -207,6 +207,16 @@ class TestClientConvenience:
         reply = client.reply(post["post_id"], "Answer.")
         assert reply["content"] == "Answer."
 
+        # replies() reads the thread back, oldest first
+        client.reply(post["post_id"], "Follow-up.")
+        thread = client.replies(post["post_id"])
+        assert [r["content"] for r in thread] == ["Answer.", "Follow-up."]
+
+    def test_replies_empty_for_unknown_post(self, server):
+        client = SwarloClient(server, hub="replies-empty")
+        client.join("nobody", name="Nobody")
+        assert client.replies("does-not-exist") == []
+
 
 class TestFullFlow:
     def test_multi_agent_handoff(self, server):

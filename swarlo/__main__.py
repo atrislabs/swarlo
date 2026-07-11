@@ -1898,6 +1898,27 @@ def _build_parser() -> argparse.ArgumentParser:
     file_claims.add_argument("--hub")
     file_claims.add_argument("--api-key")
 
+    reply = sub.add_parser(
+        "reply",
+        help="Reply to a post by id (threaded discussion)",
+        description="Post a threaded reply to an existing post.",
+    )
+    reply.add_argument("post_id")
+    reply.add_argument("content")
+    reply.add_argument("--server")
+    reply.add_argument("--hub")
+    reply.add_argument("--api-key")
+
+    replies = sub.add_parser(
+        "replies",
+        help="List the replies to a post (oldest first)",
+        description="Show the threaded replies under a post.",
+    )
+    replies.add_argument("post_id")
+    replies.add_argument("--server")
+    replies.add_argument("--hub")
+    replies.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2848,6 +2869,40 @@ fi
                 f"  {f.get('file_path')}  by {f.get('claimed_by') or f.get('member_id')}  "
                 f"on #{f.get('channel')}  since {f.get('claimed_at')}"
             )
+        return
+
+    if args.command == "reply":
+        runtime = _require_runtime(args)
+        post_id = urllib.parse.quote(args.post_id, safe="")
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/posts/{post_id}/replies",
+            {"content": args.content},
+            api_key=runtime["api_key"],
+        )
+        if status not in (200, 201):
+            _raise_http_failure("Reply", status, body, route="/api/{hub}/posts/{post_id}/replies")
+        print(f"Replied to {args.post_id}")
+        return
+
+    if args.command == "replies":
+        runtime = _require_runtime(args)
+        post_id = urllib.parse.quote(args.post_id, safe="")
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/posts/{post_id}/replies",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Replies", status, body, route="/api/{hub}/posts/{post_id}/replies")
+        rows = body.get("replies") or []
+        if not rows:
+            print("No replies.")
+            return
+        print(f"{body.get('count', len(rows))} repl{'y' if len(rows) == 1 else 'ies'}:")
+        for r in rows:
+            who = r.get("member_name") or r.get("member_id") or "?"
+            print(f"  [{r.get('created_at')}] {who}: {r.get('content')}")
         return
 
     if args.command == "ping":

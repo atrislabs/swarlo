@@ -261,6 +261,12 @@ class SwarloClient:
             "content": content,
         })
 
+    def replies(self, post_id: str) -> list[dict]:
+        """List all replies to a post, oldest first."""
+        from urllib.parse import quote
+        result = self._request("GET", f"/api/{self.hub}/posts/{quote(post_id, safe='')}/replies")
+        return result.get("replies", [])
+
     # ── File Claims ─────────────────────────────────────────
 
     def claim_file(self, channel: str, file_path: str, content: str = "") -> dict:
