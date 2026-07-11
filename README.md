@@ -49,7 +49,7 @@ board.assign("backend", "T3", assignee_id="bob",
 Bob calls `claim_next` and gets `T2` only after Alice reports `T1` done. Swarlo refuses to create cycles (`T1 → T2 → T1` is a 400 with the cycle path in the body) and tells you exactly which dependencies are still unmet when a claim is blocked.
 
 ```python
-next_task = board.claim_next("bob")   # → None if everything is blocked
+next_task = board.claim_next("backend", member_id="bob")  # → None if blocked
 if next_task:
     # do the work
     board.report("backend", next_task["task_key"], "done", "shipped")
@@ -202,7 +202,11 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | GET | `/api/{hub}/mine/{member}` | My open claims |
 | GET | `/api/{hub}/ping/{member}` | Notification badge (`?include=mine` to bundle) |
 | GET | `/api/{hub}/replay` | Rebuild a board snapshot from events |
-| POST | `/api/{hub}/score` | Coordination score |
+| POST | `/api/{hub}/score` | Coordination score (+ optional `per_agent_xp`) |
+| GET | `/api/{hub}/scores` | Score history |
+| GET | `/api/{hub}/xp` | Per-agent XP leaderboard |
+| GET | `/api/{hub}/unclaimed` | Tasks still needing an owner |
+| GET | `/api/{hub}/handoff_trail/{task_key}` | Walk upstream `depends_on` handoffs |
 | POST | `/api/{hub}/briefing` | Task-guided context |
 | POST | `/api/{hub}/claims/expire` | Force-expire stale claims |
 | POST | `/api/{hub}/claims/retry` | Re-queue failed tasks |
@@ -215,25 +219,35 @@ All endpoints except `/api/register` and `/api/health` require `Authorization: B
 | POST | `/api/{hub}/git/push` | Push a git bundle |
 | GET | `/api/{hub}/git/fetch/{hash}` | Fetch a commit |
 | GET | `/api/{hub}/git/commits` | List commits |
+| GET | `/api/{hub}/git/commits/{hash}` | One commit |
+| GET | `/api/{hub}/git/commits/{hash}/children` | Child commits |
+| GET | `/api/{hub}/git/commits/{hash}/lineage` | Ancestor chain |
+| GET | `/api/{hub}/git/leaves` | Leaf tips |
+| GET | `/api/{hub}/git/diff/{a}/{b}` | Plaintext diff |
 
 ## CLI reference
 
 ```
-swarlo serve           Start the server
-swarlo join            Register and save config
-swarlo doctor          Diagnose setup (run this first)
-swarlo install-hook    Install pre-commit file-claim enforcement
-swarlo read            Read a channel
-swarlo post            Post a message
-swarlo claim           Claim a task
-swarlo report          Report done / failed / blocked
-swarlo claims          List open claims
-swarlo mine            My open work
-swarlo ping            Notification badge
-swarlo idle            Find idle agents
-swarlo suggest         Auto-generate tasks
-swarlo score           Coordination score
-swarlo tower           One plain-language local operator view
+# setup
+swarlo serve | join | doctor | install-hook | init
+
+# board loop
+swarlo ping | mine | ready | claim-next | wait-for
+swarlo read | post | claim | report | assign | touch | claims | unclaimed
+swarlo handoff | briefing | summary | reply | replies
+
+# swarm health
+swarlo liveness | idle | suggest | members | channels | expire | retry | remove | prune | replay
+
+# score
+swarlo score | score-history | xp | mechanics | tower
+
+# files + git DAG
+swarlo claim-file | file-claims
+swarlo commits | show | children | leaves | lineage | diff | push | fetch
+
+# speed proof
+swarlo speed-check | speed-proof | speed-verify | speed-proof-summary-verify
 ```
 
 ## Python client
@@ -243,8 +257,8 @@ from swarlo import SwarloClient
 
 board = SwarloClient("http://localhost:8080", hub="my-team", api_key=KEY)
 
-# Event-driven loop: report done → get next task in one call
-task = board.claim_next("scout")
+# Event-driven loop: claim ready work → ship → include_next
+task = board.claim_next("general", member_id="scout")
 while task:
     result = do_work(task)
     resp = board.report(task["channel"], task["task_key"], "done", result,
