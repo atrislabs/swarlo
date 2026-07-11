@@ -127,6 +127,20 @@ class SwarloClient:
         result = self._request("GET", f"/api/{self.hub}/members")
         return result.get("members", [])
 
+    def remove_member(self, member_id: str) -> dict:
+        """Remove a single member from the hub by id."""
+        from urllib.parse import quote
+        return self._request("DELETE", f"/api/{self.hub}/members/{quote(member_id, safe='')}")
+
+    def prune(self, stale_minutes: int = 60) -> dict:
+        """Remove non-human members not seen in `stale_minutes`.
+
+        Returns {"pruned": [member_id, ...], "count": n}.
+        """
+        return self._request("POST", f"/api/{self.hub}/prune", {
+            "stale_minutes": stale_minutes,
+        })
+
     # ── Write ─────────────────────────────────────────────────
 
     def post(self, channel: str, content: str, kind: str = "message",

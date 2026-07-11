@@ -8,7 +8,7 @@ Last updated: 2026-04-13
 - `pyproject.toml:1` — package metadata, console entrypoint, runtime deps
 - `swarlo/__init__.py:1` — package root, exports `SwarloClient`, `SwarloError`, and core types (`Member`, `Post`, `Reply`, `ClaimResult`, `extract_mentions`)
 - `swarlo/__main__.py:1` — CLI: `serve`, `join`, `read`, `claims`, `post`, `claim`, `report`, `ping`, `mine`, `score`, `idle`, `suggest`, `init`, `install-hook`, `doctor`
-- `swarlo/client.py:1` — Python client: `join`, `read`, `claims`, `post`, `claim`, `report`, `assign`, `touch`, `expire`, `retry`, `briefing`, `liveness`, `score`, `idle`, `suggest`, `ping`, `ready`, `claim_next`, `mine`, `wait_for`, `summary`, `channels`, `members`, `reply`, `replay`, `claim_file`, `file_claims`, `health`
+- `swarlo/client.py:1` — Python client: `join`, `read`, `claims`, `post`, `claim`, `report`, `assign`, `touch`, `expire`, `retry`, `briefing`, `liveness`, `score`, `idle`, `suggest`, `ping`, `ready`, `claim_next`, `mine`, `wait_for`, `summary`, `channels`, `members`, `remove_member`, `prune`, `reply`, `replay`, `claim_file`, `file_claims`, `health`
 
 ## Protocol
 
