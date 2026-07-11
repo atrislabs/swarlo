@@ -1878,6 +1878,17 @@ def _build_parser() -> argparse.ArgumentParser:
     children.add_argument("--hub")
     children.add_argument("--api-key")
 
+    show = sub.add_parser(
+        "show",
+        help="Show one commit's metadata from the shared git DAG",
+        description="Print metadata for a single commit hash (parent, member, message).",
+    )
+    show.add_argument("hash")
+    show.add_argument("--json", action="store_true", help="Emit raw JSON")
+    show.add_argument("--server")
+    show.add_argument("--hub")
+    show.add_argument("--api-key")
+
     lineage = sub.add_parser(
         "lineage",
         help="Walk a commit's ancestor chain back to root (newest first)",
@@ -2914,6 +2925,35 @@ fi
             print(text, end="" if text.endswith("\n") else "\n")
         else:
             print("(no differences)")
+        return
+
+    if args.command == "show":
+        runtime = _require_runtime(args)
+        h = urllib.parse.quote(args.hash, safe="")
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/git/commits/{h}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure(
+                "Show",
+                status,
+                body,
+                route="/api/{hub}/git/commits/{hash}",
+            )
+        if args.json:
+            print(json.dumps(body, indent=2, sort_keys=True))
+            return
+        print(f"hash:    {body.get('hash') or args.hash}")
+        print(f"parent:  {body.get('parent_hash') or '(root)'}")
+        print(f"member:  {body.get('member_name') or body.get('member_id') or '?'}")
+        print(f"when:    {body.get('created_at') or '?'}")
+        msg = body.get("message") or ""
+        if msg:
+            print("message:")
+            for line in str(msg).splitlines() or [msg]:
+                print(f"  {line}")
         return
 
     if args.command == "claim-file":

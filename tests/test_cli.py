@@ -4461,3 +4461,33 @@ def test_children_prints_child_commits(monkeypatch, tmp_path, capsys):
     assert "def4567890ab" in out
     assert "Builder" in out
     assert "next" in out
+
+
+def test_show_prints_commit_metadata(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert method == "GET"
+        assert url.endswith("/git/commits/abc123")
+        return 200, {
+            "hash": "abc123",
+            "parent_hash": None,
+            "member_name": "Builder",
+            "created_at": "2026-07-11T00:00:00+00:00",
+            "message": "root commit\nmore detail",
+        }
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "show", "abc123"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "hash:    abc123" in out
+    assert "parent:  (root)" in out
+    assert "Builder" in out
+    assert "root commit" in out
