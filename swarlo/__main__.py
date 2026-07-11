@@ -1579,6 +1579,10 @@ def _build_parser() -> argparse.ArgumentParser:
     post.add_argument("content")
     post.add_argument("--kind", default="message")
     post.add_argument("--task-key")
+    post.add_argument("--priority", type=int, default=0,
+                      help="0-5, higher is preferred when later claimed")
+    post.add_argument("--depends-on", default=None,
+                      help="comma-separated task keys this post waits on")
     post.add_argument("--server")
     post.add_argument("--hub")
     post.add_argument("--api-key")
@@ -1587,6 +1591,8 @@ def _build_parser() -> argparse.ArgumentParser:
     claim.add_argument("channel")
     claim.add_argument("task_key")
     claim.add_argument("content")
+    claim.add_argument("--depends-on", default=None,
+                      help="comma-separated task keys this claim waits on")
     claim.add_argument("--server")
     claim.add_argument("--hub")
     claim.add_argument("--api-key")
@@ -1596,6 +1602,13 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("task_key")
     report.add_argument("status", choices=["done", "failed", "blocked"])
     report.add_argument("content")
+    report.add_argument("--include-next", action="store_true",
+                        help="also return the next ready task if any")
+    report.add_argument("--suggest-if-empty", action="store_true",
+                        help="with --include-next, auto-suggest when queue is empty")
+    report.add_argument("--affected-file", action="append", default=[],
+                        dest="affected_files",
+                        help="file path touched (repeatable)")
     report.add_argument("--server")
     report.add_argument("--hub")
     report.add_argument("--api-key")
@@ -2673,10 +2686,19 @@ fi
     if args.command == "post":
         runtime = _require_runtime(args)
         channel = urllib.parse.quote(args.channel, safe="")
+        payload: dict = {"content": args.content, "kind": args.kind}
+        if args.task_key:
+            payload["task_key"] = args.task_key
+        if args.priority:
+            payload["priority"] = int(args.priority)
+        if args.depends_on:
+            payload["depends_on"] = [
+                d.strip() for d in args.depends_on.split(",") if d.strip()
+            ]
         status, body = _request(
             "POST",
             f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/{channel}/posts",
-            {"content": args.content, "kind": args.kind, "task_key": args.task_key},
+            payload,
             api_key=runtime["api_key"],
         )
         if status not in (200, 201):
@@ -2687,10 +2709,15 @@ fi
     if args.command == "claim":
         runtime = _require_runtime(args)
         channel = urllib.parse.quote(args.channel, safe="")
+        payload = {"task_key": args.task_key, "content": args.content}
+        if args.depends_on:
+            payload["depends_on"] = [
+                d.strip() for d in args.depends_on.split(",") if d.strip()
+            ]
         status, body = _request(
             "POST",
             f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/{channel}/claim",
-            {"task_key": args.task_key, "content": args.content},
+            payload,
             api_key=runtime["api_key"],
         )
         if status == 409:
@@ -2703,15 +2730,36 @@ fi
     if args.command == "report":
         runtime = _require_runtime(args)
         channel = urllib.parse.quote(args.channel, safe="")
+        payload = {
+            "task_key": args.task_key,
+            "status": args.status,
+            "content": args.content,
+        }
+        if args.include_next:
+            payload["include_next"] = True
+        if args.suggest_if_empty:
+            payload["suggest_if_empty"] = True
+        if args.affected_files:
+            payload["affected_files"] = list(args.affected_files)
         status, body = _request(
             "POST",
             f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/{channel}/report",
-            {"task_key": args.task_key, "status": args.status, "content": args.content},
+            payload,
             api_key=runtime["api_key"],
         )
         if status not in (200, 201):
             raise SystemExit(f"Report failed ({status}): {body}")
         print(f"Reported {args.status} for {args.task_key} on #{args.channel}")
+        if args.include_next:
+            nxt = body.get("next_task")
+            if nxt:
+                print(
+                    f"  NEXT: {nxt.get('task_key')} — {(nxt.get('content') or '')[:60]}"
+                )
+            else:
+                print("  NEXT: (none)")
+            for s in body.get("suggestions") or []:
+                print(f"  SUGGEST: {s}")
         return
 
     if args.command == "assign":

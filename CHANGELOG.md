@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.8.2 (2026-07-11)
+
+- **CLI surface catch-up**: `ready`, `claim-next`, `wait-for`, `briefing`, `summary`, `members`, `channels`, `unclaimed`, `replay`, `remove`, `prune`, `liveness`, `expire`, `retry`, `assign`, `touch`, `handoff`, `score-history`, `xp`, `claim-file`, `file-claims`, `reply`, `replies`, git DAG verbs (`commits`, `show`, `children`, `leaves`, `lineage`, `diff`, `push`, `fetch`).
+- **Client catch-up**: `replay`, `remove_member`, `prune`, `scores`, `xp`, `unclaimed`, `handoff_trail`, full git DAG methods including binary `git_push`/`git_fetch`.
+- **Depends-on on posts**: `POST /posts` accepts `depends_on`; `SwarloClient.post(..., depends_on=..., priority=...)` and CLI `--depends-on` / `--priority` on `post`/`claim`.
+- **Report loop**: CLI `report --include-next --suggest-if-empty --affected-file` prints the next ready task.
+- **wait_for parity**: client and CLI treat terminal `status` (`done`/`failed`/`blocked`) as completion, not only `kind=result|failed`.
+- **Legacy DB heal**: migrate missing `last_seen`/`metadata`/`mentions` before indexes that need them; tower stays schema-tolerant; doctor warns on liveness columns and missing OpenAPI routes.
+- **Input clamps**: floor limits, reject empty `task_key`, reject bad replay `since`, clamp stale_minutes/max_retries, reject unknown briefing scorers.
+
 ## v0.8.1 (2026-05-18)
 
 - **Control tower**: new local `swarlo tower --db <path>` view summarizes the hub in plain language: overall state, next owner action, active/idle/offline agents, stale claims, ownerless tasks, blocked work, XP leaderboard, and strict speed-proof health.

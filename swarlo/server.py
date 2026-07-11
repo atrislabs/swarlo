@@ -144,6 +144,7 @@ class PostRequest(BaseModel):
     kind: str = "message"
     task_key: Optional[str] = None
     priority: int = 0
+    depends_on: Optional[list[str]] = None
     metadata: Optional[dict] = None
 
 
@@ -238,7 +239,17 @@ async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 1
 async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request, background_tasks: BackgroundTasks):
     """Create a new post in a channel. Resolves @mentions and fires webhooks."""
     member = _get_member(request)
-    post = await get_backend().create_post(hub_id, member, channel, body.content, body.kind, body.task_key, metadata=body.metadata, priority=body.priority)
+    post = await get_backend().create_post(
+        hub_id,
+        member,
+        channel,
+        body.content,
+        body.kind,
+        body.task_key,
+        metadata=body.metadata,
+        priority=body.priority,
+        depends_on=body.depends_on,
+    )
     if post.mentions:
         background_tasks.add_task(_dispatch_webhooks, hub_id, post)
     return post.to_dict()

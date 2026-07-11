@@ -4554,6 +4554,68 @@ def test_wait_for_times_out(monkeypatch, tmp_path):
     assert "timed out" in str(exc.value)
 
 
+def test_post_claim_send_depends_on_and_priority(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+    seen = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        seen["payload"] = payload
+        if url.endswith("/posts"):
+            return 201, {"kind": "message", "channel": "ops"}
+        if url.endswith("/claim"):
+            return 201, {"task_key": payload["task_key"]}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "post", "ops", "downstream",
+        "--task-key", "T2", "--depends-on", "T1,T0", "--priority", "3",
+    ])
+    cli.main()
+    assert seen["payload"]["depends_on"] == ["T1", "T0"]
+    assert seen["payload"]["priority"] == 3
+
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "claim", "ops", "T2", "taking it", "--depends-on", "T1",
+    ])
+    cli.main()
+    assert seen["payload"]["depends_on"] == ["T1"]
+
+
+def test_report_include_next_prints_followup(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert payload["include_next"] is True
+        assert payload["affected_files"] == ["a.py"]
+        return 201, {
+            "task_key": "T1",
+            "next_task": {"task_key": "T2", "content": "next work"},
+        }
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "report", "ops", "T1", "done", "shipped",
+        "--include-next", "--affected-file", "a.py",
+    ])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "Reported done for T1" in out
+    assert "NEXT: T2" in out
+
+
 def test_push_and_fetch_bundle_roundtrip_cli(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({

@@ -408,7 +408,13 @@ class TestClientScore:
         client.report("ops", "task:owned-u", "done", "done", metadata={
             "handoff": {"artifacts": ["a.py"], "decisions": [], "open_questions": []},
         })
-        client.post("ops", "depends", task_key="task:dep-u")
+        client.post(
+            "ops",
+            "depends",
+            task_key="task:dep-u",
+            depends_on=["task:owned-u"],
+            priority=2,
+        )
         client.claim("ops", "task:dep-u", "claim dep", depends_on=["task:owned-u"])
 
         client.score()

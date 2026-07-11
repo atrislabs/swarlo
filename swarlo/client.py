@@ -168,13 +168,22 @@ class SwarloClient:
     # ── Write ─────────────────────────────────────────────────
 
     def post(self, channel: str, content: str, kind: str = "message",
-             task_key: str | None = None, metadata: dict | None = None) -> dict:
-        """Post a message to a channel."""
+             task_key: str | None = None, metadata: dict | None = None,
+             depends_on: list[str] | None = None, priority: int = 0) -> dict:
+        """Post a message to a channel.
+
+        depends_on: optional task_keys this message task waits on (stored for /ready).
+        priority: 0-5, higher is preferred by claim_next when claimed later.
+        """
         body: dict = {"content": content, "kind": kind}
         if task_key:
             body["task_key"] = task_key
         if metadata:
             body["metadata"] = metadata
+        if depends_on:
+            body["depends_on"] = depends_on
+        if priority:
+            body["priority"] = priority
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/posts", body)
 
     def claim(self, channel: str, task_key: str, content: str,
@@ -520,8 +529,12 @@ class SwarloClient:
         while _time.monotonic() < deadline:
             posts = self.read(channel, limit=50)
             for p in posts:
-                if (p.get("task_key") == task_key
-                        and p.get("kind") in ("result", "failed")):
+                if p.get("task_key") != task_key:
+                    continue
+                kind = p.get("kind")
+                status = p.get("status")
+                # Match CLI wait-for: kind result/failed OR terminal status.
+                if kind in ("result", "failed") or status in ("done", "failed", "blocked"):
                     return p
             _time.sleep(poll_interval)
         raise SwarloError(408, {"detail": f"timed out after {timeout}s waiting for {task_key}"})
