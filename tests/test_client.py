@@ -470,6 +470,60 @@ class TestClientGitDAG:
             client.git_commit("deadbeef")
         assert exc.value.status_code == 404
 
+    def _make_bundle(self, tmpdir):
+        """Build a real two-commit git bundle; return (bundle_bytes, hash1, hash2)."""
+        import subprocess
+        run = lambda *a: subprocess.run(a, capture_output=True, check=True, text=True)
+        run("git", "init", tmpdir)
+        run("git", "-C", tmpdir, "config", "user.email", "t@t.com")
+        run("git", "-C", tmpdir, "config", "user.name", "T")
+        with open(os.path.join(tmpdir, "f.txt"), "w") as f:
+            f.write("hello")
+        run("git", "-C", tmpdir, "add", ".")
+        run("git", "-C", tmpdir, "commit", "-m", "first commit")
+        hash1 = run("git", "-C", tmpdir, "rev-parse", "HEAD").stdout.strip()
+        with open(os.path.join(tmpdir, "f.txt"), "w") as f:
+            f.write("world")
+        run("git", "-C", tmpdir, "add", ".")
+        run("git", "-C", tmpdir, "commit", "-m", "second commit")
+        hash2 = run("git", "-C", tmpdir, "rev-parse", "HEAD").stdout.strip()
+        branch = run("git", "-C", tmpdir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        bundle_path = os.path.join(tmpdir, "b.bundle")
+        run("git", "-C", tmpdir, "bundle", "create", bundle_path, branch)
+        with open(bundle_path, "rb") as f:
+            return f.read(), hash1, hash2
+
+    def test_git_push_fetch_diff_roundtrip(self, server):
+        client = SwarloClient(server, hub="gitdag-bin")
+        client.join("pusher-1", name="Pusher")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle, hash1, hash2 = self._make_bundle(tmpdir)
+
+        # push — server imports the bundle and returns the indexed tip hash
+        result = client.git_push(bundle)
+        assert hash2 in result["hashes"]
+
+        # the returned tip is queryable through the read wrappers too
+        assert client.git_commit(hash2)["message"] == "second commit"
+
+        # fetch — a valid bundle comes back as raw bytes
+        fetched = client.git_fetch(hash2)
+        assert isinstance(fetched, bytes) and len(fetched) > 0
+
+        # diff — both commit objects landed in the store, so a diff across
+        # them is available even though only the tip was indexed
+        diff = client.git_diff(hash1, hash2)
+        assert isinstance(diff, str)
+        assert "-hello" in diff and "+world" in diff
+
+    def test_git_fetch_missing_raises_404(self, server):
+        client = SwarloClient(server, hub="gitdag-bin-miss")
+        client.join("nobody2", name="Nobody")
+        with pytest.raises(SwarloError) as exc:
+            client.git_fetch("abc123def456")
+        assert exc.value.status_code == 404
+
 
 class TestSwarloError:
     """Tests for SwarloError message formatting."""

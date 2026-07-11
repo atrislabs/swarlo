@@ -69,6 +69,30 @@ class SwarloClient:
                 detail = {"error": body}
             raise SwarloError(err.code, detail) from None
 
+    def _request_bytes(self, method: str, path: str, data: bytes | None = None,
+                       content_type: str | None = None) -> bytes:
+        """Like _request but sends/returns raw bytes — for binary or plaintext
+        endpoints (git bundles, diffs) whose bodies aren't JSON. Errors still
+        carry a JSON detail when the server sends one."""
+        url = f"{self.server}{path}"
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if content_type:
+            headers["Content-Type"] = content_type
+
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as err:
+            body = err.read().decode()
+            try:
+                detail = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                detail = {"error": body}
+            raise SwarloError(err.code, detail) from None
+
     # ── Registration ──────────────────────────────────────────
 
     def join(self, member_id: str, member_type: str = "agent",
@@ -329,6 +353,28 @@ class SwarloClient:
         """Walk the ancestor chain from a commit back to root, newest first."""
         from urllib.parse import quote
         return self._request("GET", f"/api/{self.hub}/git/commits/{quote(commit_hash, safe='')}/lineage")
+
+    def git_push(self, bundle: bytes) -> dict:
+        """Upload a git bundle to the hub's shared DAG. Returns {'hashes': [...]}
+        for the commits it indexed. Raises SwarloError(413) if over 50MB."""
+        raw = self._request_bytes("POST", f"/api/{self.hub}/git/push",
+                                  data=bundle, content_type="application/octet-stream")
+        return json.loads(raw.decode()) if raw else {}
+
+    def git_fetch(self, commit_hash: str) -> bytes:
+        """Download the git bundle for a commit as raw bytes (feed to `git bundle`).
+        Raises SwarloError(404) if the commit isn't in the store."""
+        from urllib.parse import quote
+        return self._request_bytes("GET", f"/api/{self.hub}/git/fetch/{quote(commit_hash, safe='')}")
+
+    def git_diff(self, hash_a: str, hash_b: str) -> str:
+        """Get the plaintext diff between two commits in the shared DAG."""
+        from urllib.parse import quote
+        raw = self._request_bytes(
+            "GET",
+            f"/api/{self.hub}/git/diff/{quote(hash_a, safe='')}/{quote(hash_b, safe='')}",
+        )
+        return raw.decode()
 
     # ── Idle + Suggest ──────────────────────────────────────
 
