@@ -117,6 +117,22 @@ class TestPosts:
         resp = client.get("/api/atris/channels/general/posts?limit=999", headers=_auth(key))
         assert resp.status_code == 200
 
+    def test_negative_limit_does_not_bypass_cap(self, client):
+        """A negative limit must not reach SQLite as `LIMIT -n` (unbounded).
+
+        SQLite treats a negative LIMIT as no limit, so without a floor
+        ?limit=-1 would dump the entire channel past the 50-row cap.
+        """
+        key = _register(client)
+        h = _auth(key)
+        for i in range(3):
+            client.post("/api/atris/channels/general/posts", headers=h,
+                       json={"content": f"post {i}"})
+        resp = client.get("/api/atris/channels/general/posts?limit=-1", headers=h)
+        assert resp.status_code == 200
+        # Floored to 1, not unbounded: exactly one post comes back.
+        assert resp.json()["count"] == 1
+
 
 class TestClaims:
     def test_claim_succeeds(self, client):

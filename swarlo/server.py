@@ -226,7 +226,9 @@ async def list_channels(hub_id: str, request: Request):
 async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 10):
     """List recent posts in a channel, newest first."""
     _get_member(request)
-    posts = await get_backend().read_channel(hub_id, channel, limit=min(limit, 50))
+    # Floor at 1: a negative limit reaches SQLite as `LIMIT -n`, which SQLite
+    # treats as unbounded — returning the whole channel and bypassing the cap.
+    posts = await get_backend().read_channel(hub_id, channel, limit=max(1, min(limit, 50)))
     return {"channel": channel, "count": len(posts), "posts": [p.to_dict() for p in posts]}
 
 
@@ -881,7 +883,7 @@ async def replay_posts(
 async def get_summary(hub_id: str, request: Request, limit: int = 10):
     """Get a personalized summary of recent activity for the authenticated member."""
     member = _get_member(request)
-    text = await get_backend().summarize_for_member(hub_id, member.member_id, limit=min(limit, 50))
+    text = await get_backend().summarize_for_member(hub_id, member.member_id, limit=max(1, min(limit, 50)))
     return {"summary": text}
 
 
@@ -1516,7 +1518,7 @@ async def git_fetch(hub_id: str, hash: str, request: Request):
 async def git_list_commits(hub_id: str, request: Request, member_filter: Optional[str] = None, limit: int = 50):
     """List commits in the hub, optionally filtered by member."""
     _get_member(request)
-    return get_backend().list_commits(hub_id, member_id=member_filter, limit=min(limit, 200))
+    return get_backend().list_commits(hub_id, member_id=member_filter, limit=max(1, min(limit, 200)))
 
 
 @app.get("/api/{hub_id}/git/commits/{hash}")
