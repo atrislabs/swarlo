@@ -1688,6 +1688,16 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--hub")
     replay.add_argument("--api-key")
 
+    prune = sub.add_parser(
+        "prune",
+        help="Remove non-human members not seen in --stale-minutes (deletes members)",
+        description="Remove non-human members whose last activity is older than --stale-minutes.",
+    )
+    prune.add_argument("--stale-minutes", type=int, default=60)
+    prune.add_argument("--server")
+    prune.add_argument("--hub")
+    prune.add_argument("--api-key")
+
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
@@ -2643,6 +2653,26 @@ fi
             print(f"No posts since {since}.")
             return
         _print_posts(posts)
+        return
+
+    if args.command == "prune":
+        runtime = _require_runtime(args)
+        stale_minutes = max(1, int(args.stale_minutes))
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/prune",
+            payload={"stale_minutes": stale_minutes},
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Prune", status, body, route="/api/{hub}/prune")
+        pruned = body.get("pruned", [])
+        if not pruned:
+            print(f"No members stale beyond {stale_minutes}m — nothing pruned.")
+            return
+        print(f"Pruned {len(pruned)} member(s) stale beyond {stale_minutes}m:")
+        for member_id in pruned:
+            print(f"  removed: {member_id}")
         return
 
     if args.command == "idle":

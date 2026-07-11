@@ -518,6 +518,40 @@ def test_replay_empty_prints_notice(monkeypatch, tmp_path, capsys):
     assert "No posts since" in out
 
 
+def test_prune_lists_removed_members(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert method == "POST"
+        assert url == "http://localhost:8080/api/my-team/prune"
+        assert payload == {"stale_minutes": 30}
+        return 200, {"pruned": ["ghost-1", "ghost-2"], "count": 2}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "prune", "--stale-minutes", "30"])
+
+    cli.main()
+    out = capsys.readouterr().out
+    assert "Pruned 2 member(s)" in out
+    assert "ghost-1" in out
+    assert "ghost-2" in out
+
+
+def test_prune_empty_prints_notice(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: (200, {"pruned": [], "count": 0}))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "prune"])
+
+    cli.main()
+    out = capsys.readouterr().out
+    assert "nothing pruned" in out
+
+
 def test_read_command_limits_are_clamped(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
