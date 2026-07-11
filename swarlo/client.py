@@ -301,6 +301,35 @@ class SwarloClient:
         d = max(1, min(int(depth), 10))
         return self._request("GET", f"/api/{self.hub}/handoff_trail/{key}?depth={d}")
 
+    # ── Git DAG ─────────────────────────────────────────────
+
+    def git_commits(self, member_filter: str | None = None, limit: int = 50) -> list[dict]:
+        """List indexed commits in the hub's shared DAG, newest first."""
+        from urllib.parse import urlencode
+        query: dict[str, str | int] = {"limit": max(1, min(int(limit), 200))}
+        if member_filter:
+            query["member_filter"] = member_filter
+        return self._request("GET", f"/api/{self.hub}/git/commits?{urlencode(query)}")
+
+    def git_commit(self, commit_hash: str) -> dict:
+        """Get metadata for one commit by hash. Raises SwarloError(404) if unknown."""
+        from urllib.parse import quote
+        return self._request("GET", f"/api/{self.hub}/git/commits/{quote(commit_hash, safe='')}")
+
+    def git_children(self, commit_hash: str) -> list[dict]:
+        """List the direct child commits of a given commit hash."""
+        from urllib.parse import quote
+        return self._request("GET", f"/api/{self.hub}/git/commits/{quote(commit_hash, safe='')}/children")
+
+    def git_leaves(self) -> list[dict]:
+        """List leaf commits (tips with no children) in the shared DAG."""
+        return self._request("GET", f"/api/{self.hub}/git/leaves")
+
+    def git_lineage(self, commit_hash: str) -> list[dict]:
+        """Walk the ancestor chain from a commit back to root, newest first."""
+        from urllib.parse import quote
+        return self._request("GET", f"/api/{self.hub}/git/commits/{quote(commit_hash, safe='')}/lineage")
+
     # ── Idle + Suggest ──────────────────────────────────────
 
     def idle(self, idle_minutes: int = 15) -> dict:

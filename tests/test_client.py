@@ -421,6 +421,56 @@ class TestClientScore:
         assert trail["trail"][0]["from"] == "task:owned-u"
 
 
+class TestClientGitDAG:
+    """Client wrappers over the shared git commit DAG (read side)."""
+
+    def test_git_dag_read_methods(self, server):
+        from swarlo.server import get_backend
+
+        hub = "gitdag-hub"
+        client = SwarloClient(server, hub=hub)
+        client.join("committer-1", name="Committer")
+
+        # Index a small chain: root -> mid -> tip, plus a sibling leaf off root.
+        be = get_backend()
+        be.index_commit(hub, "hroot", "", "committer-1", "Committer", "root commit")
+        be.index_commit(hub, "hmid", "hroot", "committer-1", "Committer", "middle commit")
+        be.index_commit(hub, "htip", "hmid", "committer-1", "Committer", "tip commit")
+        be.index_commit(hub, "hsib", "hroot", "committer-1", "Committer", "sibling commit")
+
+        # list — newest first, all four present
+        commits = client.git_commits()
+        hashes = [c["hash"] for c in commits]
+        assert {"hroot", "hmid", "htip", "hsib"}.issubset(set(hashes))
+
+        # single commit metadata
+        mid = client.git_commit("hmid")
+        assert mid["parent_hash"] == "hroot"
+        assert mid["message"] == "middle commit"
+
+        # children of root are mid + sibling (not tip)
+        child_hashes = {c["hash"] for c in client.git_children("hroot")}
+        assert child_hashes == {"hmid", "hsib"}
+
+        # leaves are the tips with no children: tip and sibling
+        leaf_hashes = {c["hash"] for c in client.git_leaves()}
+        assert {"htip", "hsib"}.issubset(leaf_hashes)
+        assert "hroot" not in leaf_hashes and "hmid" not in leaf_hashes
+
+        # lineage from tip walks back to root
+        lineage_hashes = [c["hash"] for c in client.git_lineage("htip")]
+        assert lineage_hashes[0] == "htip"
+        assert lineage_hashes[-1] == "hroot"
+        assert "hmid" in lineage_hashes
+
+    def test_git_commit_missing_raises_404(self, server):
+        client = SwarloClient(server, hub="gitdag-miss")
+        client.join("nobody", name="Nobody")
+        with pytest.raises(SwarloError) as exc:
+            client.git_commit("deadbeef")
+        assert exc.value.status_code == 404
+
+
 class TestSwarloError:
     """Tests for SwarloError message formatting."""
 
