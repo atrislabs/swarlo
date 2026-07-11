@@ -661,10 +661,13 @@ async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
                 except Exception:
                     pass
 
-    # Keep non-zero scores, sort descending, take top N
+    # Keep non-zero scores, sort descending, take top N.
+    # Floor the slice at 1: body.limit is unconstrained, and a negative value
+    # makes scored[:body.limit] a from-the-end slice (e.g. -5 drops the 5
+    # LOWEST-scored and returns everything else) — the opposite of "top N".
     scored = [(s, r) for s, r in zip(scores, rows) if s > 0]
     scored.sort(key=lambda x: -x[0])
-    top = scored[: body.limit]
+    top = scored[: max(1, body.limit)]
 
     return {
         "task": body.task,

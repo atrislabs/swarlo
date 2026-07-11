@@ -891,6 +891,22 @@ class TestBriefing:
         assert "count" in data
         assert "extracted_keywords" in data
 
+    def test_briefing_negative_limit_does_not_invert_top_n(self, client):
+        """A negative limit must floor to a real top-N, not a from-the-end slice.
+
+        With three equally-relevant posts, scored[:-1] would return two (all
+        but the lowest); the floor makes it return exactly one.
+        """
+        key = _register(client, "briefer2", "Briefer2")
+        h = _auth(key)
+        for i in range(3):
+            client.post("/api/atris/channels/general/posts", headers=h,
+                       json={"content": "database migration rollback plan"})
+        resp = client.post("/api/atris/briefing", headers=h,
+                          json={"task": "database migration rollback", "limit": -1})
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 1
+
     def test_briefing_requires_auth(self, client):
         resp = client.post("/api/atris/briefing", json={"task": "Some task"})
         assert resp.status_code == 401
