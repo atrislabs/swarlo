@@ -4069,3 +4069,98 @@ def test_unclaimed_404_hints_server_upgrade(monkeypatch, tmp_path, capsys):
     assert "404" in msg
     assert "unclaimed" in msg
     assert "restart" in msg.lower() or "upgrade" in msg.lower()
+
+
+def test_ready_prints_dep_satisfied_tasks(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+        "member_id": "agent-a",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert method == "GET"
+        assert "/ready/agent-a" in url
+        return 200, {
+            "member_id": "agent-a",
+            "count": 1,
+            "tasks": [{
+                "task_key": "T2",
+                "content": "downstream work",
+                "depends_on": ["T1"],
+            }],
+        }
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "ready"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "READY: T2" in out
+    assert "deps=T1" in out
+
+
+def test_briefing_prints_ranked_posts(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert method == "POST"
+        assert url.endswith("/briefing")
+        assert payload["task"] == "fix login"
+        return 200, {
+            "task": "fix login",
+            "scorer": "tfidf",
+            "posts": [{"score": 0.91, "kind": "message", "content": "auth bug notes"}],
+        }
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "briefing", "fix login"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "Briefing for: fix login" in out
+    assert "auth bug notes" in out
+    assert "0.910" in out
+
+
+def test_members_and_channels_print(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        if url.endswith("/members"):
+            return 200, {"count": 1, "members": [{
+                "member_id": "a1", "member_name": "A", "member_type": "agent",
+                "last_seen": "2026-07-11T00:00:00+00:00",
+            }]}
+        if url.endswith("/channels"):
+            return 200, {"channels": ["general", "ops"]}
+        if "/summary" in url:
+            return 200, {"summary": "Board is quiet."}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+
+    monkeypatch.setattr(sys, "argv", ["swarlo", "members"])
+    cli.main()
+    assert "a1" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["swarlo", "channels"])
+    cli.main()
+    assert "#general" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["swarlo", "summary"])
+    cli.main()
+    assert "Board is quiet." in capsys.readouterr().out

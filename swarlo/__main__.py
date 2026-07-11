@@ -218,6 +218,11 @@ def _require_runtime(args, *, auth: bool = True, hub: bool = True) -> dict:
         "server": getattr(args, "server", None) or os.getenv("SWARLO_SERVER") or config.get("server"),
         "api_key": getattr(args, "api_key", None) or os.getenv("SWARLO_API_KEY") or config.get("api_key"),
         "hub": getattr(args, "hub", None) or os.getenv("SWARLO_HUB") or config.get("hub"),
+        "member_id": (
+            getattr(args, "member_id", None)
+            or os.getenv("SWARLO_MEMBER_ID")
+            or config.get("member_id")
+        ),
     }
 
     if not runtime["server"]:
@@ -1581,6 +1586,56 @@ def _build_parser() -> argparse.ArgumentParser:
     mine.add_argument("--hub")
     mine.add_argument("--api-key")
 
+    ready = sub.add_parser(
+        "ready",
+        help="Tasks assigned to me whose depends_on are all done",
+        description="Subset of /mine that can be claimed right now (deps satisfied).",
+    )
+    ready.add_argument("--member-id", help="Override member ID")
+    ready.add_argument("--server")
+    ready.add_argument("--hub")
+    ready.add_argument("--api-key")
+
+    briefing = sub.add_parser(
+        "briefing",
+        help="Rank board posts by relevance to a task description",
+        description="Task-guided board briefing (tfidf or regex scorer).",
+    )
+    briefing.add_argument("task", help="Task description to rank posts against")
+    briefing.add_argument("--limit", type=int, default=15)
+    briefing.add_argument("--scorer", choices=("tfidf", "regex"), default="tfidf")
+    briefing.add_argument("--server")
+    briefing.add_argument("--hub")
+    briefing.add_argument("--api-key")
+
+    summary = sub.add_parser(
+        "summary",
+        help="Print a plain-language board summary",
+        description="Formatted hub summary (posts + open claims).",
+    )
+    summary.add_argument("--limit", type=int, default=10)
+    summary.add_argument("--server")
+    summary.add_argument("--hub")
+    summary.add_argument("--api-key")
+
+    members = sub.add_parser(
+        "members",
+        help="List hub members",
+        description="List registered members in the hub.",
+    )
+    members.add_argument("--server")
+    members.add_argument("--hub")
+    members.add_argument("--api-key")
+
+    channels = sub.add_parser(
+        "channels",
+        help="List hub channels",
+        description="List available channels in the hub.",
+    )
+    channels.add_argument("--server")
+    channels.add_argument("--hub")
+    channels.add_argument("--api-key")
+
     handoff = sub.add_parser(
         "handoff",
         help="Show upstream handoff trail for a task (deps + their decisions/artifacts)",
@@ -2504,7 +2559,7 @@ fi
         member_id = args.member_id or runtime.get("member_id", "unknown")
         status, body = _request(
             "GET",
-            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/mine/{member_id}",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/mine/{urllib.parse.quote(member_id, safe='')}",
             api_key=runtime["api_key"],
         )
         if status != 200:
@@ -2516,6 +2571,115 @@ fi
             print("No open work. Find something to do.")
         for a in body.get("assignments", []):
             print(f"  ASSIGNED: {a['task_key']} by {a.get('assigned_by','?')} — {a['content'][:60]}")
+        return
+
+    if args.command == "ready":
+        runtime = _require_runtime(args)
+        member_id = args.member_id or runtime.get("member_id")
+        if not member_id:
+            raise SystemExit("ready needs --member-id or a joined config member_id")
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/ready/"
+            f"{urllib.parse.quote(member_id, safe='')}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Ready", status, body, route="/api/{hub}/ready/{member_id}")
+        tasks = body.get("tasks") or []
+        if not tasks:
+            print("No ready tasks (deps not met or queue empty).")
+            return
+        print(f"{body.get('count', len(tasks))} ready task(s) for {member_id}:")
+        for t in tasks:
+            deps = t.get("depends_on") or []
+            dep_s = f" deps={','.join(deps)}" if deps else ""
+            print(f"  READY: {t.get('task_key')} — {(t.get('content') or '')[:60]}{dep_s}")
+        return
+
+    if args.command == "briefing":
+        runtime = _require_runtime(args)
+        task = (args.task or "").strip()
+        if not task:
+            raise SystemExit("briefing needs a task description")
+        limit = _bounded_limit(args.limit, default=15)
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/briefing",
+            {"task": task, "limit": limit, "scorer": args.scorer},
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Briefing", status, body, route="/api/{hub}/briefing")
+        posts = body.get("posts") or body.get("results") or []
+        if not posts:
+            print("No ranked posts.")
+            return
+        print(f"Briefing for: {task[:80]}  (scorer={body.get('scorer', args.scorer)})")
+        for i, post in enumerate(posts, start=1):
+            score = post.get("score")
+            score_s = f" score={score:.3f}" if isinstance(score, (int, float)) else ""
+            key = post.get("task_key") or ""
+            key_s = f" {key}" if key else ""
+            print(
+                f"  {i:>2}.{score_s}{key_s} "
+                f"[{post.get('kind', '?')}] {(post.get('content') or '')[:70]}"
+            )
+        return
+
+    if args.command == "summary":
+        runtime = _require_runtime(args)
+        limit = _bounded_limit(args.limit, default=10)
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/summary?limit={limit}",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Summary", status, body, route="/api/{hub}/summary")
+        text = body.get("summary") or ""
+        if not text:
+            print("Empty summary.")
+            return
+        print(text)
+        return
+
+    if args.command == "members":
+        runtime = _require_runtime(args)
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/members",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Members", status, body, route="/api/{hub}/members")
+        rows = body.get("members") or []
+        if not rows:
+            print("No members.")
+            return
+        print(f"{body.get('count', len(rows))} member(s):")
+        for m in rows:
+            print(
+                f"  {m.get('member_id')}  {m.get('member_name')}  "
+                f"type={m.get('member_type')}  last_seen={m.get('last_seen')}"
+            )
+        return
+
+    if args.command == "channels":
+        runtime = _require_runtime(args)
+        status, body = _request(
+            "GET",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels",
+            api_key=runtime["api_key"],
+        )
+        if status != 200:
+            _raise_http_failure("Channels", status, body, route="/api/{hub}/channels")
+        rows = body.get("channels") or []
+        if not rows:
+            print("No channels.")
+            return
+        for ch in rows:
+            print(f"  #{ch}" if not str(ch).startswith("#") else f"  {ch}")
         return
 
     if args.command == "ping":
