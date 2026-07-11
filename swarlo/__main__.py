@@ -1547,6 +1547,19 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--hub")
     report.add_argument("--api-key")
 
+    assign = sub.add_parser("assign", help="Push-assign a task to another member")
+    assign.add_argument("channel")
+    assign.add_argument("task_key")
+    assign.add_argument("assignee_id")
+    assign.add_argument("content")
+    assign.add_argument("--priority", type=int, default=0,
+                        help="0-5, higher is claimed first by claim-next")
+    assign.add_argument("--depends-on", default=None,
+                        help="comma-separated task keys this assignment waits on")
+    assign.add_argument("--server")
+    assign.add_argument("--hub")
+    assign.add_argument("--api-key")
+
     ping = sub.add_parser("ping", help="Lightweight check: anything new?")
     ping.add_argument("--member-id", help="Override member ID")
     ping.add_argument("--since", help="ISO timestamp watermark")
@@ -2401,6 +2414,33 @@ fi
         if status not in (200, 201):
             raise SystemExit(f"Report failed ({status}): {body}")
         print(f"Reported {args.status} for {args.task_key} on #{args.channel}")
+        return
+
+    if args.command == "assign":
+        runtime = _require_runtime(args)
+        channel = urllib.parse.quote(args.channel, safe="")
+        payload = {
+            "task_key": args.task_key,
+            "assignee_id": args.assignee_id,
+            "content": args.content,
+        }
+        if args.priority:
+            payload["priority"] = args.priority
+        if args.depends_on:
+            payload["depends_on"] = [
+                d.strip() for d in args.depends_on.split(",") if d.strip()
+            ]
+        status, body = _request(
+            "POST",
+            f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/{channel}/assign",
+            payload,
+            api_key=runtime["api_key"],
+        )
+        if status == 409:
+            raise SystemExit(f"Assign conflict: {body}")
+        if status not in (200, 201):
+            raise SystemExit(f"Assign failed ({status}): {body}")
+        print(f"Assigned {args.task_key} to {args.assignee_id} on #{args.channel}")
         return
 
     if args.command == "mine":

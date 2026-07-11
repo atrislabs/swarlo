@@ -243,6 +243,45 @@ def test_claim_uses_saved_runtime(monkeypatch, tmp_path, capsys):
     assert "Claimed task:1" in capsys.readouterr().out
 
 
+def test_assign_uses_saved_runtime(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called.update({"method": method, "url": url, "payload": payload, "api_key": api_key})
+        return 201, {"claimed": True}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", [
+        "swarlo", "assign", "ops lane", "task:1", "executor", "Please do the thing",
+        "--priority", "3", "--depends-on", "task:a, task:b",
+    ])
+
+    cli.main()
+    assert called["url"] == "http://localhost:8080/api/my-team/channels/ops%20lane/assign"
+    assert called["payload"]["task_key"] == "task:1"
+    assert called["payload"]["assignee_id"] == "executor"
+    assert called["payload"]["priority"] == 3
+    assert called["payload"]["depends_on"] == ["task:a", "task:b"]
+    assert called["api_key"] == "secret"
+    assert "Assigned task:1 to executor" in capsys.readouterr().out
+
+
+def test_assign_conflict_exits(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: (409, {"detail": "taken"}))
+    monkeypatch.setattr(sys, "argv", ["swarlo", "assign", "general", "task:1", "executor", "do it"])
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
 def test_read_prints_posts(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))
