@@ -3720,3 +3720,44 @@ def test_doctor_warns_on_missing_liveness_columns(monkeypatch, tmp_path, capsys)
     assert exit_code == 1  # server still unreachable
     assert "liveness columns" in out
     assert "last_seen" in out
+
+
+def test_http_failure_message_hints_on_route_404():
+    msg = cli._http_failure_message(
+        "Unclaimed",
+        404,
+        {"detail": "Not Found"},
+        route="/api/{hub}/unclaimed",
+    )
+    assert "Unclaimed failed (404)" in msg
+    assert "missing /api/{hub}/unclaimed" in msg
+    assert "restart" in msg.lower() or "upgrade" in msg.lower()
+
+
+def test_http_failure_message_plain_for_non_404():
+    msg = cli._http_failure_message("XP", 500, {"detail": "boom"}, route="/api/{hub}/xp")
+    assert msg == "XP failed (500): {'detail': 'boom'}"
+    assert "missing" not in msg
+
+
+def test_unclaimed_404_hints_server_upgrade(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        return 404, {"detail": "Not Found"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "unclaimed"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    msg = str(exc_info.value)
+    assert "404" in msg
+    assert "unclaimed" in msg
+    assert "restart" in msg.lower() or "upgrade" in msg.lower()

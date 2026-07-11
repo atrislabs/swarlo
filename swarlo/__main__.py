@@ -187,6 +187,31 @@ def _request(method: str, url: str, payload: dict | None = None, api_key: str | 
         return err.code, payload
 
 
+# Routes the CLI needs that older hubs may not have mounted yet.
+_CLI_SERVER_ROUTES = (
+    ("GET", "/api/{hub}/unclaimed"),
+    ("GET", "/api/{hub}/xp"),
+    ("GET", "/api/{hub}/scores"),
+    ("GET", "/api/{hub}/handoff_trail/{task_key}"),
+)
+
+
+def _http_failure_message(label: str, status: int, body: dict, *, route: str | None = None) -> str:
+    """Human failure line. 404 on a known route → upgrade/restart hint."""
+    base = f"{label} failed ({status}): {body}"
+    if status != 404 or not route:
+        return base
+    return (
+        f"{base}\n"
+        f"  server is missing {route} — restart `swarlo serve` with a package that mounts it "
+        f"(or upgrade swarlo). CLI and hub are out of sync."
+    )
+
+
+def _raise_http_failure(label: str, status: int, body: dict, *, route: str | None = None) -> None:
+    raise SystemExit(_http_failure_message(label, status, body, route=route))
+
+
 def _require_runtime(args, *, auth: bool = True, hub: bool = True) -> dict:
     config = _load_config()
     runtime = {
@@ -1927,6 +1952,44 @@ def _run_doctor() -> int:
             _check(f"local DB liveness columns at {resolved}", "ok",
                    "last_seen, last_active present", colors)
 
+    # Check 9: live server OpenAPI advertises CLI-critical routes.
+    # A healthy /api/health is not enough if the hub is an older package.
+    if server_ok and server:
+        try:
+            with urllib.request.urlopen(
+                f"{server.rstrip('/')}/openapi.json", timeout=3
+            ) as resp:
+                openapi = json.loads(resp.read().decode())
+            path_keys = set((openapi.get("paths") or {}).keys())
+            missing_routes = []
+            for needle, label in (
+                ("/unclaimed", "GET /api/{hub}/unclaimed"),
+                ("/xp", "GET /api/{hub}/xp"),
+                ("/scores", "GET /api/{hub}/scores"),
+                ("/handoff_trail/", "GET /api/{hub}/handoff_trail/{task_key}"),
+            ):
+                if not any(needle in p for p in path_keys):
+                    missing_routes.append(label)
+            if missing_routes:
+                _check(
+                    "server API surface for CLI",
+                    "warn",
+                    "missing "
+                    + ", ".join(missing_routes)
+                    + " — restart hub with current swarlo",
+                    colors,
+                )
+            else:
+                _check(
+                    "server API surface for CLI",
+                    "ok",
+                    "unclaimed, xp, scores, handoff_trail present",
+                    colors,
+                )
+        except Exception as exc:
+            _check("server API surface for CLI", "warn",
+                   f"could not read openapi.json: {exc}", colors)
+
     print()
     if any_fail:
         print(f"  {colors['fail']}At least one check failed.{colors['reset']} "
@@ -2361,7 +2424,12 @@ fi
             api_key=runtime["api_key"],
         )
         if status != 200:
-            raise SystemExit(f"Handoff trail failed ({status}): {body}")
+            _raise_http_failure(
+                "Handoff trail",
+                status,
+                body,
+                route=f"/api/{{hub}}/handoff_trail/{args.task_key}",
+            )
         if args.json:
             print(json.dumps(body, indent=2))
             return
@@ -2443,7 +2511,12 @@ fi
             api_key=runtime["api_key"],
         )
         if status != 200:
-            raise SystemExit(f"Score history failed ({status}): {body}")
+            _raise_http_failure(
+                "Score history",
+                status,
+                body,
+                route="/api/{hub}/scores",
+            )
         rows = body.get("scores") or []
         if not rows:
             print("No score history.")
@@ -2481,7 +2554,7 @@ fi
             api_key=runtime["api_key"],
         )
         if status != 200:
-            raise SystemExit(f"XP failed ({status}): {body}")
+            _raise_http_failure("XP", status, body, route="/api/{hub}/xp")
         rows = body.get("per_agent_xp") or []
         rows = rows[:limit]
         if not rows:
@@ -2521,7 +2594,12 @@ fi
             api_key=runtime["api_key"],
         )
         if status != 200:
-            raise SystemExit(f"Unclaimed failed ({status}): {body}")
+            _raise_http_failure(
+                "Unclaimed",
+                status,
+                body,
+                route="/api/{hub}/unclaimed",
+            )
         rows = (body.get("tasks") or [])[:limit]
         if not rows:
             print("No unclaimed tasks.")

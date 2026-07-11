@@ -247,6 +247,33 @@ class SwarloClient:
         """Compute and store coordination score for the hub."""
         return self._request("POST", f"/api/{self.hub}/score")
 
+    def scores(self, limit: int = 10) -> dict:
+        """Persisted coordination score history."""
+        return self._request("GET", f"/api/{self.hub}/scores?limit={max(1, min(int(limit), 500))}")
+
+    def xp(self, limit: int = 20, member_id: str | None = None) -> dict:
+        """Per-agent XP leaderboard."""
+        query = f"limit={max(1, min(int(limit), 500))}"
+        if member_id:
+            from urllib.parse import quote
+            query += f"&member_id={quote(member_id, safe='')}"
+        return self._request("GET", f"/api/{self.hub}/xp?{query}")
+
+    def unclaimed(self, limit: int = 20, channel: str | None = None) -> dict:
+        """Message tasks that still need an owner."""
+        from urllib.parse import urlencode
+        query: dict[str, str | int] = {"limit": max(1, min(int(limit), 500))}
+        if channel:
+            query["channel"] = channel
+        return self._request("GET", f"/api/{self.hub}/unclaimed?{urlencode(query)}")
+
+    def handoff_trail(self, task_key: str, depth: int = 3) -> dict:
+        """Walk depends_on backward from task_key (BFS)."""
+        from urllib.parse import quote
+        key = quote(task_key, safe="")
+        d = max(1, min(int(depth), 10))
+        return self._request("GET", f"/api/{self.hub}/handoff_trail/{key}?depth={d}")
+
     # ── Idle + Suggest ──────────────────────────────────────
 
     def idle(self, idle_minutes: int = 15) -> dict:

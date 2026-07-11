@@ -349,6 +349,38 @@ class TestClientScore:
         result = client.score()
         assert result.get("tasks_shipped", 0) >= 1
 
+    def test_scores_xp_unclaimed_handoff_trail(self, server):
+        client = SwarloClient(server, hub="score3")
+        client.join("surface", name="Surface")
+
+        client.post("ops", "ownerless work", task_key="task:open-u")
+        client.post("ops", "owned work", task_key="task:owned-u")
+        client.claim("ops", "task:owned-u", "claiming")
+        client.report("ops", "task:owned-u", "done", "done", metadata={
+            "handoff": {"artifacts": ["a.py"], "decisions": [], "open_questions": []},
+        })
+        client.post("ops", "depends", task_key="task:dep-u")
+        client.claim("ops", "task:dep-u", "claim dep", depends_on=["task:owned-u"])
+
+        client.score()
+        hist = client.scores(limit=5)
+        assert "scores" in hist
+        assert hist["count"] >= 1
+
+        board = client.xp(limit=5)
+        assert "per_agent_xp" in board
+        assert board["count"] >= 1
+
+        open_tasks = client.unclaimed(limit=10)
+        keys = {t["task_key"] for t in open_tasks.get("tasks") or []}
+        assert "task:open-u" in keys
+        assert "task:owned-u" not in keys
+
+        trail = client.handoff_trail("task:dep-u", depth=3)
+        assert trail["task_key"] == "task:dep-u"
+        assert trail["count"] >= 1
+        assert trail["trail"][0]["from"] == "task:owned-u"
+
 
 class TestSwarloError:
     """Tests for SwarloError message formatting."""
