@@ -5,11 +5,10 @@ Runs as a daemon. Writes to ~/.swarlo/monitor.log.
 Check it anytime: tail -50 ~/.swarlo/monitor.log
 """
 
-import json
 import time
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

@@ -42,12 +42,6 @@ from swarlo.sqlite_backend import SQLiteBackend  # noqa: E402
 # weak vocabulary with the task. Pass-1 produces a flat score
 # distribution where top-k bleeds into the noise floor — the case where
 # naive PRF drifts and a gate should block looping.
-ADVERSARIAL_TASK = (
-    "I'm debugging the self-improvement loop. Users report proposals "
-    "are getting dropped under load. I think there's an auth or "
-    "quota problem in the improvement endpoint. Pull up anything "
-    "the team has learned about this."
-)
 ADVERSARIAL_RELEVANT = [
     "Got a 403 on the quota endpoint last night — traced to a missing member check.",
     "The improvement router was dropping requests silently when the agent_id was numeric.",
@@ -76,10 +70,6 @@ CLEAN_RELEVANT = [
     "Wallet transaction rebuild landed for stale blockhash on Solana devnet.",
     "Jupiter swap route was swallowing a devnet blockhash expiry silently.",
 ]
-
-# Alias kept for the current seed_board signature — points at the
-# adversarial templates by default.
-RELEVANT_TEMPLATES = ADVERSARIAL_RELEVANT
 
 # Distractors are plausible engineering chatter on the same board.
 # Some mention credits/auth/latency too — so keyword matching isn't enough.
@@ -223,7 +213,7 @@ def run_bench(n_total: int, k_relevant: int, iters: int, seed: int, mode: str = 
     try:
         hub = "bench"
         client = SwarloClient(base, hub=hub)
-        key = client.join("bencher", name="Bencher")
+        client.join("bencher", name="Bencher")
 
         metrics_by_scorer: dict[str, list[dict]] = {"random": [], "regex": [], "tfidf": [], "prf": [], "prf_gated": []}
         for i in range(iters):
