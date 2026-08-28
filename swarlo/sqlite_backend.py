@@ -8,7 +8,6 @@ import threading
 import uuid
 import weakref
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 from .backend import SwarloBackend
@@ -585,7 +584,7 @@ class SQLiteBackend(SwarloBackend):
         # Claim succeeded — post the visible assignment message.
         # assignee_id is passed as a first-class column so /ping can find it
         # without json_extract gymnastics.
-        assign_post = await self.create_post(
+        await self.create_post(
             hub_id, assigner, channel, f"Assigned {task_key} to @{assignee.member_name}: {content}",
             kind="assign", task_key=task_key,
             metadata={"assignee_id": assignee_id, "claim_post_id": result.post_id},
