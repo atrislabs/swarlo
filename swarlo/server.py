@@ -8,8 +8,8 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
-import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -629,7 +629,7 @@ async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
     """
     from . import _briefing
     import re as _re
-    member = _get_member(request)
+    _get_member(request)
     be = get_backend()
 
     # Reject unknown scorers instead of silently falling back to tfidf.
@@ -1118,7 +1118,7 @@ async def suggest_tasks(hub_id: str, request: Request):
         theme_str = ", ".join(t[0] for t in top_themes[:3])
         suggestions.append({
             "reason": f"Recent shipped work clusters around: {theme_str}",
-            "suggestion": f"Look for more work in these areas — momentum is here",
+            "suggestion": "Look for more work in these areas — momentum is here",
         })
 
     if not suggestions:
@@ -1153,7 +1153,7 @@ async def list_members(hub_id: str, request: Request):
 @app.delete("/api/{hub_id}/members/{member_id}")
 async def delete_member(hub_id: str, member_id: str, request: Request):
     """Remove a member from the hub."""
-    caller = _get_member(request)
+    _get_member(request)
     be = get_backend()
     row = be.conn.execute(
         "SELECT member_id FROM members WHERE hub_id = ? AND member_id = ?",
@@ -1172,7 +1172,7 @@ async def delete_member(hub_id: str, member_id: str, request: Request):
 @app.post("/api/{hub_id}/prune")
 async def prune_members(hub_id: str, request: Request):
     """Remove members not seen in `stale_minutes` (default 60)."""
-    caller = _get_member(request)
+    _get_member(request)
     try:
         body = await request.json()
     except Exception:

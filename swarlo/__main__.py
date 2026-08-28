@@ -235,15 +235,6 @@ def _request_bytes(
         return err.code, payload
 
 
-# Routes the CLI needs that older hubs may not have mounted yet.
-_CLI_SERVER_ROUTES = (
-    ("GET", "/api/{hub}/unclaimed"),
-    ("GET", "/api/{hub}/xp"),
-    ("GET", "/api/{hub}/scores"),
-    ("GET", "/api/{hub}/handoff_trail/{task_key}"),
-)
-
-
 def _http_failure_message(label: str, status: int, body: dict, *, route: str | None = None) -> str:
     """Human failure line. 404 on a known route → upgrade/restart hint."""
     base = f"{label} failed ({status}): {body}"
@@ -2035,7 +2026,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("idle", help="Find idle agents").add_argument("--server")
     sub.add_parser("suggest", help="Auto-generate task suggestions").add_argument("--server")
 
-    init = sub.add_parser("init", help="Enable Swarlo for this repo")
+    sub.add_parser("init", help="Enable Swarlo for this repo")
 
     install_hook = sub.add_parser(
         "install-hook",
