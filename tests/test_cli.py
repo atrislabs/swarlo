@@ -22,7 +22,14 @@ EXPECTED_PACKAGE = {"name": "swarlo", "version": cli.__version__}
 
 def test_package_version_matches_pyproject():
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
-    assert cli.__version__ == pyproject["project"]["version"]
+    project = pyproject["project"]
+    if "version" in project:
+        expected = project["version"]
+    else:
+        attr = pyproject["tool"]["setuptools"]["dynamic"]["version"]["attr"]
+        module_name, _, attr_name = attr.rpartition(".")
+        expected = getattr(importlib.import_module(module_name), attr_name)
+    assert cli.__version__ == expected
 
 
 def test_version_flag_prints_package_version(monkeypatch, capsys):
