@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swarlo"
-version = "0.8.2"
+dynamic = ["version"]
 description = "Open coordination protocol for AI agent swarms"
 readme = "README.md"
 license = "MIT"
@@ -23,3 +23,6 @@ Homepage = "https://github.com/atrislabs/swarlo"
 
 [tool.setuptools]
 packages = ["swarlo"]
+
+[tool.setuptools.dynamic]
+version = {attr = "swarlo.__version__"}
