@@ -10,6 +10,7 @@ from swarlo.gc import (
     archive_posts,
     drop_idle_members,
     keep_backups,
+    prune_hub,
     record_run,
     rotate_logs,
     start_schedule,
@@ -409,3 +410,43 @@ def test_vacuum_frees_pages_and_keeps_rows(live):
         assert c.execute("PRAGMA freelist_count").fetchone()[0] == 0
     wal = live.with_name(live.name + "-wal")
     assert not wal.exists() or wal.stat().st_size == 0
+
+
+def test_prune_hub_runs_every_step_and_returns_counts(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "atris.db"
+    backend = SQLiteBackend(str(db))
+    backend.conn
+    backend.close()
+    _post(db, "old", _ago(40), hub="atris")
+    _post(db, "new", _ago(1), hub="atris")
+    with sqlite3.connect(db) as c:
+        c.execute(
+            "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, "
+            "avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, computed_at) "
+            "VALUES ('atris', 0, 0, 0, 0, 0, 0, 0, ?)",
+            (_ago(10),),
+        )
+        c.execute(
+            "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen) "
+            "VALUES ('idle', 'atris', 'agent', 'x', '2026-01-01T00:00:00', ?)",
+            (_ago(31),),
+        )
+    (home / "big.log").write_bytes(b"x" * (11 * MB))
+    for i in range(5):
+        b = home / f"atris.db.backup-{i}"
+        b.write_bytes(b"b")
+        os.utime(b, (i, i))
+
+    counts = prune_hub(home)
+
+    assert counts["posts_archived"] == 1
+    assert counts["scores_trimmed"] == 1
+    assert counts["members_dropped"] == 1
+    assert counts["logs_rotated"] == 1
+    assert counts["backups_removed"] == 2
+    assert counts["pages_freed"] >= 0
+    assert _ids(db, "posts", "post_id") == {"new"}
+    assert len(list((home / "archive").glob("atris-*.db"))) == 1
+    json.dumps(counts)

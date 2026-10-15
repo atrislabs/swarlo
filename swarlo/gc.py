@@ -44,6 +44,12 @@ keep_backups(home, keep=3)
 
 rotate_logs and keep_backups return the paths they acted on.
 
+prune_hub(home, hub="atris")
+    One full prune of ``home/atris.db`` and ``home``: archive_posts (into
+    ``home/archive``), trim_scores, drop_idle_members, rotate_logs,
+    keep_backups, vacuum, in that order. Returns a dict of counts, ready to
+    hand to record_run or start_schedule.
+
 Run log and daily schedule for the swarlo pruner.
 
 record_run(home, trigger, ok, mb_before=None, **counts)
@@ -264,6 +270,19 @@ def keep_backups(home, keep: int = 3) -> list[Path]:
             p.unlink()
         removed += doomed
     return removed
+
+
+def prune_hub(home, hub: str = "atris") -> dict:
+    home = Path(home)
+    db = home / "atris.db"
+    return {
+        "posts_archived": sum(archive_posts(db, home / "archive", hub).values()),
+        "scores_trimmed": trim_scores(db, hub),
+        "members_dropped": len(drop_idle_members(db, hub)),
+        "logs_rotated": len(rotate_logs(home)),
+        "backups_removed": len(keep_backups(home)),
+        "pages_freed": vacuum(db),
+    }
 
 
 LOG_NAME = "prune.jsonl"
