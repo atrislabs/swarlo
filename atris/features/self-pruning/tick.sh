@@ -1,5 +1,6 @@
 #!/bin/bash
 # One Self-Pruning heartbeat. Skips if a run is still going. Budget caps the spend.
+# One mission at a time: parallel missions share this checkout and stop each other mid-edit.
 set -u
 ROOT="$HOME/arena/empire/swarlo"
 CLI="$HOME/arena/empire/atris-cli-campaign/bin/atris.js"
@@ -11,4 +12,4 @@ mkdir "$LOCK" 2>/dev/null || { echo "$(date '+%F %T') skip: a run is still going
 trap 'rmdir "$LOCK"' EXIT
 cd "$ROOT" || exit 1
 echo "$(date '+%F %T') heartbeat" >> "$LOG"
-node "$CLI" campaign run cmp-self-pruning --parallel 2 --max-steps 3 --max-ticks 3 >> "$LOG" 2>&1
+node "$CLI" campaign run cmp-self-pruning --parallel 1 --max-steps 3 --max-ticks 3 >> "$LOG" 2>&1
