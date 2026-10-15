@@ -45,6 +45,14 @@ The executor has an uncommitted change to `swarlo/sqlite_backend.py`. It folds a
 - The rule's 18 tests pass (`pytest -q tests/test_repeat_fold.py`) on the system `python3` and on both `atrisos-backend` virtual environments. The executor's last log entry said they were blocked on "No module named pytest"; that no longer reproduces.
 - Not done here, and it needs the executor or Keshav: commit the change and restart the local hub. Old rows stay in the 24h window until they age out, so the judge's live number falls over the next day rather than all at once.
 
+### Update ~11:50Z: committed, but the live hub isn't running it yet
+
+- The fold was committed as `1f97c56` at 2026-10-15 04:47:15 -0700 (11:47Z).
+- The live hub (`swarlo serve --port 8090 --db ~/.swarlo/atris.db`) started at **03:44:55 local**, about an hour *before* that commit (from `ps -eo pid,lstart,command`).
+- The hub runs from `atrisos-backend/venv`, which installs swarlo in editable mode from this checkout (`direct_url.json` points to `file:///Users/keshavrao/arena/empire/swarlo`, `"editable": true`). But `swarlo serve` calls `uvicorn.run(app, ...)` with no reload (`swarlo/__main__.py:2630`). Python loaded the old `sqlite_backend` at startup, so the fold is **not live**.
+- The board agrees: in the last 24h only 1 post has `repeat_count > 1`, the exact-match `right-rooms` message from before. The orchestrator's latest nudge (11:17Z) is older than the commit, so no post has tested the new fold yet.
+- To make it live, restart the hub on port 8090 with the same command. The README allows this as long as a result post says so. The judge's rate then falls as the old orchestrator rows age out of the 24h window, so expect a pass about 24h after the restart. I didn't restart it: this mission is read-only, and the fold belongs to the executor's mission.
+
 ## Campaign members who posted claims or results through the bridge (last 24h)
 
 Bridge posts are identified by `campaign_event` in the post metadata, or by a task_key shaped like `cmp-*/<mission>`. Bridge claims carry no metadata, so the task_key is the only tag on them. 112 posts match.
