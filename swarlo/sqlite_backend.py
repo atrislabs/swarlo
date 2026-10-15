@@ -25,6 +25,9 @@ REPEAT_FOLD_PREFIX_CHARS = 80
 REPEAT_FOLD_WINDOW_HOURS = 24
 # Coordination state: these stay distinct rows even without a task_key.
 REPEAT_FOLD_EXEMPT_KINDS = ("claim", "result")
+# Machine status posts fold with numbers ignored ("1 commit ahead" == "6 commits ahead") and show the
+# newest text. Everything else folds only on an exact repeat, so "Shipped #1333" and "Shipped #1334" stay apart.
+REPEAT_FOLD_NUMBERS_KINDS = ("nudge", "status")
 
 
 def _fold_head(content: str | None) -> str:
@@ -522,17 +525,22 @@ class SQLiteBackend(SwarloBackend):
             return None
         cutoff = (datetime.fromisoformat(now)
                   - timedelta(hours=self.repeat_window_hours)).isoformat()
+        if kind in REPEAT_FOLD_NUMBERS_KINDS:
+            match, head = "fold_head(content) = ?", _fold_head(content)
+        else:
+            match, head = f"substr(content, 1, {REPEAT_FOLD_PREFIX_CHARS}) = ?", (content or "")[:REPEAT_FOLD_PREFIX_CHARS]
         row = self.conn.execute(
             "SELECT * FROM posts WHERE hub_id = ? AND member_id = ? AND kind = ? "
-            "AND task_key IS NULL AND created_at >= ? AND fold_head(content) = ? "
+            f"AND task_key IS NULL AND created_at >= ? AND {match} "
             "ORDER BY created_at DESC LIMIT 1",
-            (hub_id, member.member_id, kind, cutoff, _fold_head(content)),
+            (hub_id, member.member_id, kind, cutoff, head),
         ).fetchone()
         if row is None:
             return None
+        newest = kind in REPEAT_FOLD_NUMBERS_KINDS  # status posts show their latest numbers
         self.conn.execute(
-            "UPDATE posts SET repeat_count = COALESCE(repeat_count, 1) + 1 WHERE post_id = ?",
-            (row["post_id"],),
+            "UPDATE posts SET repeat_count = COALESCE(repeat_count, 1) + 1, content = ? WHERE post_id = ?",
+            (content if newest else row["content"], row["post_id"]),
         )
         self.conn.execute(
             "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
@@ -541,6 +549,8 @@ class SQLiteBackend(SwarloBackend):
         self.conn.commit()
         post = self._row_to_post(row)
         post.repeat_count = (row["repeat_count"] or 1) + 1
+        if newest:
+            post.content = content
         return post
 
     async def retry_failed(self, hub_id: str, max_retries: int = 3) -> list[str]:

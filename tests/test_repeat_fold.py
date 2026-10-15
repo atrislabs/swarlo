@@ -145,19 +145,27 @@ class TestRepeatFold:
         assert "repeat_count" not in post.to_dict()
 
     @pytest.mark.asyncio
-    async def test_numbers_ignored_when_matching(self, backend, member_a):
-        first = await backend.create_post("hub-1", member_a, "general", "branch is 1 commit ahead, 3 files dirty")
-        second = await backend.create_post("hub-1", member_a, "general", "branch is 12 commit ahead, 40 files dirty")
-        assert second.post_id == first.post_id
-        assert second.repeat_count == 2
-        assert _row_count(backend) == 1
+    async def test_messages_with_different_numbers_stay_apart(self, backend, member_a):
+        first = await backend.create_post("hub-1", member_a, "general", "Shipped as atris #1333: campaign cadence")
+        second = await backend.create_post("hub-1", member_a, "general", "Shipped as atris #1334: campaign cadence")
+        assert second.post_id != first.post_id
+        assert _row_count(backend) == 2
 
     @pytest.mark.asyncio
     async def test_numbers_ignored_only_in_first_80_chars(self, backend, member_a):
         head = "y" * 78
-        first = await backend.create_post("hub-1", member_a, "general", head + "7 left")
-        second = await backend.create_post("hub-1", member_a, "general", head + "x left")
+        first = await backend.create_post("hub-1", member_a, "general", head + "7 left", kind="status")
+        second = await backend.create_post("hub-1", member_a, "general", head + "x left", kind="status")
         assert second.post_id != first.post_id
+
+    @pytest.mark.asyncio
+    async def test_status_fold_shows_newest_text(self, backend, member_a):
+        first = await backend.create_post("hub-1", member_a, "general", "branch is 1 commit(s) ahead", kind="status")
+        second = await backend.create_post("hub-1", member_a, "general", "branch is 6 commit(s) ahead", kind="status")
+        assert second.post_id == first.post_id and second.repeat_count == 2
+        assert second.content == "branch is 6 commit(s) ahead"
+        stored = backend.conn.execute("SELECT content FROM posts WHERE post_id = ?", (first.post_id,)).fetchone()[0]
+        assert stored == "branch is 6 commit(s) ahead"
 
     @pytest.mark.asyncio
     async def test_nudge_with_changing_numbers_folds(self, backend, member_a):
