@@ -256,6 +256,40 @@ def test_keep_backups_keeps_newest_by_mtime(tmp_path):
     assert (tmp_path / "atris.db-wal").exists()
 
 
+def test_keep_backups_does_not_count_sidecars(tmp_path):
+    def make(name, t, data=b"db"):
+        p = tmp_path / name
+        p.write_bytes(data)
+        os.utime(p, (t, t))
+
+    make("atris.db.backup-a", 400)
+    make("atris.db.backup-a-shm", 401)
+    make("atris.db.backup-a-wal", 401, b"")
+    make("atris.db.backup-b", 300)
+    make("atris.db.backup-b-wal", 300, b"frames")
+    make("atris.db.backup-b-shm", 300)
+    make("atris.db.backup-c", 200)
+    make("atris.db.backup-d", 100)
+    make("atris.db.backup-d-wal", 100, b"frames")
+
+    removed = keep_backups(tmp_path, keep=3)
+
+    assert sorted(p.name for p in removed) == [
+        "atris.db.backup-a-shm",
+        "atris.db.backup-a-wal",
+        "atris.db.backup-d",
+        "atris.db.backup-d-wal",
+    ]
+    left = sorted(p.name for p in tmp_path.glob("atris.db.backup*"))
+    assert left == [
+        "atris.db.backup-a",
+        "atris.db.backup-b",
+        "atris.db.backup-b-shm",
+        "atris.db.backup-b-wal",
+        "atris.db.backup-c",
+    ]
+
+
 def test_keep_backups_noop_when_few(tmp_path):
     (tmp_path / "atris.db.backup-1").write_bytes(b"db")
     assert keep_backups(tmp_path) == []

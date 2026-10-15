@@ -32,6 +32,10 @@ keep_backups(home, keep=3)
     Deletes all but the ``keep`` newest ``atris.db.backup*`` files directly in
     ``home``, newest by mtime (backup suffixes mix epoch and date stamps, so
     names do not sort). ``atris.db`` itself never matches the pattern.
+    ``-wal``/``-shm``/``-journal`` sidecars are not counted as backups: they
+    are deleted with their backup, and also beside a kept backup when its
+    ``-wal`` is empty (they hold no data then). A kept backup with a non-empty
+    ``-wal`` keeps its sidecars.
 
 rotate_logs and keep_backups return the paths they acted on.
 
@@ -218,13 +222,28 @@ def rotate_logs(home, max_mb: float = 10) -> list[Path]:
     return rotated
 
 
+SIDECARS = ("-wal", "-shm", "-journal")
+
+
 def keep_backups(home, keep: int = 3) -> list[Path]:
     home = Path(home)
-    backups = [p for p in home.glob("atris.db.backup*") if p.is_file() and not p.is_symlink()]
+    files = [p for p in home.glob("atris.db.backup*") if p.is_file() and not p.is_symlink()]
+    backups = [p for p in files if not p.name.endswith(SIDECARS)]
     backups.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    removed = backups[max(0, keep):]
-    for p in removed:
-        p.unlink()
+    removed = []
+    for i, db in enumerate(backups):
+        sidecars = [db.with_name(db.name + s) for s in SIDECARS]
+        sidecars = [p for p in sidecars if p in files]
+        if i >= max(0, keep):
+            doomed = [db, *sidecars]
+        else:
+            wal = db.with_name(db.name + "-wal")
+            if wal.exists() and wal.stat().st_size > 0:
+                continue
+            doomed = sidecars
+        for p in doomed:
+            p.unlink()
+        removed += doomed
     return removed
 
 
