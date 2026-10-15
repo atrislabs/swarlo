@@ -44,10 +44,15 @@ keep_backups(home, keep=3)
 
 rotate_logs and keep_backups return the paths they acted on.
 
+backup(db_path)
+    Copies the live database beside itself as ``atris.db.backup-<UTC stamp>``
+    with sqlite's backup API (consistent while the hub writes). Returns the path.
+
 prune_hub(home, hub="atris")
-    One full prune of ``home/atris.db`` and ``home``: archive_posts (into
-    ``home/archive``), trim_scores, drop_idle_members, rotate_logs,
-    keep_backups, vacuum, in that order. Returns a dict of counts, ready to
+    One full prune of ``home/atris.db`` and ``home``: backup, archive_posts
+    (into ``home/archive``), trim_scores, drop_idle_members, rotate_logs,
+    keep_backups, vacuum, in that order, so every run leaves the 3 newest
+    daily copies from before it changed anything. Returns a dict of counts, ready to
     hand to record_run or start_schedule.
 
 Run log and daily schedule for the swarlo pruner.
@@ -272,9 +277,22 @@ def keep_backups(home, keep: int = 3) -> list[Path]:
     return removed
 
 
+def backup(db_path) -> Path:
+    db_path = Path(db_path)
+    dest = db_path.with_name(f"{db_path.name}.backup-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}")
+    src, dst = sqlite3.connect(str(db_path)), sqlite3.connect(str(dest))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return dest
+
+
 def prune_hub(home, hub: str = "atris") -> dict:
     home = Path(home)
     db = home / "atris.db"
+    backup(db)
     return {
         "posts_archived": sum(archive_posts(db, home / "archive", hub).values()),
         "scores_trimmed": trim_scores(db, hub),

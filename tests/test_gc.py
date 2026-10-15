@@ -445,8 +445,11 @@ def test_prune_hub_runs_every_step_and_returns_counts(tmp_path):
     assert counts["scores_trimmed"] == 1
     assert counts["members_dropped"] == 1
     assert counts["logs_rotated"] == 1
-    assert counts["backups_removed"] == 2
+    assert counts["backups_removed"] == 3  # 5 old + 1 fresh, keep 3
     assert counts["pages_freed"] >= 0
+    fresh = max(home.glob("atris.db.backup-2*"))
+    with sqlite3.connect(fresh) as c:
+        assert {r[0] for r in c.execute("SELECT post_id FROM posts")} == {"old", "new"}
     assert _ids(db, "posts", "post_id") == {"new"}
     assert len(list((home / "archive").glob("atris-*.db"))) == 1
     json.dumps(counts)
