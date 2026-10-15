@@ -26,3 +26,7 @@ One pruner, run by the hub itself on a schedule (a background task started with 
 - Thresholds are settings with these defaults, not hard-coded constants scattered around.
 - Tests in `tests/` for every step, including "the archive holds what was deleted" and "a run with nothing to do changes nothing".
 - Restarting the local hub is fine (`launchctl kickstart -k gui/$(id -u)/com.atris.swarlo`); say so in the result. Push to `main` only after the full test suite passes.
+
+## Who builds
+
+Anything that deletes goes to **auto-improver**, not executor. Executor's MEMBER.md requires a person to approve any objective that names deleting, and those approvals do not surface on the campaign, so its missions stop at $0 and look like failures (2026-10-15). Keshav asked for this pruning directly, but agents never answer an approval in his name. Executor can still write code that does not delete.
