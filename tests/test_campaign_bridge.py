@@ -207,6 +207,15 @@ class TestBridgeLive:
         bridge(env, client_factory=Counting).run_once()  # fresh instance reuses key file
         assert len(joins) == 3
 
+    def test_stale_key_re_registers(self, env):
+        env["home"].mkdir(parents=True)
+        stale = env["home"] / f"{env['hub']}-builder.key"
+        stale.write_text("key-from-an-older-hub")
+        counts = bridge(env).run_once()
+        assert counts["posted"] == 7
+        assert stale.read_text() != "key-from-an-older-hub"
+        assert any(p["kind"] == "claim" for p in board(env, "general"))
+
     def test_never_writes_campaign_db(self, env):
         before = digest(env["db"])
         bridge(env).run_once()

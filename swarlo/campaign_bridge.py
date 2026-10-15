@@ -170,13 +170,14 @@ class CampaignBridge:
         tmp.write_text(json.dumps(self.state, indent=1))
         tmp.replace(self.state_path)
 
-    def client_for(self, member: str) -> SwarloClient:
-        """Client for `member`, registering only if no key file exists yet."""
-        if member in self._clients:
+    def client_for(self, member: str, fresh: bool = False) -> SwarloClient:
+        """Client for `member`, registering only if no key file exists yet
+        (or `fresh`, after the hub rejected the stored key)."""
+        if member in self._clients and not fresh:
             return self._clients[member]
         key_path = self.home / f"{self.hub}-{member}.key"
         client = self.client_factory(self.server, hub=self.hub)
-        if key_path.exists():
+        if key_path.exists() and not fresh:
             client.api_key = key_path.read_text().strip()
             client.member_id = member
         else:
@@ -188,8 +189,16 @@ class CampaignBridge:
         return client
 
     def apply(self, action: Action) -> str:
-        """Perform one action. Returns 'ok' or 'skipped' (hub said 404/409)."""
-        client = self.client_for(action.member)
+        """Perform one action. Returns 'ok' or 'skipped' (hub said 404/409).
+        A stale stored key (401) re-registers the member once and retries."""
+        try:
+            return self._apply(self.client_for(action.member), action)
+        except SwarloError as exc:
+            if exc.status_code != 401:
+                raise
+        return self._apply(self.client_for(action.member, fresh=True), action)
+
+    def _apply(self, client: SwarloClient, action: Action) -> str:
         try:
             if action.verb == "claim":
                 client.claim(action.channel, action.task_key, action.content)
