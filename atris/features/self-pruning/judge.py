@@ -9,6 +9,7 @@ Read only. Passes when all hold on hub `atris` (~/.swarlo):
   5. every *.log in ~/.swarlo is 10 MB or less, and at most 3 atris.db backups remain
   6. ~/.swarlo is 60 MB or less in total
   7. it is automatic: a scheduled prune (trigger "schedule" in ~/.swarlo/prune.jsonl) ran in the last 26 hours
+  8. designed, not sprawled: the pruner is one module, swarlo/gc.py, with one test file, tests/test_gc.py
 The last line carries every number and the next move.
 """
 import datetime as dt
@@ -77,6 +78,11 @@ except OSError:
     pass
 recent = bool(last_scheduled) and last_scheduled >= ago(26 / 24)
 
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+pieces = sorted(os.path.basename(p) for p in glob.glob(os.path.join(REPO, "swarlo", "gc*.py")))
+tests = sorted(os.path.basename(p) for p in glob.glob(os.path.join(REPO, "tests", "test_gc*.py")))
+one_module = pieces == ["gc.py"] and tests == ["test_gc.py"]
+
 fails = []
 if old_posts:
     fails.append("archive posts older than 30 days")
@@ -92,11 +98,13 @@ if backups > BACKUPS:
     fails.append("keep only the 3 newest backups")
 if total > TOTAL_MB:
     fails.append("shrink ~/.swarlo")
+if not one_module:
+    fails.append(f"merge the pruner into one module, swarlo/gc.py + tests/test_gc.py (now {', '.join(pieces + tests) or 'none'})")
 if not recent:
     fails.append("make the hub prune itself on a schedule (prune.jsonl, trigger schedule)")
 
 nums = (f"posts>30d {old_posts}, kept {live}+{archived}, scores>7d {old_scores}, idle members {idle}, "
-        f"big logs {len(big_logs)}, backups {backups}, size {total:.0f}MB, last scheduled prune {last_scheduled or 'never'}")
+        f"big logs {len(big_logs)}, backups {backups}, size {total:.0f}MB, gc modules {len(pieces)}, last scheduled prune {last_scheduled or 'never'}")
 if fails:
     print(f"not yet · {nums} · next: {fails[0]}")
     sys.exit(1)
