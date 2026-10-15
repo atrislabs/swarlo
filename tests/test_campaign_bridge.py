@@ -236,3 +236,56 @@ class TestBridgeLive:
         assert read_events(tmp_path / "nope.db") == []
         b = CampaignBridge(env["server"], env["hub"], dbs=[tmp_path / "nope.db"], home=env["home"])
         assert b.run_once()["seen"] == 0
+
+
+# ── Judge repeats ──────────────────────────────────────────
+
+def judge(summary, passed=False):
+    return ("judge_ran", "judge", {"passed": passed, "summary": summary})
+
+
+class TestJudgeRepeat:
+    def test_judge_repeat_with_new_numbers_is_skipped(self, env):
+        b = bridge(env)
+        b.run_once()  # posts "repeats 0.72, members 1, closed 0"
+        make_db(env["db"], [judge("repeats 0.27, members 3, closed 12")], start=len(EVENTS))
+        assert b.run_once() == {"seen": 1, "posted": 0, "skipped": 0, "ignored": 1}
+        assert len(board(env, "experiments")) == 1
+
+    def test_judge_repeat_new_text_still_posts(self, env):
+        b = bridge(env)
+        b.run_once()
+        make_db(env["db"], [judge("repeats 0.27, members 3, closed 12, asks 1")], start=len(EVENTS))
+        assert b.run_once()["posted"] == 1
+
+    def test_judge_repeat_verdict_flip_still_posts(self, env):
+        b = bridge(env)
+        b.run_once()
+        make_db(env["db"], [judge("repeats 0.02, members 3, closed 12", passed=True)], start=len(EVENTS))
+        assert b.run_once()["posted"] == 1
+        assert "judge passed" in board(env, "experiments")[0]["content"]
+
+    def test_judge_repeat_is_per_campaign(self, env):
+        b = bridge(env)
+        b.run_once()
+        make_db(env["db"], [judge("repeats 0.72, members 1, closed 0")], campaign="cmp-other",
+                start=len(EVENTS))
+        assert b.run_once()["posted"] == 1
+
+    def test_judge_repeat_memory_survives_restart(self, env):
+        bridge(env).run_once()
+        state = json.loads((env["home"] / f"campaign_bridge-{env['hub']}.json").read_text())
+        assert state["judge_last"]["cmp-demo"] == "cmp-demo judge not passed: repeats #.#, members #, closed #"
+        make_db(env["db"], [judge("repeats 0.5, members 2, closed 1")], start=len(EVENTS))
+        assert bridge(env).run_once()["ignored"] == 1  # fresh instance reads the state file
+
+    def test_judge_repeat_failed_post_is_not_remembered(self, env):
+        class Down(SwarloClient):
+            def post(self, channel, *a, **k):
+                if channel == "experiments":
+                    raise SwarloError(409, {"detail": "nope"})
+                return super().post(channel, *a, **k)
+
+        b = bridge(env, client_factory=Down)
+        b.run_once()
+        assert "cmp-demo" not in b.state["judge_last"]

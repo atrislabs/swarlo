@@ -9,7 +9,8 @@ Each workspace keeps its campaign log in ``<checkout>/.atris/state/atris.db``
     step with cost_usd   -> touch the claim (cost recorded in bridge state)
     mission_ended        -> report done (kept) or failed (failed / reverted)
     ask_opened           -> escalation in #escalations
-    judge_ran            -> result in #experiments
+    judge_ran            -> result in #experiments (skipped when it repeats the
+                            campaign's last judge post with digits as '#')
     judge_set            -> message "judge changed"
 
 task_key is ``<campaign_id>/<mission_id>``. Events are deduped by id, so
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -40,6 +42,7 @@ KNOWN_WORKSPACES = (
     Path(__file__).resolve().parent.parent,
 )
 SEEN_CAP = 5000
+DIGITS = re.compile(r"\d+")  # digit runs, as the hub folds them
 
 
 def default_dbs() -> list[Path]:
@@ -161,6 +164,7 @@ class CampaignBridge:
         state.setdefault("pos", {})
         state.setdefault("seen", [])
         state.setdefault("cost", {})
+        state.setdefault("judge_last", {})
         return state
 
     def _save_state(self) -> None:
@@ -228,11 +232,18 @@ class CampaignBridge:
                     counts["seen"] += 1
                     if event["id"] not in seen:
                         action = map_event(event, self.channel)
+                        judge = None
+                        if action is not None and event["type"] == "judge_ran":
+                            judge = DIGITS.sub("#", action.content)
+                            if self.state["judge_last"].get(event["campaign_id"]) == judge:
+                                action = None  # same judge line, only numbers moved
                         if action is None:
                             counts["ignored"] += 1
                         else:
                             outcome = self.apply(action)
                             counts["posted" if outcome == "ok" else "skipped"] += 1
+                            if judge is not None and outcome == "ok":
+                                self.state["judge_last"][event["campaign_id"]] = judge
                             if action.verb == "touch":
                                 cost = self.state["cost"]
                                 cost[action.task_key] = cost.get(action.task_key, 0) + action.metadata["cost_usd"]
