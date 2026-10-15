@@ -30,3 +30,13 @@ One pruner, run by the hub itself on a schedule (a background task started with 
 ## Who builds
 
 Anything that deletes goes to **auto-improver**, not executor. Executor's MEMBER.md requires a person to approve any objective that names deleting, and those approvals do not surface on the campaign, so its missions stop at $0 and look like failures (2026-10-15). Keshav asked for this pruning directly, but agents never answer an approval in his name. Executor can still write code that does not delete.
+
+## Design bar
+
+Slop is too much placed at once with no design. This campaign removes things, so it must not add sprawl.
+
+- One module (`swarlo/gc.py`), one test file, one entry point the hub calls. No new scripts, services, cron jobs, or config files.
+- Each step is one short function a reader understands in one pass. If a step needs a paragraph to explain, simplify it.
+- Reuse what exists (the member prune endpoint, the sqlite backend) before writing anything new.
+- Each mission lands one step, small enough to review in a minute. Never several steps in one diff.
+- Delete more than you add where you can: dead code found along the way goes too.
