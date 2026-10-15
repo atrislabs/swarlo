@@ -8,6 +8,7 @@ import pytest
 
 from swarlo.gc import (
     archive_posts,
+    drop_idle_members,
     keep_backups,
     record_run,
     rotate_logs,
@@ -164,6 +165,27 @@ def test_trim_scores_drops_old_rows_for_one_hub(live):
         left = sorted(c.execute("SELECT hub_id, computed_at FROM scores").fetchall())
     assert left == sorted([rows[2], rows[3]])
     assert trim_scores(live, "hub-1", days=7) == 0
+
+
+def test_drop_idle_members_removes_unseen_and_stale_for_one_hub(live):
+    rows = [
+        ("never", "hub-1", None),
+        ("stale", "hub-1", _ago(31)),
+        ("fresh", "hub-1", _ago(1)),
+        ("other", "hub-2", _ago(31)),
+    ]
+    with sqlite3.connect(live) as c:
+        c.executemany(
+            "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen) "
+            "VALUES (?, ?, 'agent', 'x', '2026-01-01T00:00:00', ?)",
+            rows,
+        )
+
+    assert sorted(drop_idle_members(live, "hub-1", days=30)) == ["never", "stale"]
+    with sqlite3.connect(live) as c:
+        left = sorted(r[0] for r in c.execute("SELECT member_id FROM members"))
+    assert left == ["fresh", "other"]
+    assert drop_idle_members(live, "hub-1", days=30) == []
 
 
 def test_rotate_logs_copy_truncates_big_log(tmp_path):

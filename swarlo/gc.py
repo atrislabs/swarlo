@@ -14,6 +14,11 @@ archive_posts(db_path, archive_dir, hub, days=30)
     Copies use INSERT OR IGNORE, so a run interrupted between copy and delete
     is safe to repeat. Returns ``{archive_path: posts_archived}``.
 
+drop_idle_members(db_path, hub, days=30)
+    Deletes every member of ``hub`` whose ``last_seen`` is NULL or older than
+    ``days``, the same rule the self-pruning judge counts. Returns the ids
+    removed.
+
 Disk hygiene for a swarlo home directory (normally ``~/.swarlo``).
 
 rotate_logs(home, max_mb=10)
@@ -171,6 +176,20 @@ def trim_scores(db_path, hub: str, days: int = 7) -> int:
                 "DELETE FROM scores WHERE hub_id = ? AND computed_at < ?", (hub, cutoff)
             )
         return cur.rowcount
+    finally:
+        conn.close()
+
+
+def drop_idle_members(db_path, hub: str, days: int = 30) -> list[str]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    where = "hub_id = ? AND (last_seen IS NULL OR last_seen < ?)"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        with conn:
+            ids = [r[0] for r in conn.execute(f"SELECT member_id FROM members WHERE {where}", (hub, cutoff))]
+            conn.execute(f"DELETE FROM members WHERE {where}", (hub, cutoff))
+        return ids
     finally:
         conn.close()
 
