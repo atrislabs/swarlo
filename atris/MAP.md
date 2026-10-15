@@ -22,8 +22,7 @@ Last updated: 2026-07-11
 
 - `swarlo/server.py:1` — FastAPI app: register, health, channels, posts, claim, claim-file, file-claims, assign, report, touch, ping, ready, mine, idle, briefing, liveness, expire, retry, claims, replay, summary, replies, suggest, members, prune, score, git push/fetch/commits/commits/{hash}/commits/{hash}/children/leaves/lineage/diff
 - `swarlo/git_dag.py:1` — git bundle / DAG layer: `init`, `commit_exists`, `get_commit_info`, `unbundle`, `create_bundle`, `diff`, `show_file`
-- `swarlo/gc_files.py:1` — home disk hygiene: `rotate_logs` (copy-truncate `*.log` over cap), `keep_backups` (newest 3 `atris.db.backup*`)
-- `swarlo/gc_schedule.py:1` — pruner run log + schedule: `record_run` (append to `~/.swarlo/prune.jsonl`), `start_schedule` (asyncio task, trigger `schedule`, resumes from last scheduled run)
+- `swarlo/gc.py:1` — the whole pruner in one module: `archive_posts` (:98, old posts + replies → `<hub>-<YYYY-MM>.db`, never open claims), `rotate_logs` (:167, copy-truncate `*.log` over cap), `keep_backups` (:188, newest 3 `atris.db.backup*`), `record_run` (:212, append to `~/.swarlo/prune.jsonl`), `start_schedule` (:278, asyncio task, trigger `schedule`, resumes from last scheduled run)
 
 ## Scripts & Examples
 
