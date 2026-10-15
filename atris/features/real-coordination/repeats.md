@@ -29,6 +29,22 @@ None of the repeat sources has a task_key, so the hub's claim and task logic nev
 3. **The bridge repeats some judge results.** The bridge posts every `judge_ran` event, so an unchanged "not passed" verdict lands again each time the judge reruns. That's small now (3 repeats), but it grows with every rerun.
 4. **The judge counts itself as a working member.** `judge` (member type `agent`) posted 17 `result` posts through the bridge. `judge.py` only excludes `orchestrator` as a bot, so the judge's own verdicts count toward "3+ members claiming or reporting".
 
+## Would the executor's uncommitted fold pass the judge? (replayed 2026-10-15 ~11:50Z)
+
+The executor has an uncommitted change to `swarlo/sqlite_backend.py`. It folds any post without a task_key when the same member and kind repeat the same first 80 characters (numbers ignored) within 24h. Claims and results are left alone. I replayed the hub's real posts from the last 48 hours through that rule, kept only the rows that would have been stored, and computed the judge's 24-hour repeat rate on them. Script: `/tmp/researcher-repeats/replay.py` (read-only; it imports the rule's key function from the repo).
+
+| rule | rows stored (24h) | repeats | rate | who still repeats |
+|------|------:|------:|------:|-------------------|
+| today (exact-match fold only) | 171 | 46 | 0.269 | orchestrator 43, judge 3 |
+| executor's rule (cut to 80, then ignore numbers) | 127 | 3 | **0.024** | judge 3 |
+| same rule, ignore numbers then cut to 80 | 127 | 3 | 0.024 | judge 3 |
+
+- **Once the hub runs it, the executor's change alone passes the repeats bar** (0.024 against 0.10). It removes all 43 orchestrator repeats, and the orchestrator itself needs no changes.
+- Cutting before ignoring numbers doesn't matter here: the judge uses the same key, so both sides split the same groups the same way. It's still worth fixing in both places together, but nothing depends on it.
+- The 3 leftover repeats are the judge's own unchanged "not passed" verdicts. The bridge posts them as `result`, and results are never folded. To clear them, the bridge would need to skip a `judge_ran` whose summary matches the last one for that campaign.
+- The rule's 18 tests pass (`pytest -q tests/test_repeat_fold.py`) on the system `python3` and on both `atrisos-backend` virtual environments. The executor's last log entry said they were blocked on "No module named pytest"; that no longer reproduces.
+- Not done here, and it needs the executor or Keshav: commit the change and restart the local hub. Old rows stay in the 24h window until they age out, so the judge's live number falls over the next day rather than all at once.
+
 ## Campaign members who posted claims or results through the bridge (last 24h)
 
 Bridge posts are identified by `campaign_event` in the post metadata, or by a task_key shaped like `cmp-*/<mission>`. Bridge claims carry no metadata, so the task_key is the only tag on them. 112 posts match.
