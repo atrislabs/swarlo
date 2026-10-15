@@ -450,3 +450,35 @@ def test_prune_hub_runs_every_step_and_returns_counts(tmp_path):
     assert _ids(db, "posts", "post_id") == {"new"}
     assert len(list((home / "archive").glob("atris-*.db"))) == 1
     json.dumps(counts)
+
+
+def test_server_starts_prune_schedule_on_startup_and_cancels_on_shutdown(tmp_path, monkeypatch, live):
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from swarlo import server
+
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "atris.db"
+    db.write_bytes(live.read_bytes())
+    monkeypatch.setattr(server, "HOME", home)
+    monkeypatch.setattr(server, "_backend", SQLiteBackend(str(db)))
+
+    with TestClient(server.app):
+        task = server._prune_task
+        assert task is not None
+        deadline = time.time() + 5
+        while not (home / "prune.jsonl").exists() and time.time() < deadline:
+            time.sleep(0.02)
+    assert task.cancelled() and server._prune_task is None
+    lines = _lines(home)
+    assert lines[0]["trigger"] == "schedule" and lines[0]["ok"] is True
+    assert "pages_freed" in lines[0]
+
+    other = tmp_path / "other.db"
+    other.write_bytes(live.read_bytes())
+    monkeypatch.setattr(server, "_backend", SQLiteBackend(str(other)))
+    with TestClient(server.app):
+        assert server._prune_task is None

@@ -8,10 +8,12 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated, Optional
 
 import httpx
@@ -24,6 +26,7 @@ from pydantic import BaseModel, Field, StringConstraints
 # shared claim that every empty-key claimant collides on.
 TaskKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
+from . import gc
 from .sqlite_backend import SQLiteBackend
 from .git_dag import GitDAG
 from .types import Member
@@ -98,6 +101,29 @@ def set_dag(dag: GitDAG):
     """Set the global GitDAG instance for commit tracking."""
     global _git_dag
     _git_dag = dag
+
+
+# Daily self-prune of the live hub (~/.swarlo). Only runs when this server
+# serves HOME/atris.db, so tests and side servers never prune the real hub.
+HOME = Path.home() / ".swarlo"
+_prune_task: asyncio.Task | None = None
+
+
+@app.on_event("startup")
+async def _start_prune_schedule():
+    global _prune_task
+    if _backend is None or Path(_backend.db_path).resolve() != (HOME / "atris.db").resolve():
+        return
+    _prune_task = gc.start_schedule(lambda: asyncio.to_thread(gc.prune_hub, HOME), HOME)
+
+
+@app.on_event("shutdown")
+async def _stop_prune_schedule():
+    global _prune_task
+    if _prune_task is not None:
+        _prune_task.cancel()
+        await asyncio.gather(_prune_task, return_exceptions=True)
+        _prune_task = None
 
 
 # ── Auth ────────────────────────────────────────────────────
