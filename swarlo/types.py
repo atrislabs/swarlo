@@ -67,9 +67,12 @@ class Post:
     created_at: Optional[str] = None
     replies: Optional[list[dict]] = None  # eager-loaded replies — fixes thread fragmentation
     display_id: Optional[str] = None
+    repeat_count: int = 1  # >1 when identical posts were folded into this one
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        if d.get("repeat_count", 1) == 1:
+            del d["repeat_count"]
         if d.get("metadata") is None:
             del d["metadata"]
         if d.get("mentions") is None:

@@ -17,6 +17,10 @@ from .types import Member, Post, Reply, ClaimResult
 DEFAULT_CHANNELS = ["general", "experiments", "outreach", "ops", "policies", "escalations"]
 SQLITE_BUSY_TIMEOUT_MS = 5000
 EXPIRE_CLAIM_BATCH_LIMIT = 500
+# Same member + same hub + same first N chars inside the window folds into
+# the earlier post (repeat_count bump) instead of a new row.
+REPEAT_FOLD_PREFIX_CHARS = 80
+REPEAT_FOLD_WINDOW_HOURS = 24
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
@@ -48,6 +52,7 @@ CREATE TABLE IF NOT EXISTS posts (
     mentions TEXT,
     assignee_id TEXT,
     depends_on TEXT,
+    repeat_count INTEGER DEFAULT 1,
     created_at TEXT NOT NULL
 );
 
@@ -142,8 +147,11 @@ def _post_display_id(kind: str, post_id: str | None) -> str | None:
 class SQLiteBackend(SwarloBackend):
     """Swarlo backed by a local SQLite database."""
 
-    def __init__(self, db_path: str = "swarlo.db"):
+    def __init__(self, db_path: str = "swarlo.db",
+                 repeat_window_hours: float = REPEAT_FOLD_WINDOW_HOURS):
         self.db_path = db_path
+        # <= 0 disables repeat folding.
+        self.repeat_window_hours = repeat_window_hours
         self._conn: Optional[sqlite3.Connection] = None
         self._local = threading.local()
         self._schema_lock = threading.Lock()
@@ -253,6 +261,8 @@ class SQLiteBackend(SwarloBackend):
             ("posts", "mentions", "TEXT"),
             # Dependency edge for the coordination graph (JSON task_key list).
             ("posts", "depends_on", "TEXT"),
+            # Folded repeat posts bump this instead of inserting a new row.
+            ("posts", "repeat_count", "INTEGER DEFAULT 1"),
             # Pre-liveness DBs omitted last_seen; tower/idle need it.
             ("members", "last_seen", "TEXT"),
             # Working vs connected: bumped only on post/claim/report.
@@ -467,6 +477,9 @@ class SQLiteBackend(SwarloBackend):
         depends_on_json = json.dumps(depends_on) if depends_on else None
 
         with self._write_lock:
+            folded = self._fold_repeat_post(hub_id, member, content, kind, task_key, now)
+            if folded is not None:
+                return folded
             self.conn.execute(
                 "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id, depends_on) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now, assignee_id, depends_on_json),
@@ -485,6 +498,40 @@ class SQLiteBackend(SwarloBackend):
             metadata=metadata, mentions=mention_ids or None, created_at=now,
             display_id=post_display_id,
         )
+
+    def _fold_repeat_post(self, hub_id: str, member: Member, content: str,
+                          kind: str, task_key: str | None, now: str) -> Post | None:
+        """Bump and return an earlier identical post, or None to insert.
+
+        Only plain messages fold: claims, results, assigns and other
+        task-bound posts carry coordination state and must stay distinct
+        rows. Caller holds _write_lock.
+        """
+        if self.repeat_window_hours <= 0 or kind != "message" or task_key:
+            return None
+        cutoff = (datetime.fromisoformat(now)
+                  - timedelta(hours=self.repeat_window_hours)).isoformat()
+        prefix = content[:REPEAT_FOLD_PREFIX_CHARS]
+        row = self.conn.execute(
+            "SELECT * FROM posts WHERE hub_id = ? AND member_id = ? AND kind = 'message' "
+            "AND task_key IS NULL AND created_at >= ? AND substr(content, 1, ?) = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (hub_id, member.member_id, cutoff, REPEAT_FOLD_PREFIX_CHARS, prefix),
+        ).fetchone()
+        if row is None:
+            return None
+        self.conn.execute(
+            "UPDATE posts SET repeat_count = COALESCE(repeat_count, 1) + 1 WHERE post_id = ?",
+            (row["post_id"],),
+        )
+        self.conn.execute(
+            "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
+            (now, hub_id, member.member_id),
+        )
+        self.conn.commit()
+        post = self._row_to_post(row)
+        post.repeat_count = (row["repeat_count"] or 1) + 1
+        return post
 
     async def retry_failed(self, hub_id: str, max_retries: int = 3) -> list[str]:
         """Re-queue failed tasks that haven't exceeded max_retries. Returns retried task_keys."""
@@ -1379,4 +1426,5 @@ class SQLiteBackend(SwarloBackend):
             depends_on=depends_on,
             created_at=row["created_at"],
             display_id=_post_display_id(row["kind"], row["post_id"]),
+            repeat_count=(row["repeat_count"] or 1) if "repeat_count" in keys else 1,
         )
