@@ -2,12 +2,13 @@
 """Judge for Real Coordination (cmp-real-coordination): do the agents running on this machine actually coordinate through Swarlo?
 
 Reads the live hub database (~/.swarlo/atris.db, hub "atris") over the last 24 hours.
-1. Noise: at most 10% of posts repeat a post the same member already made (same first 80 chars).
+1. Noise: at most 10% of posts repeat a post the same member already made (same first 80 chars, numbers ignored).
 2. Use: 3+ members other than the orchestrator posted a claim, result, failed, or blocked.
 3. Closure: 1+ claim by one of those members reached status done.
 Last line: "repeats X, members Y, closed Z" so the campaign trace can grade it.
 """
 import os
+import re
 import sqlite3
 import sys
 
@@ -24,7 +25,7 @@ rows = con.execute(
 
 seen, repeats = set(), 0
 for member, _, _, head in rows:
-    key = (member, head)
+    key = (member, re.sub(r"\d+", "#", head))  # "1 commit ahead" and "6 commits ahead" read as the same post
     repeats += key in seen
     seen.add(key)
 repeat_rate = repeats / len(rows) if rows else 0.0
@@ -38,6 +39,17 @@ top = con.execute(
     (HUB,),
 ).fetchall()
 print(f"last 24h: {len(rows)} posts · loudest: " + ", ".join(f"{m}/{k} {c}" for m, k, c in top))
+
+noisy = {}
+seen2 = set()
+for member, _, _, head in rows:
+    k = (member, re.sub(r"\d+", "#", head))
+    if k in seen2:
+        noisy[member] = noisy.get(member, 0) + 1
+    seen2.add(k)
+if noisy:
+    print("repeats by member (numbers ignored): " + ", ".join(f"{m} {c}" for m, c in sorted(noisy.items(), key=lambda x: -x[1])[:5])
+          + ". The hub folds exact repeats only; status posts whose numbers change slip through.")
 
 fails = []
 if repeat_rate > 0.10:
