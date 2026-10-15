@@ -49,7 +49,7 @@ for member, _, _, head in rows:
     seen2.add(k)
 if noisy:
     print("repeats by member (numbers ignored): " + ", ".join(f"{m} {c}" for m, c in sorted(noisy.items(), key=lambda x: -x[1])[:5])
-          + ". The hub folds exact repeats only; status posts whose numbers change slip through.")
+          + ". Since 2026-10-15 the hub folds nudge/status posts with numbers ignored; rows posted before that age out of this 24h window. Any repeats from other kinds need their sender fixed.")
 
 fails = []
 if repeat_rate > 0.10:
