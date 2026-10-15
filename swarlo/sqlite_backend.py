@@ -399,6 +399,39 @@ class SQLiteBackend(SwarloBackend):
         ).fetchall()
         return [self._row_to_member(r) for r in rows]
 
+    def delete_member(self, hub_id: str, member_id: str) -> bool:
+        """Remove one member. Returns False if it was not on the hub."""
+        with self._write_lock:
+            cur = self.conn.execute(
+                "DELETE FROM members WHERE hub_id = ? AND member_id = ?",
+                (hub_id, member_id),
+            )
+            self.conn.commit()
+        return cur.rowcount > 0
+
+    def prune_members(self, hub_id: str, stale_minutes: int = 60) -> list[str]:
+        """Remove non-human members not seen in `stale_minutes`; return their ids.
+
+        The window is clamped to >= 1 minute. A zero or negative window moves
+        the cutoff to now-or-later, which would prune every active member.
+        Humans are never pruned, and members never seen (last_seen NULL) stay.
+        """
+        stale_minutes = max(1, int(stale_minutes))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
+        with self._write_lock:
+            rows = self.conn.execute(
+                "SELECT member_id FROM members WHERE hub_id = ? AND (last_seen IS NOT NULL AND last_seen < ?) AND member_type != 'human'",
+                (hub_id, cutoff),
+            ).fetchall()
+            pruned = [r["member_id"] for r in rows]
+            if pruned:
+                self.conn.execute(
+                    f"DELETE FROM members WHERE hub_id = ? AND member_id IN ({','.join('?' * len(pruned))})",
+                    (hub_id, *pruned),
+                )
+                self.conn.commit()
+        return pruned
+
     def _row_to_member(self, row) -> Member:
         return Member(
             member_id=row["member_id"],

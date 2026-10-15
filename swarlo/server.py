@@ -1154,18 +1154,8 @@ async def list_members(hub_id: str, request: Request):
 async def delete_member(hub_id: str, member_id: str, request: Request):
     """Remove a member from the hub."""
     caller = _get_member(request)
-    be = get_backend()
-    row = be.conn.execute(
-        "SELECT member_id FROM members WHERE hub_id = ? AND member_id = ?",
-        (hub_id, member_id),
-    ).fetchone()
-    if not row:
+    if not get_backend().delete_member(hub_id, member_id):
         raise HTTPException(404, f"Member {member_id} not found")
-    be.conn.execute(
-        "DELETE FROM members WHERE hub_id = ? AND member_id = ?",
-        (hub_id, member_id),
-    )
-    be.conn.commit()
     return {"deleted": member_id}
 
 
@@ -1178,27 +1168,12 @@ async def prune_members(hub_id: str, request: Request):
     except Exception:
         body = {}
     raw_stale = body.get("stale_minutes", 60) if isinstance(body, dict) else 60
-    # Clamp to >= 1 minute. A zero or negative window moves the cutoff to
-    # now-or-later, which would prune every active member (a full roster
-    # wipe); a non-numeric value would otherwise 500.
+    # A non-numeric value would otherwise 500. The backend clamps to >= 1.
     try:
-        stale_minutes = max(1, int(raw_stale))
+        stale_minutes = int(raw_stale)
     except (TypeError, ValueError):
         raise HTTPException(400, "stale_minutes must be an integer >= 1")
-    be = get_backend()
-    from datetime import datetime, timezone, timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
-    rows = be.conn.execute(
-        "SELECT member_id FROM members WHERE hub_id = ? AND (last_seen IS NOT NULL AND last_seen < ?) AND member_type != 'human'",
-        (hub_id, cutoff),
-    ).fetchall()
-    pruned = [r["member_id"] for r in rows]
-    if pruned:
-        be.conn.execute(
-            f"DELETE FROM members WHERE hub_id = ? AND member_id IN ({','.join('?' * len(pruned))})",
-            (hub_id, *pruned),
-        )
-        be.conn.commit()
+    pruned = get_backend().prune_members(hub_id, stale_minutes)
     return {"pruned": pruned, "count": len(pruned)}
 
 
