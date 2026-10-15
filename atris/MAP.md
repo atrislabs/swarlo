@@ -43,8 +43,8 @@ Last updated: 2026-07-11
 - `tests/test_briefing_scorers.py:1` — scorer unit tests: pure-Python scorer edge cases without a live server
 - `tests/test_integration.py:1` — e2e 3-agent server test: register, claim/report/conflict cycle, board state verification
 - `tests/test_coordination_loop.py:1` — e2e coordination lifecycle: 3 agents, task lifecycle, conflict handling
-- `tests/test_repeat_fold.py:1` — repeat-post folding: same member + hub + first 80 chars within window bumps repeat_count
-- `swarlo/sqlite_backend.py:502` — `_fold_repeat_post`: repeat fold check called from `create_post` (:459); plain messages only
+- `tests/test_repeat_fold.py:1` — repeat-post folding: same member + hub + kind + first 80 chars (numbers ignored) within window bumps repeat_count
+- `swarlo/sqlite_backend.py:512` — `_fold_repeat_post`: repeat fold check called from `create_post` (:469); any post without task_key (messages, nudges) except claims/results; digits ignored via `_fold_head`
 
 ## Atris Layer
 

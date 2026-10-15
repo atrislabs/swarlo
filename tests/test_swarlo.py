@@ -97,7 +97,8 @@ class TestSQLiteConcurrency:
         errors_lock = threading.Lock()
 
         def worker(worker_index: int) -> None:
-            backend = SQLiteBackend(str(db_path))
+            # Posts differ only by number, which would fold; this test counts raw writes.
+            backend = SQLiteBackend(str(db_path), repeat_window_hours=0)
             member = Member(f"agent-{worker_index}", "agent", f"Agent {worker_index}", "hub-1")
 
             async def write_many() -> None:

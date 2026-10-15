@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -17,10 +18,18 @@ from .types import Member, Post, Reply, ClaimResult
 DEFAULT_CHANNELS = ["general", "experiments", "outreach", "ops", "policies", "escalations"]
 SQLITE_BUSY_TIMEOUT_MS = 5000
 EXPIRE_CLAIM_BATCH_LIMIT = 500
-# Same member + same hub + same first N chars inside the window folds into
-# the earlier post (repeat_count bump) instead of a new row.
+# Same member + same hub + same kind + same first N chars (numbers ignored)
+# inside the window folds into the earlier post (repeat_count bump) instead
+# of a new row. Matches how the Real Coordination judge counts repeats.
 REPEAT_FOLD_PREFIX_CHARS = 80
 REPEAT_FOLD_WINDOW_HOURS = 24
+# Coordination state: these stay distinct rows even without a task_key.
+REPEAT_FOLD_EXEMPT_KINDS = ("claim", "result")
+
+
+def _fold_head(content: str | None) -> str:
+    """First N chars with digit runs as '#': "1 commit ahead" == "6 commits ahead" heads."""
+    return re.sub(r"\d+", "#", (content or "")[:REPEAT_FOLD_PREFIX_CHARS])
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
@@ -184,6 +193,7 @@ class SQLiteBackend(SwarloBackend):
             timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
         )
         conn.row_factory = sqlite3.Row
+        conn.create_function("fold_head", 1, _fold_head, deterministic=True)
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -501,22 +511,22 @@ class SQLiteBackend(SwarloBackend):
 
     def _fold_repeat_post(self, hub_id: str, member: Member, content: str,
                           kind: str, task_key: str | None, now: str) -> Post | None:
-        """Bump and return an earlier identical post, or None to insert.
+        """Bump and return an earlier repeat post, or None to insert.
 
-        Only plain messages fold: claims, results, assigns and other
-        task-bound posts carry coordination state and must stay distinct
-        rows. Caller holds _write_lock.
+        Every post without a task_key folds (messages, orchestrator nudges,
+        ...) except claims and results; task-bound posts carry coordination
+        state and must stay distinct rows. Caller holds _write_lock.
         """
-        if self.repeat_window_hours <= 0 or kind != "message" or task_key:
+        if (self.repeat_window_hours <= 0 or task_key
+                or kind in REPEAT_FOLD_EXEMPT_KINDS):
             return None
         cutoff = (datetime.fromisoformat(now)
                   - timedelta(hours=self.repeat_window_hours)).isoformat()
-        prefix = content[:REPEAT_FOLD_PREFIX_CHARS]
         row = self.conn.execute(
-            "SELECT * FROM posts WHERE hub_id = ? AND member_id = ? AND kind = 'message' "
-            "AND task_key IS NULL AND created_at >= ? AND substr(content, 1, ?) = ? "
+            "SELECT * FROM posts WHERE hub_id = ? AND member_id = ? AND kind = ? "
+            "AND task_key IS NULL AND created_at >= ? AND fold_head(content) = ? "
             "ORDER BY created_at DESC LIMIT 1",
-            (hub_id, member.member_id, cutoff, REPEAT_FOLD_PREFIX_CHARS, prefix),
+            (hub_id, member.member_id, kind, cutoff, _fold_head(content)),
         ).fetchone()
         if row is None:
             return None

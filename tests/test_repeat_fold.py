@@ -66,8 +66,8 @@ class TestRepeatFold:
 
     @pytest.mark.asyncio
     async def test_different_prefix_inserts(self, backend, member_a):
-        first = await backend.create_post("hub-1", member_a, "general", "a" * 79 + "1")
-        second = await backend.create_post("hub-1", member_a, "general", "a" * 79 + "2")
+        first = await backend.create_post("hub-1", member_a, "general", "a" * 79 + "b")
+        second = await backend.create_post("hub-1", member_a, "general", "a" * 79 + "c")
         assert second.post_id != first.post_id
         assert _row_count(backend) == 2
 
@@ -143,3 +143,53 @@ class TestRepeatFold:
         post = await backend.create_post("hub-1", member_a, "general", "once")
         assert post.repeat_count == 1
         assert "repeat_count" not in post.to_dict()
+
+    @pytest.mark.asyncio
+    async def test_numbers_ignored_when_matching(self, backend, member_a):
+        first = await backend.create_post("hub-1", member_a, "general", "branch is 1 commit ahead, 3 files dirty")
+        second = await backend.create_post("hub-1", member_a, "general", "branch is 12 commit ahead, 40 files dirty")
+        assert second.post_id == first.post_id
+        assert second.repeat_count == 2
+        assert _row_count(backend) == 1
+
+    @pytest.mark.asyncio
+    async def test_numbers_ignored_only_in_first_80_chars(self, backend, member_a):
+        head = "y" * 78
+        first = await backend.create_post("hub-1", member_a, "general", head + "7 left")
+        second = await backend.create_post("hub-1", member_a, "general", head + "x left")
+        assert second.post_id != first.post_id
+
+    @pytest.mark.asyncio
+    async def test_nudge_with_changing_numbers_folds(self, backend, member_a):
+        first = await backend.create_post(
+            "hub-1", member_a, "general", "3 agent(s) idle. Post new tasks or ping them.", kind="nudge"
+        )
+        for n in (5, 2):
+            last = await backend.create_post(
+                "hub-1", member_a, "general", f"{n} agent(s) idle. Post new tasks or ping them.", kind="nudge"
+            )
+        assert last.post_id == first.post_id
+        assert last.kind == "nudge"
+        assert last.repeat_count == 3
+        assert _row_count(backend) == 1
+
+    @pytest.mark.asyncio
+    async def test_nudge_does_not_fold_into_message(self, backend, member_a):
+        first = await backend.create_post("hub-1", member_a, "general", "4 agents idle")
+        second = await backend.create_post("hub-1", member_a, "general", "4 agents idle", kind="nudge")
+        assert second.post_id != first.post_id
+        assert second.kind == "nudge"
+
+    @pytest.mark.asyncio
+    async def test_nudge_with_task_key_never_folds(self, backend, member_a):
+        first = await backend.create_post("hub-1", member_a, "general", "ping", kind="nudge", task_key="t-1")
+        second = await backend.create_post("hub-1", member_a, "general", "ping", kind="nudge", task_key="t-1")
+        assert second.post_id != first.post_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["claim", "result"])
+    async def test_claims_and_results_without_task_key_never_fold(self, backend, member_a, kind):
+        first = await backend.create_post("hub-1", member_a, "general", "done 1", kind=kind)
+        second = await backend.create_post("hub-1", member_a, "general", "done 2", kind=kind)
+        assert second.post_id != first.post_id
+        assert _row_count(backend) == 2
