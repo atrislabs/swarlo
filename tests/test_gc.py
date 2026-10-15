@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from swarlo.gc import archive_posts, keep_backups, record_run, rotate_logs, start_schedule
+from swarlo.gc import (
+    archive_posts,
+    keep_backups,
+    record_run,
+    rotate_logs,
+    start_schedule,
+    trim_scores,
+)
 from swarlo.sqlite_backend import SQLiteBackend
 
 MB = 1024 * 1024
@@ -140,6 +147,23 @@ def test_count_mismatch_leaves_live_db_untouched(live, tmp_path):
 
     assert _ids(live, "posts", "post_id") == {"p1"}
     assert _ids(live, "replies", "reply_id") == {"r1"}
+
+
+def test_trim_scores_drops_old_rows_for_one_hub(live):
+    rows = [("hub-1", _ago(10)), ("hub-1", _ago(8)), ("hub-1", _ago(1)), ("hub-2", _ago(10))]
+    with sqlite3.connect(live) as c:
+        c.executemany(
+            "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, "
+            "avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, computed_at) "
+            "VALUES (?, 0, 0, 0, 0, 0, 0, 0, ?)",
+            rows,
+        )
+
+    assert trim_scores(live, "hub-1", days=7) == 2
+    with sqlite3.connect(live) as c:
+        left = sorted(c.execute("SELECT hub_id, computed_at FROM scores").fetchall())
+    assert left == sorted([rows[2], rows[3]])
+    assert trim_scores(live, "hub-1", days=7) == 0
 
 
 def test_rotate_logs_copy_truncates_big_log(tmp_path):

@@ -161,6 +161,20 @@ def archive_posts(db_path, archive_dir, hub: str, days: int = 30) -> dict[Path, 
         conn.close()
 
 
+def trim_scores(db_path, hub: str, days: int = 7) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM scores WHERE hub_id = ? AND computed_at < ?", (hub, cutoff)
+            )
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 _CHUNK = 1 << 20
 
 
