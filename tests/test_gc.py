@@ -14,6 +14,7 @@ from swarlo.gc import (
     rotate_logs,
     start_schedule,
     trim_scores,
+    vacuum,
 )
 from swarlo.sqlite_backend import SQLiteBackend
 
@@ -382,3 +383,29 @@ def test_schedule_waits_out_a_recent_scheduled_run(tmp_path):
     asyncio.run(main())
     assert calls == []
     assert len(_lines(tmp_path)) == 1
+
+
+def _row_counts(db):
+    with sqlite3.connect(db) as c:
+        tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        return {t: c.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in tables}
+
+
+def test_vacuum_frees_pages_and_keeps_rows(live):
+    for i in range(400):
+        _post(live, f"p{i}", _ago(1))
+    with sqlite3.connect(live) as c:
+        c.execute("UPDATE posts SET content = ? ", ("x" * 2000,))
+        c.execute("DELETE FROM posts WHERE post_id != 'p0'")
+        free_before = c.execute("PRAGMA freelist_count").fetchone()[0]
+    counts = _row_counts(live)
+    assert free_before > 100
+
+    freed = vacuum(live)
+
+    assert freed >= free_before
+    assert _row_counts(live) == counts
+    with sqlite3.connect(live) as c:
+        assert c.execute("PRAGMA freelist_count").fetchone()[0] == 0
+    wal = live.with_name(live.name + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0

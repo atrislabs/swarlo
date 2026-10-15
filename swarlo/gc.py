@@ -19,6 +19,11 @@ drop_idle_members(db_path, hub, days=30)
     ``days``, the same rule the self-pruning judge counts. Returns the ids
     removed.
 
+vacuum(db_path)
+    Checkpoints the WAL into the database (TRUNCATE), rebuilds the file with
+    VACUUM, and checkpoints again so the rebuilt pages do not linger in the
+    WAL. Row contents are unchanged. Returns the number of pages freed.
+
 Disk hygiene for a swarlo home directory (normally ``~/.swarlo``).
 
 rotate_logs(home, max_mb=10)
@@ -194,6 +199,20 @@ def drop_idle_members(db_path, hub: str, days: int = 30) -> list[str]:
             ids = [r[0] for r in conn.execute(f"SELECT member_id FROM members WHERE {where}", (hub, cutoff))]
             conn.execute(f"DELETE FROM members WHERE {where}", (hub, cutoff))
         return ids
+    finally:
+        conn.close()
+
+
+def vacuum(db_path) -> int:
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        (before,) = conn.execute("PRAGMA page_count").fetchone()
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        (after,) = conn.execute("PRAGMA page_count").fetchone()
+        return before - after
     finally:
         conn.close()
 

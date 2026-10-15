@@ -1,0 +1,13 @@
+---
+name: auto-learned
+description: Verified patterns crystallized from passing runs for auto-improver. Bounded to 5 newest patterns so context never bloats.
+---
+
+# Auto-Learned Verified Patterns
+
+- **2026-10-15 (environment)**: The live `~/.swarlo` now has only today's 3 database backups, and the mission check passes (exit 0). The live database was not touched, and  -> Verify: `python3 -c "import glob,os,sqlite3,sys; h=os.path.expanduser('~/.swarlo'); b=glo` -> Next push: call the backup cleanup (keep=3) from the daily scheduled cleanup, so backups stop piling up between manual runs.
+- **2026-10-15 (environment)**: Both oversized logs in ~/.swarlo are now under 10 MB, with each log's most recent part saved in a backup file. The mission's check passes (e -> Verify: `python3 -c "import glob,os,sys; h=os.path.expanduser('~/.swarlo'); logs=glob.glo` -> Next push: run the log cleanup from the daily scheduled cleanup with a limit under 10 MB, or change the function to measure in MB s
+- **2026-10-15 (environment)**: The board now has a cleanup step that removes members unseen for 30 days. I ran it once on the live atris hub and it removed 12 stale agents -> Verify: `grep -q '^def drop_idle_members' swarlo/gc.py && python3 -m pytest -q tests/test` -> Next push: run the idle-member cleanup from the daily scheduled cleanup, next to the score trimmer.
+- **2026-10-15 (environment)**: I added a cleanup step for old board scores and ran it once on the atris hub. It removed 66,830 score rows older than 7 days, leaving 4,622. -> Verify: `python3 -m pytest -q tests/test_gc.py -k trim_scores && python3 -c "import sqlit` -> Next push: call the score trimmer from the scheduled daily cleanup, right after the old-post archiver, so score history stays cappe
+- **2026-10-15 (environment)**: I backed up the live board database, then moved 4644 posts older than 30 days into 7 monthly archive files. The frozen verifier passed (prin -> Verify: `python3 -c 'import sqlite3,glob,os,datetime as d;H=os.path.expanduser("~/.swarlo` -> Next push: add a swarlo gc posts --hub X --days 30 --dry-run command that prints per-month counts, so a person can repeat this mont
+- **2026-10-15 (environment)**: The live hub database is compacted: 17.8 MB down to 1.5 MB, the write-ahead log emptied, no row counts changed. Deleting rows never shrinks the file; it takes VACUUM plus a second TRUNCATE checkpoint. -> Verify: `python3 -c "import sqlite3,os;c=sqlite3.connect(os.path.expanduser('~/.swarlo/atris.db'));print(c.execute('PRAGMA freelist_count').fetchone(),c.execute('PRAGMA page_count').fetchone())"` -> Next push: run vacuum at the end of the daily scheduled cleanup.
