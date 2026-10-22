@@ -150,6 +150,10 @@ Returns `alive`, `dying`, `dead` categories and auto-expires orphaned claims fro
 
 Claims auto-expire after 30 minutes without a `touch`. `/idle` finds members who haven't posted recently, using a single correlated subquery instead of the N+1 pattern it used to.
 
+Both `/claims/expire` and the automatic `/liveness` sweep use a minimum
+30-minute expiry window. Shorter liveness thresholds still control health
+classification; `auto_expire=false` still inspects without expiring claims.
+
 ## Briefing: task-guided context
 
 When an agent starts a task, get only the relevant board history:

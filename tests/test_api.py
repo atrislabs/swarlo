@@ -695,6 +695,50 @@ class TestExpireClaims:
         assert client.post("/api/atris/claims/expire").status_code == 401
 
 
+class TestClaimExpirySecurity:
+    @pytest.mark.parametrize("route", ["expire", "liveness"])
+    @pytest.mark.parametrize("window", [1, 0, -5])
+    def test_short_windows_preserve_active_claims(self, client, fresh_backend, route, window):
+        owner = _auth(_register(client, "owner", "Owner"))
+        caller = _auth(_register(client, "caller", "Caller"))
+        for task_key, age in (("fresh", 70), ("stale", 31 * 60)):
+            response = client.post("/api/atris/channels/general/claim", headers=owner,
+                                   json={"task_key": task_key, "content": "Working"})
+            assert response.status_code == 201
+            heartbeat = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+            fresh_backend.conn.execute(
+                "UPDATE posts SET created_at = ?, metadata = ? WHERE post_id = ?",
+                (heartbeat, json.dumps({"heartbeat_at": heartbeat}), response.json()["post_id"]),
+            )
+            fresh_backend.conn.commit()
+        if route == "expire":
+            response = client.post("/api/atris/claims/expire", headers=caller,
+                                   json={"stale_minutes": window})
+            expired = response.json()["expired"]
+        else:
+            response = client.get(f"/api/atris/liveness?stale_minutes={window}", headers=caller)
+            expired = response.json()["expired_on_sweep"]
+        assert response.status_code == 200
+        assert expired == ["stale"]
+        for task_key, expected in (("fresh", 409), ("stale", 201)):
+            response = client.post("/api/atris/channels/general/claim", headers=caller,
+                                   json={"task_key": task_key, "content": "Taking over"})
+            assert response.status_code == expected
+
+    def test_liveness_without_sweeping_does_not_expire(self, client, fresh_backend):
+        owner = _auth(_register(client))
+        response = client.post("/api/atris/channels/general/claim", headers=owner,
+                               json={"task_key": "old", "content": "Working"})
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        fresh_backend.conn.execute("UPDATE posts SET created_at = ?, metadata = '{}' WHERE post_id = ?",
+                                   (old, response.json()["post_id"]))
+        fresh_backend.conn.commit()
+        response = client.get("/api/atris/liveness?stale_minutes=1&auto_expire=false", headers=owner)
+        assert response.status_code == 200
+        assert response.json()["expired_on_sweep"] == []
+        assert fresh_backend.conn.execute("SELECT status FROM posts WHERE task_key = 'old'").fetchone()[0] == "open"
+
+
 class TestRetryClaims:
     def test_retry_returns_empty_when_no_failed_tasks(self, client):
         """Retry with no failed tasks returns empty list."""

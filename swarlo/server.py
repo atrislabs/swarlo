@@ -781,7 +781,9 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30,
     # the expiry ran, not what was stale a second ago.
     expired_keys: list[str] = []
     if auto_expire:
-        expired_keys = await be.force_expire_claims(hub_id, stale_minutes=stale_minutes)
+        expired_keys = await be.force_expire_claims(
+            hub_id, stale_minutes=max(OPEN_CLAIM_STALE_MINUTES, stale_minutes),
+        )
 
     now = datetime.now(timezone.utc)
     cutoff_dying = (now - timedelta(minutes=stale_minutes)).isoformat()
@@ -844,14 +846,11 @@ async def expire_stale_claims(hub_id: str, request: Request):
     except Exception:
         body = {}
     raw_stale = body.get("stale_minutes", 30) if isinstance(body, dict) else 30
-    # Clamp to >= 1 minute. A zero or negative window moves the cutoff to
-    # now-or-later, expiring every currently-open claim including fresh,
-    # actively-heartbeating ones (a full in-flight-work wipe); a non-numeric
-    # value would otherwise 500 inside timedelta.
+    # Cleanup cannot shorten the normal claim heartbeat budget.
     try:
-        stale_minutes = max(1, int(raw_stale))
+        stale_minutes = max(OPEN_CLAIM_STALE_MINUTES, int(raw_stale))
     except (TypeError, ValueError):
-        raise HTTPException(400, "stale_minutes must be an integer >= 1")
+        raise HTTPException(400, "stale_minutes must be an integer")
     expired = await get_backend().force_expire_claims(hub_id, stale_minutes=stale_minutes)
     return {"expired": expired, "count": len(expired)}
 
