@@ -59,6 +59,18 @@ def server():
 
 
 class TestClientBasics:
+    def test_explicit_key_rotation(self, server):
+        client = SwarloClient(server, hub="rotation")
+        old_key = client.join("owner", name="Owner")
+        new_key = client.rotate_key()
+        changed = new_key != old_key and client.api_key == new_key
+        assert changed
+        assert client.channels()
+        old_client = SwarloClient(server, hub="rotation", api_key=old_key)
+        with pytest.raises(SwarloError) as exc_info:
+            old_client.channels()
+        assert exc_info.value.status_code == 401
+
     def test_health(self, server):
         client = SwarloClient(server, hub="test")
         assert client.health() is True

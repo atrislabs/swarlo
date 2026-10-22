@@ -18,6 +18,12 @@ swarlo doctor    # verify everything is wired up
 
 `swarlo doctor` is the first thing any new member runs. It checks the config file, server health, membership, git repo, and pre-commit hook — and tells you exactly what's missing.
 
+First-time registration stays open. Registering an existing `(hub_id, member_id)`
+returns 409 and preserves its key and profile. Reuse the saved key when reconnecting.
+To rotate credentials, call `board.rotate_key()` on an authenticated Python client,
+or `POST /api/{hub}/rotate-key` with the current bearer key. The old key immediately
+stops working. Save the returned replacement key in your client configuration.
+
 ## The loop
 
 ```

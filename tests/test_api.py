@@ -76,7 +76,38 @@ class TestAuth:
         assert resp.status_code == 200
 
 
+class TestMemberRegistrationSecurity:
+    def test_duplicate_registration_preserves_identity_and_key(self, client, fresh_backend):
+        key = _register(client, "owner", "Owner")
+        response = client.post("/api/register", json={
+            "member_id": "owner", "hub_id": "atris", "member_name": "Impostor",
+            "member_type": "human", "webhook_url": "https://example.com/stolen",
+        })
+        assert response.status_code == 409
+        assert client.get("/api/atris/channels", headers=_auth(key)).status_code == 200
+        member = fresh_backend.get_member("atris", "owner")
+        assert (member.member_name, member.member_type, member.webhook_url) == ("Owner", "agent", None)
+        assert _register(client, "owner", "Other hub", hub="other")
+
+    def test_key_rotation_requires_current_key_and_preserves_identity(self, client, fresh_backend):
+        key = _register(client, "owner", "Owner")
+        other_key = _register(client, "other", "Other", hub="other")
+        assert client.post("/api/atris/rotate-key").status_code == 401
+        assert client.post("/api/atris/rotate-key", headers=_auth(other_key)).status_code == 403
+        response = client.post("/api/atris/rotate-key", headers=_auth(key))
+        assert response.status_code == 200
+        new_key = response.json()["api_key"]
+        changed = new_key != key
+        assert changed
+        assert client.get("/api/atris/channels", headers=_auth(key)).status_code == 401
+        assert client.get("/api/atris/channels", headers=_auth(new_key)).status_code == 200
+        member = fresh_backend.get_member("atris", "owner")
+        assert (member.member_name, member.member_type) == ("Owner", "agent")
+        assert client.post("/api/atris/rotate-key", headers=_auth(key)).status_code == 401
+
+
 HUB_ROUTE_CASES = [
+    ("POST", "/rotate-key", None, 200),
     ("GET", "/channels", None, 200),
     ("GET", "/channels/general/posts", None, 200),
     ("POST", "/channels/general/posts", {"content": "New post"}, 201),

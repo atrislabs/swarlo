@@ -340,10 +340,20 @@ class SQLiteBackend(SwarloBackend):
     def register_member(self, member: Member, api_key: str | None = None) -> None:
         with self._write_lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (member.member_id, member.hub_id, member.member_type, member.member_name, api_key, member.webhook_url, _utcnow()),
             )
             self.conn.commit()
+
+    def rotate_member_key(self, member: Member, current_key: str, new_key: str) -> bool:
+        """Replace only this member's key, provided it has not changed since authentication."""
+        with self._write_lock:
+            cur = self.conn.execute(
+                "UPDATE members SET api_key = ? WHERE hub_id = ? AND member_id = ? AND api_key = ?",
+                (new_key, member.hub_id, member.member_id, current_key),
+            )
+            self.conn.commit()
+        return cur.rowcount == 1
 
     def get_member(self, hub_id: str, member_id: str) -> Member | None:
         row = self.conn.execute(

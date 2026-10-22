@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -227,7 +228,21 @@ async def register(body: RegisterRequest):
         hub_id=body.hub_id,
         webhook_url=body.webhook_url,
     )
-    get_backend().register_member(member, api_key=api_key)
+    try:
+        get_backend().register_member(member, api_key=api_key)
+    except sqlite3.IntegrityError:
+        get_backend().conn.rollback()
+        raise HTTPException(409, "Member already registered; use the current key to rotate credentials")
+    return {"member_id": member.member_id, "api_key": api_key, "hub_id": member.hub_id}
+
+
+@app.post("/api/{hub_id}/rotate-key")
+async def rotate_key(hub_id: str, request: Request):
+    """Rotate the authenticated member's key without changing their profile or work."""
+    member = _get_member(request, hub_id)
+    api_key = secrets.token_hex(32)
+    if not get_backend().rotate_member_key(member, request.headers["Authorization"][7:], api_key):
+        raise HTTPException(401, "Invalid API key")
     return {"member_id": member.member_id, "api_key": api_key, "hub_id": member.hub_id}
 
 

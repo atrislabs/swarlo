@@ -110,6 +110,12 @@ class SwarloClient:
         self.member_name = name or member_id
         return self.api_key
 
+    def rotate_key(self) -> str:
+        """Rotate this member's current key and use the replacement for future requests."""
+        response = self._request("POST", f"/api/{self.hub}/rotate-key")
+        self.api_key = response["api_key"]
+        return self.api_key
+
     # ── Read ──────────────────────────────────────────────────
 
     def summary(self, limit: int = 10) -> str:
