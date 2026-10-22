@@ -128,8 +128,8 @@ async def _stop_prune_schedule():
 
 # ── Auth ────────────────────────────────────────────────────
 
-def _get_member(request: Request) -> Member:
-    """Authenticate request via Bearer token and return the Member. Raises 401 on failure."""
+def _get_member(request: Request, hub_id: str) -> Member:
+    """Authenticate the member (401) and require access to the requested hub (403)."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(401, "Missing Authorization: Bearer <api_key>")
@@ -138,6 +138,8 @@ def _get_member(request: Request) -> Member:
     member = be.authenticate(api_key)
     if not member:
         raise HTTPException(401, "Invalid API key")
+    if member.hub_id != hub_id:
+        raise HTTPException(403, "Member does not belong to this hub")
     # Bump last_seen on every authenticated call
     try:
         from datetime import datetime, timezone
@@ -242,7 +244,7 @@ async def health():
 @app.get("/api/{hub_id}/channels")
 async def list_channels(hub_id: str, request: Request):
     """List all channels in the hub including defaults and custom."""
-    _get_member(request)
+    _get_member(request, hub_id)
     channels = await get_backend().list_channels(hub_id)
     return {"channels": channels}
 
@@ -252,7 +254,7 @@ async def list_channels(hub_id: str, request: Request):
 @app.get("/api/{hub_id}/channels/{channel}/posts")
 async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 10):
     """List recent posts in a channel, newest first."""
-    _get_member(request)
+    _get_member(request, hub_id)
     # Floor at 1: a negative limit reaches SQLite as `LIMIT -n`, which SQLite
     # treats as unbounded — returning the whole channel and bypassing the cap.
     posts = await get_backend().read_channel(hub_id, channel, limit=max(1, min(limit, 50)))
@@ -264,7 +266,7 @@ async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 1
 @app.post("/api/{hub_id}/channels/{channel}/posts", status_code=201)
 async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request, background_tasks: BackgroundTasks):
     """Create a new post in a channel. Resolves @mentions and fires webhooks."""
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     post = await get_backend().create_post(
         hub_id,
         member,
@@ -286,7 +288,7 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
 @app.post("/api/{hub_id}/channels/{channel}/claim", status_code=201)
 async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Request):
     """Claim a task to prevent duplicate work. Returns 409 if already claimed."""
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     result = await get_backend().claim(
         hub_id, member, channel, body.task_key, body.content,
         depends_on=body.depends_on,
@@ -309,7 +311,7 @@ class FileClaimRequest(BaseModel):
 async def claim_file(hub_id: str, channel: str, body: FileClaimRequest, request: Request):
     """Claim a file to prevent two agents editing it simultaneously.
     Uses task_key = 'file:<path>' convention on the existing claim system."""
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     task_key = f"file:{body.file_path}"
     desc = body.content or f"Editing {body.file_path}"
     result = await get_backend().claim(hub_id, member, channel, task_key, desc)
@@ -321,7 +323,7 @@ async def claim_file(hub_id: str, channel: str, body: FileClaimRequest, request:
 @app.get("/api/{hub_id}/file-claims")
 async def list_file_claims(hub_id: str, request: Request):
     """List all currently claimed files across all channels."""
-    _get_member(request)
+    _get_member(request, hub_id)
     claims = await get_backend().get_open_claims(hub_id)
     file_claims = [c for c in claims if c.task_key and c.task_key.startswith("file:")]
     return {
@@ -344,7 +346,7 @@ async def list_file_claims(hub_id: str, request: Request):
 @app.post("/api/{hub_id}/channels/{channel}/assign", status_code=201)
 async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: Request, background_tasks: BackgroundTasks):
     """Push-assign a task to a specific member. Creates a claim on their behalf and notifies via webhook."""
-    assigner = _get_member(request)
+    assigner = _get_member(request, hub_id)
     be = get_backend()
     result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
                              depends_on=body.depends_on, priority=body.priority)
@@ -380,7 +382,7 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
     if none). This eliminates the poll round-trip: report done → get next
     in one call. The agent loop becomes event-driven instead of timer-driven.
     """
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     try:
         post = await get_backend().report(
             hub_id, member, channel, body.task_key, body.status, body.content,
@@ -417,7 +419,7 @@ class TouchRequest(BaseModel):
 @app.post("/api/{hub_id}/channels/{channel}/touch")
 async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Request):
     """Touch a claim to refresh its timestamp and prevent expiration."""
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     task_key = body.task_key
     ok = await get_backend().touch_claim(hub_id, member.member_id, task_key)
     if not ok:
@@ -445,7 +447,7 @@ async def ping(hub_id: str, member_id: str, request: Request,
     The extra work is skipped entirely when include is None, so this
     does not regress the cheapest path.
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     be = get_backend()
 
     # Default: since last 15 minutes
@@ -513,7 +515,7 @@ async def my_ready_tasks(hub_id: str, member_id: str, request: Request):
     workflow uses task dependencies. Short-circuits the "try to claim,
     get blocked, move on" loop into one call.
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     be = get_backend()
     posts = await be.get_ready_tasks(hub_id, member_id)
     return {
@@ -535,7 +537,7 @@ async def my_open_tasks(hub_id: str, member_id: str, request: Request):
     Combine with /ping for the full notification badge → work-list flow.
     Use /ready instead if you want only the subset whose deps are done.
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     be = get_backend()
     posts = await be.get_my_open_tasks(hub_id, member_id)
     return {
@@ -552,7 +554,7 @@ async def handoff_trail(hub_id: str, task_key: str, request: Request, depth: int
     Powers `swarlo handoff`. Backend already implements the walk;
     this route was documented and CLI-wired but never mounted.
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     depth = max(1, min(int(depth), 10))
     trail = get_backend().walk_handoff_trail(hub_id, task_key, depth=depth)
     return {
@@ -579,7 +581,7 @@ async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
     - working : last_active within idle_minutes (producing) OR has open claim
     - idle    : alive but neither of the above
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     be = get_backend()
 
     now = datetime.now(timezone.utc)
@@ -655,7 +657,7 @@ async def get_briefing(hub_id: str, body: BriefingRequest, request: Request):
     """
     from . import _briefing
     import re as _re
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     be = get_backend()
 
     # Reject unknown scorers instead of silently falling back to tfidf.
@@ -755,7 +757,7 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30,
     garbage collection for dead-agent claims. Pass auto_expire=false if
     you only want to observe without cleaning up.
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     be = get_backend()
     from datetime import datetime, timezone, timedelta
 
@@ -821,7 +823,7 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30,
 @app.post("/api/{hub_id}/claims/expire")
 async def expire_stale_claims(hub_id: str, request: Request):
     """Force-expire claims that have been stale beyond the threshold."""
-    _get_member(request)
+    _get_member(request, hub_id)
     try:
         body = await request.json()
     except Exception:
@@ -844,7 +846,7 @@ async def expire_stale_claims(hub_id: str, request: Request):
 @app.post("/api/{hub_id}/claims/retry")
 async def retry_failed_tasks(hub_id: str, request: Request):
     """Re-open failed tasks for retry up to max_retries limit."""
-    _get_member(request)
+    _get_member(request, hub_id)
     try:
         body = await request.json()
     except Exception:
@@ -868,7 +870,7 @@ async def retry_failed_tasks(hub_id: str, request: Request):
 @app.get("/api/{hub_id}/claims")
 async def list_claims(hub_id: str, request: Request, channel: Optional[str] = None):
     """List all open claims in the hub, optionally filtered by channel."""
-    _get_member(request)
+    _get_member(request, hub_id)
     claims = await get_backend().get_open_claims(hub_id, channel=channel)
     return {"count": len(claims), "claims": [c.to_dict() for c in claims]}
 
@@ -891,7 +893,7 @@ async def replay_posts(
 
     Returns posts in chronological order (oldest first), capped at `limit`.
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     if not since or not since.strip():
         raise HTTPException(400, "since query param is required (ISO8601 timestamp)")
     try:
@@ -934,7 +936,7 @@ async def replay_posts(
 @app.get("/api/{hub_id}/summary")
 async def get_summary(hub_id: str, request: Request, limit: int = 10):
     """Get a personalized summary of recent activity for the authenticated member."""
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     text = await get_backend().summarize_for_member(hub_id, member.member_id, limit=max(1, min(limit, 50)))
     return {"summary": text}
 
@@ -944,7 +946,7 @@ async def get_summary(hub_id: str, request: Request, limit: int = 10):
 @app.get("/api/{hub_id}/posts/{post_id}/replies")
 async def list_replies(hub_id: str, post_id: str, request: Request):
     """List all replies to a specific post."""
-    _get_member(request)
+    _get_member(request, hub_id)
     replies = await get_backend().get_replies(hub_id, post_id)
     return {
         "post_id": post_id,
@@ -956,7 +958,7 @@ async def list_replies(hub_id: str, post_id: str, request: Request):
 @app.post("/api/{hub_id}/posts/{post_id}/replies", status_code=201)
 async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: Request):
     """Create a reply to an existing post."""
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     reply = await get_backend().reply(hub_id, member, post_id, body.content)
     return reply.to_dict()
 
@@ -1048,7 +1050,7 @@ async def suggest_tasks(hub_id: str, request: Request):
     This is the RL self-feeding loop: when the queue is empty, the system
     generates its own work based on what it observes.
     """
-    _get_member(request)
+    _get_member(request, hub_id)
     be = get_backend()
     from datetime import datetime, timezone, timedelta
 
@@ -1168,7 +1170,7 @@ async def suggest_tasks(hub_id: str, request: Request):
 @app.get("/api/{hub_id}/members")
 async def list_members(hub_id: str, request: Request):
     """List all registered members in the hub."""
-    _get_member(request)
+    _get_member(request, hub_id)
     rows = get_backend().conn.execute(
         "SELECT member_id, member_name, member_type, created_at, last_seen FROM members WHERE hub_id = ?",
         (hub_id,),
@@ -1179,7 +1181,7 @@ async def list_members(hub_id: str, request: Request):
 @app.delete("/api/{hub_id}/members/{member_id}")
 async def delete_member(hub_id: str, member_id: str, request: Request):
     """Remove a member from the hub."""
-    caller = _get_member(request)
+    caller = _get_member(request, hub_id)
     if not get_backend().delete_member(hub_id, member_id):
         raise HTTPException(404, f"Member {member_id} not found")
     return {"deleted": member_id}
@@ -1188,7 +1190,7 @@ async def delete_member(hub_id: str, member_id: str, request: Request):
 @app.post("/api/{hub_id}/prune")
 async def prune_members(hub_id: str, request: Request):
     """Remove members not seen in `stale_minutes` (default 60)."""
-    caller = _get_member(request)
+    caller = _get_member(request, hub_id)
     try:
         body = await request.json()
     except Exception:
@@ -1215,7 +1217,7 @@ async def compute_score(hub_id: str, request: Request):
         tasks_shipped: completed results
         avg_time_to_claim: average seconds from task post to claim
     """
-    _get_member(request)  # Auth check
+    _get_member(request, hub_id)  # Auth check
     be = get_backend()
     from datetime import datetime, timezone, timedelta
 
@@ -1460,7 +1462,7 @@ async def list_unclaimed(
     channel: Optional[str] = None,
 ):
     """List message tasks that still need an owner."""
-    _get_member(request)
+    _get_member(request, hub_id)
     limit = max(1, min(int(limit), 500))
     tasks = _list_unclaimed_tasks(
         get_backend(), hub_id, limit=limit, channel=channel or None
@@ -1476,7 +1478,7 @@ async def list_xp(
     member_id: Optional[str] = None,
 ):
     """Per-agent XP leaderboard (same mechanics as CLI `swarlo xp`)."""
-    _get_member(request)
+    _get_member(request, hub_id)
     limit = max(1, min(int(limit), 500))
     rows = _compute_per_agent_xp(get_backend(), hub_id)
     if member_id:
@@ -1488,7 +1490,7 @@ async def list_xp(
 @app.get("/api/{hub_id}/scores")
 async def list_scores(hub_id: str, request: Request, limit: int = 10):
     """Persisted coordination score history for `swarlo score-history`."""
-    _get_member(request)
+    _get_member(request, hub_id)
     limit = max(1, min(int(limit), 500))
     be = get_backend()
     rows = be.conn.execute(
@@ -1508,7 +1510,7 @@ async def list_scores(hub_id: str, request: Request, limit: int = 10):
 @app.post("/api/{hub_id}/git/push", status_code=201)
 async def git_push(hub_id: str, request: Request):
     """Push a git bundle to the hub's DAG store."""
-    member = _get_member(request)
+    member = _get_member(request, hub_id)
     body = await request.body()
     if len(body) > 50 * 1024 * 1024:
         raise HTTPException(413, "Bundle too large (max 50MB)")
@@ -1531,7 +1533,7 @@ async def git_push(hub_id: str, request: Request):
 @app.get("/api/{hub_id}/git/fetch/{hash}")
 async def git_fetch(hub_id: str, hash: str, request: Request):
     """Fetch a commit bundle by hash from the DAG store."""
-    _get_member(request)
+    _get_member(request, hub_id)
     dag = get_dag()
     if not dag.commit_exists(hash):
         raise HTTPException(404, "Commit not found")
@@ -1544,14 +1546,14 @@ async def git_fetch(hub_id: str, hash: str, request: Request):
 @app.get("/api/{hub_id}/git/commits")
 async def git_list_commits(hub_id: str, request: Request, member_filter: Optional[str] = None, limit: int = 50):
     """List commits in the hub, optionally filtered by member."""
-    _get_member(request)
+    _get_member(request, hub_id)
     return get_backend().list_commits(hub_id, member_id=member_filter, limit=max(1, min(limit, 200)))
 
 
 @app.get("/api/{hub_id}/git/commits/{hash}")
 async def git_get_commit(hub_id: str, hash: str, request: Request):
     """Get metadata for a specific commit by hash."""
-    _get_member(request)
+    _get_member(request, hub_id)
     commit = get_backend().get_commit(hub_id, hash)
     if not commit:
         raise HTTPException(404, "Commit not found")
@@ -1561,28 +1563,28 @@ async def git_get_commit(hub_id: str, hash: str, request: Request):
 @app.get("/api/{hub_id}/git/commits/{hash}/children")
 async def git_children(hub_id: str, hash: str, request: Request):
     """Get all child commits of a given commit hash."""
-    _get_member(request)
+    _get_member(request, hub_id)
     return get_backend().get_children(hub_id, hash)
 
 
 @app.get("/api/{hub_id}/git/leaves")
 async def git_leaves(hub_id: str, request: Request):
     """Get all leaf commits (commits with no children) in the DAG."""
-    _get_member(request)
+    _get_member(request, hub_id)
     return get_backend().get_leaves(hub_id)
 
 
 @app.get("/api/{hub_id}/git/commits/{hash}/lineage")
 async def git_lineage(hub_id: str, hash: str, request: Request):
     """Get the full ancestor chain from a commit back to root."""
-    _get_member(request)
+    _get_member(request, hub_id)
     return get_backend().get_lineage(hub_id, hash)
 
 
 @app.get("/api/{hub_id}/git/diff/{hash_a}/{hash_b}")
 async def git_diff(hub_id: str, hash_a: str, hash_b: str, request: Request):
     """Get the diff between two commits as plain text."""
-    _get_member(request)
+    _get_member(request, hub_id)
     dag = get_dag()
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(dag.diff(hash_a, hash_b))

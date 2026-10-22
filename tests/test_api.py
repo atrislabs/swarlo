@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from swarlo.server import app, set_backend, set_dag
+from swarlo.server import app, get_dag, set_backend, set_dag
 from swarlo.sqlite_backend import SQLiteBackend
 from swarlo.git_dag import GitDAG
 
@@ -74,6 +74,131 @@ class TestAuth:
         key = _register(client)
         resp = client.get("/api/atris/channels", headers=_auth(key))
         assert resp.status_code == 200
+
+
+HUB_ROUTE_CASES = [
+    ("GET", "/channels", None, 200),
+    ("GET", "/channels/general/posts", None, 200),
+    ("POST", "/channels/general/posts", {"content": "New post"}, 201),
+    ("POST", "/channels/general/claim", {"task_key": "new-task", "content": "Claim"}, 201),
+    ("POST", "/channels/general/claim-file", {"file_path": "example.py"}, 201),
+    ("GET", "/file-claims", None, 200),
+    ("POST", "/channels/general/assign", {
+        "task_key": "assigned-task", "assignee_id": "worker", "content": "Assignment",
+    }, 201),
+    ("POST", "/channels/general/report", {
+        "task_key": "active-task", "status": "done", "content": "Finished",
+    }, 201),
+    ("POST", "/channels/general/touch", {"task_key": "active-task"}, 200),
+    ("GET", "/ping/worker", None, 200),
+    ("GET", "/ready/worker", None, 200),
+    ("GET", "/mine/worker", None, 200),
+    ("GET", "/handoff_trail/active-task", None, 200),
+    ("GET", "/idle", None, 200),
+    ("POST", "/briefing", {"task": "Read hub posts"}, 200),
+    ("GET", "/liveness", None, 200),
+    ("POST", "/claims/expire", {"stale_minutes": 30}, 200),
+    ("POST", "/claims/retry", {"max_retries": 3}, 200),
+    ("GET", "/claims", None, 200),
+    ("GET", "/replay?since=2000-01-01T00:00:00Z", None, 200),
+    ("GET", "/summary", None, 200),
+    ("GET", "/posts/{post_id}/replies", None, 200),
+    ("POST", "/posts/{post_id}/replies", {"content": "New reply"}, 201),
+    ("POST", "/suggest", None, 200),
+    ("GET", "/members", None, 200),
+    ("DELETE", "/members/removable", None, 200),
+    ("POST", "/prune", {"stale_minutes": 60}, 200),
+    ("POST", "/score", None, 200),
+    ("GET", "/unclaimed", None, 200),
+    ("GET", "/xp", None, 200),
+    ("GET", "/scores", None, 200),
+    ("POST", "/git/push", None, 201),
+    ("GET", "/git/fetch/{commit_hash}", None, 200),
+    ("GET", "/git/commits", None, 200),
+    ("GET", "/git/commits/{commit_hash}", None, 200),
+    ("GET", "/git/commits/{commit_hash}/children", None, 200),
+    ("GET", "/git/leaves", None, 200),
+    ("GET", "/git/commits/{commit_hash}/lineage", None, 200),
+    ("GET", "/git/diff/{commit_hash}/{commit_hash}", None, 200),
+]
+
+
+class TestHubAuthorization:
+    def test_every_hub_route_is_covered(self):
+        from starlette.routing import Match
+
+        covered = set()
+        for method, path, _, _ in HUB_ROUTE_CASES:
+            path = path.format(post_id="post", commit_hash="abcd").split("?", 1)[0]
+            scope = {"type": "http", "method": method, "path": f"/api/alpha{path}"}
+            matches = [route for route in app.routes if route.matches(scope)[0] == Match.FULL]
+            assert len(matches) == 1
+            covered.add((method, matches[0].path))
+        expected = {
+            (method, route.path)
+            for route in app.routes if "{hub_id}" in route.path
+            for method in route.methods
+        }
+        assert covered == expected
+
+    @pytest.mark.parametrize("target_hub", ["alpha", "bravo"])
+    @pytest.mark.parametrize("method,path,body,success_status", HUB_ROUTE_CASES,
+                             ids=[f"{method} {path}" for method, path, _, _ in HUB_ROUTE_CASES])
+    def test_member_is_bound_to_own_hub(
+        self, client, fresh_backend, tmp_path, target_hub, method, path, body, success_status,
+    ):
+        headers = {}
+        post_ids = {}
+        for hub in ("alpha", "bravo"):
+            # Identical member IDs ensure authorization uses the hub, not just the ID.
+            headers[hub] = _auth(_register(client, "worker", "Worker", hub=hub))
+            _register(client, "removable", "Removable", hub=hub)
+            post = client.post(f"/api/{hub}/channels/general/posts", headers=headers[hub],
+                               json={"content": f"{hub}-only content"})
+            assert post.status_code == 201
+            post_ids[hub] = post.json()["post_id"]
+            claim = client.post(f"/api/{hub}/channels/general/claim", headers=headers[hub],
+                                json={"task_key": "active-task", "content": "Working"})
+            assert claim.status_code == 201
+
+        commit_hash = ""
+        request_options = {"json": body} if body is not None else {}
+        if path.startswith("/git/"):
+            # Real local git objects exercise successful same-hub transport too.
+            dag = get_dag()
+            empty_tree = tmp_path / "empty-tree"
+            empty_tree.write_bytes(b"")
+            tree_hash = dag._git("hash-object", "-w", "-t", "tree", str(empty_tree)).stdout.strip()
+            commit_hash = dag._git(
+                "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "commit-tree", tree_hash, "-m", "Authorization fixture",
+            ).stdout.strip()
+            if path == "/git/push":
+                request_options = {"content": dag.create_bundle(commit_hash)}
+            else:
+                fresh_backend.index_commit(target_hub, commit_hash, "", "worker", "Worker", "Fixture")
+
+        # A rejected call must not mutate the victim's coordination state.
+        def victim_state():
+            return {
+                table: [tuple(row) for row in fresh_backend.conn.execute(
+                    f"SELECT {columns} FROM {table} WHERE hub_id = ? ORDER BY rowid", ("bravo",),
+                )]
+                for table, columns in (
+                    ("members", "member_id, member_name, last_seen, last_active"),
+                    ("posts", "*"), ("replies", "*"), ("commits", "*"), ("scores", "*"),
+                )
+            }
+
+        before = victim_state()
+        path = path.format(post_id=post_ids[target_hub], commit_hash=commit_hash)
+        response = client.request(method, f"/api/{target_hub}{path}", headers=headers["alpha"],
+                                  **request_options)
+        assert response.status_code == (success_status if target_hub == "alpha" else 403)
+        if target_hub == "bravo":
+            assert "bravo-only content" not in response.text
+            victim_changed = victim_state() != before
+            assert not victim_changed
 
 
 class TestChannels:
