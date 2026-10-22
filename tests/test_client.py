@@ -217,9 +217,9 @@ class TestClientConvenience:
 
     def test_remove_member(self, server):
         client = SwarloClient(server, hub="remove-test")
-        # Join the goner first so the client's active identity stays the keeper.
-        client.join("gone-1", name="Goner")
-        client.join("keep-1", name="Keeper")
+        client.join("keep-1", "human", name="Keeper")
+        goner = SwarloClient(server, hub="remove-test")
+        goner.join("gone-1", name="Goner")
 
         result = client.remove_member("gone-1")
         assert result["deleted"] == "gone-1"
@@ -230,7 +230,7 @@ class TestClientConvenience:
 
     def test_prune_returns_shape(self, server):
         client = SwarloClient(server, hub="prune-test")
-        client.join("fresh-1", name="Fresh")
+        client.join("fresh-1", "human", name="Fresh")
 
         # Freshly-joined member is not stale, so nothing is pruned.
         result = client.prune(stale_minutes=60)

@@ -572,7 +572,7 @@ class TestMembers:
 class TestPrune:
     def test_prune_returns_empty_when_all_active(self, client):
         """Prune with very long stale window should not remove active members."""
-        key = _register(client, "active-agent", "Active")
+        key = _register(client, "active-operator", "Active", member_type="human")
         resp = client.post("/api/atris/prune", headers=_auth(key),
                           json={"stale_minutes": 9999})
         assert resp.status_code == 200
@@ -581,8 +581,8 @@ class TestPrune:
 
     def test_prune_negative_window_does_not_wipe_roster(self, client):
         """A negative/zero window must be clamped, not prune every active member."""
+        key_b = _register(client, "keeper-b", "KeeperB", member_type="human")
         _register(client, "keeper-a", "KeeperA")
-        key_b = _register(client, "keeper-b", "KeeperB")
         for window in (0, -5):
             resp = client.post("/api/atris/prune", headers=_auth(key_b),
                               json={"stale_minutes": window})
@@ -590,7 +590,7 @@ class TestPrune:
             assert resp.json()["pruned"] == [], f"window={window} wiped the roster"
 
     def test_prune_rejects_non_numeric_window(self, client):
-        key = _register(client, "pruner", "Pruner")
+        key = _register(client, "pruner", "Pruner", member_type="human")
         resp = client.post("/api/atris/prune", headers=_auth(key),
                           json={"stale_minutes": "soon"})
         assert resp.status_code == 400
@@ -609,12 +609,65 @@ class TestDeleteMember:
 
     def test_delete_member_not_found(self, client):
         """Deleting non-existent member returns 404."""
-        key = _register(client, "keeper", "Keeper")
+        key = _register(client, "keeper", "Keeper", member_type="human")
         resp = client.delete("/api/atris/members/ghost", headers=_auth(key))
         assert resp.status_code == 404
 
     def test_delete_member_requires_auth(self, client):
         assert client.delete("/api/atris/members/anyone").status_code == 401
+
+
+class TestMemberAdministrationSecurity:
+    def test_agent_cannot_delete_other_member(self, client):
+        victim = _auth(_register(client, "victim", "Victim"))
+        attacker = _auth(_register(client, "attacker", "Attacker"))
+        response = client.delete("/api/atris/members/victim", headers=attacker)
+        assert response.status_code == 403
+        assert client.get("/api/atris/channels", headers=victim).status_code == 200
+
+    def test_agent_cannot_prune_members(self, client, fresh_backend):
+        victim = _auth(_register(client, "victim", "Victim"))
+        attacker = _auth(_register(client, "attacker", "Attacker"))
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        fresh_backend.conn.execute("UPDATE members SET last_seen = ? WHERE member_id = 'victim'", (old,))
+        fresh_backend.conn.commit()
+        response = client.post("/api/atris/prune", headers=attacker, json={"stale_minutes": 1})
+        assert response.status_code == 403
+        assert client.get("/api/atris/channels", headers=victim).status_code == 200
+
+    def test_self_removal_still_revokes_own_key(self, client):
+        member = _auth(_register(client))
+        assert client.delete("/api/atris/members/agent-1", headers=member).status_code == 200
+        assert client.get("/api/atris/channels", headers=member).status_code == 401
+
+    def test_human_can_remove_other_member(self, client):
+        operator = _auth(_register(client, "operator", "Operator", member_type="human"))
+        victim = _auth(_register(client, "victim", "Victim"))
+        assert client.delete("/api/atris/members/victim", headers=operator).status_code == 200
+        assert client.get("/api/atris/channels", headers=victim).status_code == 401
+        assert client.get("/api/atris/channels", headers=operator).status_code == 200
+
+    def test_human_prune_preserves_humans_and_active_members(self, client, fresh_backend):
+        operator = _auth(_register(client, "operator", "Operator", member_type="human"))
+        old_human = client.post("/api/register", headers=operator, json={
+            "hub_id": "atris", "member_id": "human", "member_type": "human",
+        })
+        assert old_human.status_code == 201
+        old_human_headers = _auth(old_human.json()["api_key"])
+        stale = _auth(_register(client, "stale", "Stale"))
+        active = _auth(_register(client, "active", "Active"))
+        client.get("/api/atris/channels", headers=active)
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        fresh_backend.conn.execute(
+            "UPDATE members SET last_seen = ? WHERE member_id IN ('human', 'stale')", (old,),
+        )
+        fresh_backend.conn.commit()
+        response = client.post("/api/atris/prune", headers=operator, json={"stale_minutes": 60})
+        assert response.status_code == 200
+        assert response.json()["pruned"] == ["stale"]
+        assert client.get("/api/atris/channels", headers=stale).status_code == 401
+        for headers in (old_human_headers, active, operator):
+            assert client.get("/api/atris/channels", headers=headers).status_code == 200
 
 
 class TestReplay:

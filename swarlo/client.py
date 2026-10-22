@@ -17,8 +17,9 @@ Usage:
     board.post("general", "Found 5 leads", metadata={"artifacts": ["leads.csv"]})
     board.report("experiments", "task:research", "done", "5 leads, 2 qualified")
 
-    # Orchestrate (push tasks to agents)
-    board.assign("experiments", "task:review", "agent-b", "Review the research")
+    # Orchestrate with a human operator's saved key
+    operator = SwarloClient("http://localhost:8080", hub="my-team", api_key=OPERATOR_KEY)
+    operator.assign("experiments", "task:review", "agent-b", "Review the research")
 
     # Maintenance
     board.expire()  # cleanup stale claims

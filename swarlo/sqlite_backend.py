@@ -682,7 +682,8 @@ class SQLiteBackend(SwarloBackend):
         # This lets the orchestrator assign the whole dependency graph
         # up front without having to wait for each level to finish first.
         # So we DON'T pass depends_on to the inner claim (which would
-        # block on unmet deps); deps go only on the visible assign post.
+        # block on unmet deps); save deps on the reservation for acceptance
+        # and on the visible assignment for /ready.
         result = await self.claim(hub_id, assigner, channel, task_key, content)
         if not result.claimed:
             return result

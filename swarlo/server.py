@@ -1218,6 +1218,8 @@ async def list_members(hub_id: str, request: Request):
 async def delete_member(hub_id: str, member_id: str, request: Request):
     """Remove a member from the hub."""
     caller = _get_member(request, hub_id)
+    if caller.member_id != member_id:
+        _require_human(caller)
     if not get_backend().delete_member(hub_id, member_id):
         raise HTTPException(404, f"Member {member_id} not found")
     return {"deleted": member_id}
@@ -1227,6 +1229,7 @@ async def delete_member(hub_id: str, member_id: str, request: Request):
 async def prune_members(hub_id: str, request: Request):
     """Remove members not seen in `stale_minutes` (default 60)."""
     caller = _get_member(request, hub_id)
+    _require_human(caller)
     try:
         body = await request.json()
     except Exception:
