@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import sqlite3
+import time
 import threading
 import uuid
 import weakref
@@ -213,7 +214,18 @@ class SQLiteBackend(SwarloBackend):
         conn.row_factory = sqlite3.Row
         conn.create_function("fold_head", 1, _fold_head, deterministic=True)
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Switching to WAL takes an exclusive lock that busy_timeout does not cover,
+        # so two backends opening a new database at once can see "database is
+        # locked". Skip it when already WAL, otherwise retry briefly.
+        if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
+            for attempt in range(50):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 49:
+                        raise
+                    time.sleep(0.05)
         conn.execute("PRAGMA foreign_keys=ON")
         with self._schema_lock:
             conn.executescript(SCHEMA)
