@@ -31,9 +31,9 @@ def client():
     return TestClient(app)
 
 
-def _join(client, member_id, name):
+def _join(client, member_id, name, member_type="agent"):
     resp = client.post("/api/register", json={
-        "member_id": member_id, "member_type": "agent",
+        "member_id": member_id, "member_type": member_type,
         "member_name": name, "hub_id": "team",
     })
     assert resp.status_code == 201
@@ -145,7 +145,7 @@ class TestFullCoordinationLoop:
         assert "auth" in top_content
 
     def test_assign_creates_claim(self, client):
-        boss = _join(client, "boss", "Boss")
+        boss = _join(client, "boss", "Boss", member_type="human")
         worker = _join(client, "worker", "Worker")
 
         # Boss assigns task to worker
@@ -161,7 +161,7 @@ class TestFullCoordinationLoop:
         assert any(c["task_key"] == "A1" for c in claims)
 
     def test_ping_then_mine_flow(self, client):
-        boss = _join(client, "boss", "Boss")
+        boss = _join(client, "boss", "Boss", member_type="human")
         worker = _join(client, "worker", "Worker")
 
         # Boss assigns work

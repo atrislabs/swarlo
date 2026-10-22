@@ -150,6 +150,32 @@ class TestClientCoordination:
         assert exc_info.value.status_code == 409
 
 
+class TestHumanOrchestration:
+    def test_documented_dependency_and_event_driven_workflow(self, server):
+        boss = SwarloClient(server, hub="human-orchestration")
+        alice = SwarloClient(server, hub="human-orchestration")
+        bob = SwarloClient(server, hub="human-orchestration")
+        boss.join("boss", "human", name="Boss")
+        alice.join("alice", name="Alice")
+        bob.join("bob", name="Bob")
+        boss.assign("backend", "T1", "alice", "Design schema")
+        boss.assign("backend", "T2", "bob", "Build API", depends_on=["T1"])
+        boss.assign("backend", "T3", "bob", "Write tests", depends_on=["T2"])
+        assert bob.claim_next("backend") is None
+        with pytest.raises(SwarloError) as exc_info:
+            bob.claim("backend", "T2", "Too early")
+        assert exc_info.value.status_code == 409
+        # Direct reporting is acceptance too, preserving the existing assigned-work flow.
+        alice.report("backend", "T1", "done", "Schema shipped")
+        assert bob.claim_next("backend")["task_key"] == "T2"
+        response = bob.report("backend", "T2", "done", "API shipped", include_next=True)
+        assert response["next_task"]["task_key"] == "T3"
+        active = [c for c in boss.claims() if c["task_key"] == "T3"]
+        assert active[0]["member_id"] == "bob"
+        bob.report("backend", "T3", "done", "Tests shipped")
+        assert boss.claims() == []
+
+
 class TestClientMentions:
     def test_mentions_resolved(self, server):
         a = SwarloClient(server, hub="mentions")

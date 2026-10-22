@@ -129,7 +129,7 @@ def test_mine_returns_own_claims_and_assignments(live_server):
     alice = SwarloClient(live_server, hub="mine-test")
     bob = SwarloClient(live_server, hub="mine-test")
 
-    alice.join("alice", name="Alice")
+    alice.join("alice", "human", name="Alice")
     bob.join("bob", name="Bob")
 
     # Alice claims her own task
@@ -157,7 +157,7 @@ def test_ping_finds_assigns_via_first_class_column(live_server):
     orchestrator = SwarloClient(live_server, hub="ping-test")
     worker = SwarloClient(live_server, hub="ping-test")
 
-    orchestrator.join("orch", name="Orch")
+    orchestrator.join("orch", "human", name="Orch")
     worker.join("worker", name="Worker")
 
     # Worker pings — should be quiet
@@ -512,7 +512,7 @@ def test_ping_with_include_mine_folds_task_list_into_response(live_server):
     """
     orch = SwarloClient(live_server, hub="ping-include")
     worker = SwarloClient(live_server, hub="ping-include")
-    orch.join("orch", name="Orch")
+    orch.join("orch", "human", name="Orch")
     worker.join("worker", name="Worker")
 
     # Default ping — no task list, unchanged behavior
@@ -573,7 +573,7 @@ def test_assign_records_deps_but_does_not_block(live_server):
     """
     orch = SwarloClient(live_server, hub="deps-assign")
     worker = SwarloClient(live_server, hub="deps-assign")
-    orch.join("orch", name="Orch")
+    orch.join("orch", "human", name="Orch")
     worker.join("worker", name="Worker")
 
     # Assign task:C which depends on task:A (not done). Assignment should
@@ -587,7 +587,7 @@ def test_ready_filters_out_unmet_dep_tasks(live_server):
     """/ready returns only the subset of /mine whose deps are all done."""
     orch = SwarloClient(live_server, hub="deps-ready")
     worker = SwarloClient(live_server, hub="deps-ready")
-    orch.join("orch", name="Orch")
+    orch.join("orch", "human", name="Orch")
     worker.join("worker", name="Worker")
 
     # Three assignments:
@@ -620,7 +620,7 @@ def test_claim_next_picks_ready_and_skips_blocked(live_server):
     """
     orch = SwarloClient(live_server, hub="claim-next-a")
     worker = SwarloClient(live_server, hub="claim-next-a")
-    orch.join("orch", name="Orch")
+    orch.join("orch", "human", name="Orch")
     worker.join("worker", name="Worker")
 
     # Assign one task with no deps (ready) and one blocked on an unposted dep
@@ -646,7 +646,7 @@ def test_claim_next_respects_priority(live_server):
     highest-priority one first (higher number = higher priority)."""
     orch = SwarloClient(live_server, hub="priority-test")
     worker = SwarloClient(live_server, hub="priority-test")
-    orch.join("orch", name="Orch")
+    orch.join("orch", "human", name="Orch")
     worker.join("worker", name="Worker")
 
     # Assign three tasks at different priorities — all ready (no deps)
@@ -673,7 +673,7 @@ def test_claim_next_returns_none_when_nothing_is_ready(live_server):
     """claim_next returns None when no assignments have met dependencies."""
     orch = SwarloClient(live_server, hub="claim-next-empty")
     worker = SwarloClient(live_server, hub="claim-next-empty")
-    orch.join("orch", name="Orch")
+    orch.join("orch", "human", name="Orch")
     worker.join("worker", name="Worker")
 
     result = worker.claim_next("general")
@@ -718,7 +718,7 @@ def test_cycle_detection_rejects_three_hop_cycle(live_server):
     # To actually test cycle detection across 3 hops, we need an existing chain
     # that includes our new task. Do this by setting up a fresh hub:
     bob = SwarloClient(live_server, hub="cycle-three-b")
-    bob.join("bob", name="Bob")
+    bob.join("bob", "human", name="Bob")
 
     # Pre-populate a chain of open (not-yet-done) claims so the cycle check
     # walks through them. Use direct POST to bypass the "deps must be done"
@@ -842,7 +842,7 @@ def test_report_include_next_returns_ready_task(live_server):
     """
     orch = SwarloClient(live_server, hub="report-next")
     alice = SwarloClient(live_server, hub="report-next")
-    orch.join("orch", name="Orchestrator")
+    orch.join("orch", "human", name="Orchestrator")
     alice.join("alice", name="Alice")
 
     orch.assign("backend", "T1", assignee_id="alice", content="Build schema")

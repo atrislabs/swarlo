@@ -667,12 +667,7 @@ class SQLiteBackend(SwarloBackend):
                      task_key: str, assignee_id: str, content: str,
                      depends_on: list[str] | None = None,
                      priority: int = 0) -> ClaimResult:
-        """Push-assign a task to a specific member. Claims first, then posts assignment message.
-
-        depends_on is recorded on both the implicit claim AND the visible
-        assign post so /ready can filter correctly regardless of which
-        row it walks.
-        """
+        """Reserve under the assigner until the designated worker accepts."""
         # Look up assignee
         assignee = self.get_member(hub_id, assignee_id)
         if not assignee:
@@ -688,9 +683,16 @@ class SQLiteBackend(SwarloBackend):
         # up front without having to wait for each level to finish first.
         # So we DON'T pass depends_on to the inner claim (which would
         # block on unmet deps); deps go only on the visible assign post.
-        result = await self.claim(hub_id, assignee, channel, task_key, content)
+        result = await self.claim(hub_id, assigner, channel, task_key, content)
         if not result.claimed:
             return result
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE posts SET metadata = json_set(metadata, '$.pending_assignee', ?), "
+                "assignee_id = ?, depends_on = ? WHERE post_id = ?",
+                (assignee_id, assignee_id, json.dumps(depends_on or []), result.post_id),
+            )
+            self.conn.commit()
 
         # Claim succeeded — post the visible assignment message.
         # assignee_id is passed as a first-class column so /ping can find it
@@ -717,6 +719,14 @@ class SQLiteBackend(SwarloBackend):
             task_key=task_key,
             limit=1,
         )
+        pending = self.conn.execute(
+            "SELECT post_id, depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
+            "AND kind = 'claim' AND status = 'open' "
+            "AND json_extract(metadata, '$.pending_assignee') = ?",
+            (hub_id, task_key, member.member_id),
+        ).fetchone()
+        if pending:
+            depends_on = list(dict.fromkeys((depends_on or []) + json.loads(pending["depends_on"] or "[]")))
 
         # Cycle detection — reject a claim whose declared deps would
         # transitively depend back on this task_key. Without this, a
@@ -761,6 +771,25 @@ class SQLiteBackend(SwarloBackend):
 
         try:
             with self._write_lock:
+                if pending:
+                    accepted = self.conn.execute(
+                        "UPDATE posts SET member_id = ?, member_name = ?, member_type = ?, "
+                        "metadata = json_remove(json_set(metadata, '$.heartbeat_at', ?), '$.pending_assignee') "
+                        "WHERE post_id = ? AND status = 'open' "
+                        "AND json_extract(metadata, '$.pending_assignee') = ?",
+                        (member.member_id, member.member_name, member.member_type, now,
+                         pending["post_id"], member.member_id),
+                    )
+                    if accepted.rowcount:
+                        self.conn.execute(
+                            "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
+                            (now, hub_id, member.member_id),
+                        )
+                        self.conn.commit()
+                        return ClaimResult(
+                            claimed=True, conflict=False, post_id=pending["post_id"],
+                            display_id=_post_display_id("claim", pending["post_id"]), channel=channel, kind="claim",
+                        )
                 self.conn.execute(
                     "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
                     "content, kind, task_key, status, metadata, mentions, created_at, assignee_id, depends_on) "
@@ -949,6 +978,17 @@ class SQLiteBackend(SwarloBackend):
                      parent_id: str | None = None,
                      affected_files: list[str] | None = None,
                      metadata: dict | None = None) -> Post:
+        pending = self.conn.execute(
+            "SELECT depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
+            "AND kind = 'claim' AND status = 'open' "
+            "AND json_extract(metadata, '$.pending_assignee') = ?",
+            (hub_id, task_key, member.member_id),
+        ).fetchone()
+        if pending:
+            accepted = await self.claim(hub_id, member, channel, task_key, content,
+                                        depends_on=json.loads(pending["depends_on"] or "[]"))
+            if not accepted.claimed:
+                raise PermissionError(accepted.message or f"Cannot accept task {task_key}")
         existing = await self.get_open_claims(hub_id, task_key=task_key)
         if existing and existing[0].member_id != member.member_id:
             raise PermissionError(

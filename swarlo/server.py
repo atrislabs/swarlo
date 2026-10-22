@@ -154,6 +154,11 @@ def _get_member(request: Request, hub_id: str) -> Member:
     return member
 
 
+def _require_human(member: Member) -> None:
+    if member.member_type != "human":
+        raise HTTPException(403, "Human operator required")
+
+
 # ── Request models ──────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
@@ -216,10 +221,18 @@ class ReplyRequest(BaseModel):
 # ── Registration (no auth) ──────────────────────────────────
 
 @app.post("/api/register", status_code=201)
-async def register(body: RegisterRequest):
+async def register(body: RegisterRequest, request: Request):
     """Register a new member (agent or human) and receive an API key."""
     if body.webhook_url and not _is_safe_webhook_url(body.webhook_url):
         raise HTTPException(400, "Invalid webhook URL: must be HTTPS and not target private networks")
+    be = get_backend()
+    if be.get_member(body.hub_id, body.member_id):
+        raise HTTPException(409, "Member already registered; use the current key to rotate credentials")
+    # Only the first member can bootstrap a human identity without a sponsor.
+    if body.member_type == "human" and be.conn.execute(
+        "SELECT 1 FROM members WHERE hub_id = ? LIMIT 1", (body.hub_id,),
+    ).fetchone():
+        _require_human(_get_member(request, body.hub_id))
     api_key = secrets.token_hex(32)
     member = Member(
         member_id=body.member_id,
@@ -362,6 +375,7 @@ async def list_file_claims(hub_id: str, request: Request):
 async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: Request, background_tasks: BackgroundTasks):
     """Push-assign a task to a specific member. Creates a claim on their behalf and notifies via webhook."""
     assigner = _get_member(request, hub_id)
+    _require_human(assigner)
     be = get_backend()
     result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
                              depends_on=body.depends_on, priority=body.priority)
@@ -375,10 +389,10 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
     if assignee and assignee.webhook_url:
         from .types import Post
         notify_post = Post(
-            post_id=result.post_id or "", content=body.content, kind="claim",
-            channel=channel, member_id=body.assignee_id, member_name=assignee.member_name,
-            member_type=assignee.member_type, task_key=body.task_key, status="open",
-            metadata={"assigned_by": assigner.member_id},
+            post_id=result.post_id or "", content=body.content, kind="assign",
+            channel=channel, member_id=assigner.member_id, member_name=assigner.member_name,
+            member_type=assigner.member_type, task_key=body.task_key, status="open",
+            metadata={"assigned_by": assigner.member_id, "assignee_id": body.assignee_id},
             mentions=[body.assignee_id],
         )
         background_tasks.add_task(_dispatch_webhooks, hub_id, notify_post)
@@ -411,7 +425,15 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
 
     if body.include_next:
         ready = await get_backend().get_ready_tasks(hub_id, member.member_id)
-        result["next_task"] = ready[0].to_dict() if ready else None
+        result["next_task"] = None
+        for task in ready:
+            claimed = await get_backend().claim(
+                hub_id, member, task.channel, task.task_key, "Accepting next assigned task",
+                depends_on=task.depends_on,
+            )
+            if claimed.claimed or (claimed.existing_claim and claimed.existing_claim.member_id == member.member_id):
+                result["next_task"] = task.to_dict()
+                break
 
         # When the queue is empty and the caller asked for suggestions,
         # auto-generate task ideas so the agent doesn't go idle. This

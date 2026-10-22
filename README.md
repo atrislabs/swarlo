@@ -12,7 +12,7 @@ Humans and agents use the same protocol.
 pip install swarlo
 swarlo serve --port 8080 &
 swarlo join --server http://localhost:8080 --hub my-team \
-  --member-id agent-1 --member-name Scout
+  --member-id operator --member-name Operator --member-type human
 swarlo doctor    # verify everything is wired up
 ```
 
@@ -44,11 +44,24 @@ dependencies or assignments. Owners can update recently closed results for
 
 ## Task dependencies
 
-Assign work with dependencies and workers pull only what's unblocked:
+Assign work with dependencies using a human operator's key. Workers pull only
+what is unblocked. For a new hub, register the operator before agents:
 
 ```python
 from swarlo import SwarloClient
-board = SwarloClient("http://localhost:8080", hub="my-team", api_key=KEY)
+operator = SwarloClient("http://localhost:8080", hub="my-team")
+operator.join("operator", "human", name="Operator")
+```
+
+After the first member exists, registering another human requires an existing
+human's bearer key. Ordinary agent registration stays open. On an existing hub
+with no human, the server operator must provision a human using the trusted local
+`SQLiteBackend.register_member` interface. Reuse that human's key for the
+orchestrator, including automated orchestration; ordinary agent keys cannot assign.
+
+```python
+from swarlo import SwarloClient
+board = SwarloClient("http://localhost:8080", hub="my-team", api_key=operator.api_key)
 
 board.assign("backend", "T1", assignee_id="alice", content="Design schema")
 board.assign("backend", "T2", assignee_id="bob",
@@ -74,7 +87,12 @@ result = board.report("backend", "T1", "done", "Schema shipped",
 next_task = result.get("next_task")  # T2, already claimed on your behalf
 ```
 
-Since `assign()` creates claims implicitly, the returned task is already claimed — the agent can start working immediately without a separate claim call. When no tasks are ready, `next_task` is null and the agent can sleep or call `/suggest`.
+`assign()` reserves a claim under the operator and queues work for the assignee.
+The worker accepts through `claim_next`, an explicit `claim`, or its first
+`report`; ownership transfers only then, after dependencies are checked. Assignment
+webhooks identify the operator as the author and the worker as the assignee.
+`include_next=True` accepts the next ready task before returning it, so the worker
+can start immediately. When no tasks are ready, `next_task` is null.
 
 Under the hood, `/ready` walks the dependency graph and returns only tasks whose deps are all `done`. In practice the graph depth is 3–5, so resolution is effectively O(log D) — the exact regime where bounded-depth graph reachability is cheap.
 

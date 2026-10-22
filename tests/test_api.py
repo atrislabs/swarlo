@@ -33,9 +33,9 @@ def client():
     return TestClient(app)
 
 
-def _register(client, member_id="agent-1", name="Hugo", hub="atris"):
+def _register(client, member_id="agent-1", name="Hugo", hub="atris", member_type="agent"):
     resp = client.post("/api/register", json={
-        "member_id": member_id, "member_type": "agent",
+        "member_id": member_id, "member_type": member_type,
         "member_name": name, "hub_id": hub,
     })
     assert resp.status_code == 201
@@ -182,7 +182,7 @@ class TestHubAuthorization:
         post_ids = {}
         for hub in ("alpha", "bravo"):
             # Identical member IDs ensure authorization uses the hub, not just the ID.
-            headers[hub] = _auth(_register(client, "worker", "Worker", hub=hub))
+            headers[hub] = _auth(_register(client, "worker", "Worker", hub=hub, member_type="human"))
             _register(client, "removable", "Removable", hub=hub)
             post = client.post(f"/api/{hub}/channels/general/posts", headers=headers[hub],
                                json={"content": f"{hub}-only content"})
@@ -1094,7 +1094,7 @@ class TestTouch:
 class TestAssign:
     def test_assign_creates_claim_for_assignee(self, client):
         """Assign endpoint creates a claim on behalf of another member."""
-        key_a = _register(client, "manager", "Manager")
+        key_a = _register(client, "manager", "Manager", member_type="human")
         _register(client, "worker", "Worker")
         resp = client.post("/api/atris/channels/general/assign", headers=_auth(key_a),
                           json={"task_key": "task:assigned", "assignee_id": "worker",
@@ -1107,6 +1107,46 @@ class TestAssign:
         resp = client.post("/api/atris/channels/general/assign",
                           json={"task_key": "task:x", "assignee_id": "worker3", "content": "Do it"})
         assert resp.status_code == 401
+
+
+class TestAssignmentSecurity:
+    def test_agent_cannot_assign_in_another_members_name(self, client):
+        attacker = _auth(_register(client, "attacker", "Attacker"))
+        _register(client, "worker", "Worker")
+        response = client.post("/api/atris/channels/general/assign", headers=attacker,
+                               json={"task_key": "T", "assignee_id": "worker", "content": "Forged"})
+        assert response.status_code == 403
+        assert client.get("/api/atris/claims", headers=attacker).json()["count"] == 0
+
+    def test_operator_holds_assignment_until_worker_accepts(self, client):
+        operator = _auth(_register(client, "operator", "Operator", member_type="human"))
+        worker = _auth(_register(client, "worker", "Worker"))
+        other = _auth(_register(client, "other", "Other"))
+        response = client.post("/api/atris/channels/general/assign", headers=operator,
+                               json={"task_key": "T", "assignee_id": "worker", "content": "Do T"})
+        assert response.status_code == 201
+        claims = client.get("/api/atris/claims", headers=worker).json()["claims"]
+        assert claims[0]["member_id"] == "operator"
+        for headers, status in ((other, 409), (worker, 201)):
+            response = client.post("/api/atris/channels/general/claim", headers=headers,
+                                   json={"task_key": "T", "content": "Accept"})
+            assert response.status_code == status
+        claims = client.get("/api/atris/claims", headers=worker).json()["claims"]
+        assert claims[0]["member_id"] == "worker"
+        assert "pending_assignee" not in claims[0].get("metadata", {})
+
+    def test_human_enrollment_cannot_be_self_granted_on_existing_hub(self, client):
+        agent = _auth(_register(client, "agent", "Agent"))
+        payload = {"hub_id": "atris", "member_id": "impostor", "member_type": "human"}
+        assert client.post("/api/register", json=payload).status_code == 401
+        assert client.post("/api/register", json=payload, headers=agent).status_code == 403
+
+    def test_operator_can_enroll_another_human(self, client):
+        operator = _auth(_register(client, "operator", "Operator", member_type="human"))
+        response = client.post("/api/register", headers=operator, json={
+            "hub_id": "atris", "member_id": "second", "member_type": "human",
+        })
+        assert response.status_code == 201
 
 
 class TestFileClaims:

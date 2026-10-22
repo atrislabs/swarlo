@@ -622,7 +622,7 @@ class TestSSRF:
 class TestAssign:
     @pytest.mark.asyncio
     async def test_assign_creates_claim_for_assignee(self, backend, member_a, member_b):
-        """Assign creates a claim owned by the assignee, not the assigner."""
+        """Assign reserves under the assigner until the assignee accepts."""
         backend.register_member(member_a)
         backend.register_member(member_b)
 
@@ -631,7 +631,11 @@ class TestAssign:
 
         claims = await backend.get_open_claims("hub-1", task_key="task:assigned")
         assert len(claims) == 1
-        assert claims[0].member_id == "agent-b"  # owned by assignee
+        assert claims[0].member_id == "agent-a"
+        accepted = await backend.claim("hub-1", member_b, "experiments", "task:assigned", "Accept")
+        assert accepted.claimed
+        claims = await backend.get_open_claims("hub-1", task_key="task:assigned")
+        assert claims[0].member_id == "agent-b"
 
     @pytest.mark.asyncio
     async def test_assign_posts_visible_message(self, backend, member_a, member_b):

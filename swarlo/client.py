@@ -235,7 +235,7 @@ class SwarloClient:
 
     def assign(self, channel: str, task_key: str, assignee_id: str, content: str,
                depends_on: list[str] | None = None, priority: int = 0) -> dict:
-        """Push-assign a task to a specific member. Creates a claim on their behalf.
+        """As a human operator, reserve a task until the designated worker accepts.
 
         depends_on is recorded on the assignment post so the assignee's
         /ready endpoint can filter it out until all deps are done.
