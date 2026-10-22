@@ -464,7 +464,18 @@ def test_liveness_auto_expires_stale_claims(live_server):
     open_before = observer.claims()
     assert any(c["task_key"] == "task:will-go-stale" for c in open_before)
 
-    # Liveness with stale_minutes=0 treats everything as stale and sweeps
+    # Age the claim past the normal heartbeat budget. A short health threshold
+    # must still expire genuinely stale claims without shortening that budget.
+    from swarlo.server import get_backend
+    from datetime import datetime, timedelta, timezone
+    backend = get_backend()
+    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+    backend.conn.execute(
+        "UPDATE posts SET metadata = json_set(metadata, '$.heartbeat_at', ?) "
+        "WHERE hub_id = ? AND task_key = ? AND kind = 'claim'",
+        (old, "liveness-sweep", "task:will-go-stale"),
+    )
+    backend.conn.commit()
     result = observer._request(
         "GET", "/api/liveness-sweep/liveness?stale_minutes=0"
     )

@@ -955,6 +955,26 @@ class SQLiteBackend(SwarloBackend):
                 f"Task {task_key} is claimed by {existing[0].member_name}"
             )
 
+        claim = self.conn.execute(
+            "SELECT member_id, status, created_at, "
+            "COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) AS last_touch "
+            "FROM posts WHERE hub_id = ? AND task_key = ? AND kind = 'claim' "
+            "AND status IN ('open', 'done', 'failed', 'blocked', 'stale') "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (hub_id, task_key),
+        ).fetchone()
+        if not claim or claim["member_id"] != member.member_id:
+            raise PermissionError(f"Claim task {task_key} before reporting it")
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        if claim["status"] != "open" and claim["last_touch"] < cutoff:
+            recent_result = self.conn.execute(
+                "SELECT 1 FROM posts WHERE hub_id = ? AND task_key = ? AND member_id = ? "
+                "AND status IN ('done', 'failed', 'blocked') AND created_at >= ? LIMIT 1",
+                (hub_id, task_key, member.member_id, max(cutoff, claim["created_at"])),
+            ).fetchone()
+            if not recent_result:
+                raise PermissionError(f"Reclaim task {task_key} before reporting it")
+
         kind = "result" if status == "done" else "failed" if status == "failed" else status
         # Merge affected_files into metadata for downstream consumption
         report_meta = dict(metadata or {})

@@ -15,8 +15,8 @@ Each workspace keeps its campaign log in ``<checkout>/.atris/state/atris.db``
 
 task_key is ``<campaign_id>/<mission_id>``. Events are deduped by id, so
 re-tailing a database is harmless. Each actor registers on the hub once and
-its key is kept in ``~/.swarlo/<hub>-<actor>.key`` (registering again would
-rotate the key, so an existing key file is always reused).
+its key is kept in ``~/.swarlo/<hub>-<actor>.key``. Existing key files are
+reused; duplicate registration is rejected and rotation requires the current key.
 
 Run: ``python3 -m swarlo.campaign_bridge [--once] [--db PATH ...]``
 """

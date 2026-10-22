@@ -392,6 +392,61 @@ class TestReports:
         assert resp.status_code == 422
 
 
+class TestReportOwnershipSecurity:
+    @pytest.mark.parametrize("claim_state", ["missing", "stale", "forged"])
+    @pytest.mark.parametrize("status", ["done", "failed", "blocked"])
+    def test_non_owner_cannot_report_or_unblock_dependencies(
+        self, client, fresh_backend, claim_state, status,
+    ):
+        owner = _auth(_register(client, "owner", "Owner"))
+        attacker = _auth(_register(client, "attacker", "Attacker"))
+        if claim_state == "stale":
+            client.post("/api/atris/channels/general/claim", headers=owner,
+                        json={"task_key": "T", "content": "Working"})
+            fresh_backend.conn.execute("UPDATE posts SET status = 'stale' WHERE task_key = 'T'")
+            fresh_backend.conn.commit()
+        elif claim_state == "forged":
+            client.post("/api/atris/channels/general/posts", headers=attacker,
+                        json={"task_key": "T", "kind": "claim", "content": "Fake claim"})
+        # Seed an ordinary dependency assignment independently of assignment permissions.
+        fresh_backend.conn.execute(
+            "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+            "content, kind, task_key, assignee_id, depends_on, created_at) "
+            "VALUES ('dependent', 'atris', 'general', 'owner', 'Owner', 'agent', "
+            "'Do U after T', 'assign', 'U', 'owner', '[\"T\"]', ?)",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+        fresh_backend.conn.commit()
+        response = client.post("/api/atris/channels/general/report", headers=attacker,
+                               json={"task_key": "T", "status": status, "content": "Forged"})
+        assert response.status_code == 409
+        assert client.get("/api/atris/ready/owner", headers=owner).json()["count"] == 0
+        assert fresh_backend.conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE task_key = 'T' AND status IN ('done', 'failed', 'blocked')",
+        ).fetchone()[0] == 0
+
+    def test_owner_can_report_and_correct_recent_result(self, client):
+        owner = _auth(_register(client))
+        client.post("/api/atris/channels/general/claim", headers=owner,
+                    json={"task_key": "T", "content": "Working"})
+        for status in ("blocked", "done"):
+            response = client.post("/api/atris/channels/general/report", headers=owner,
+                                   json={"task_key": "T", "status": status, "content": "Update"})
+            assert response.status_code == 201
+
+    def test_old_owner_cannot_report_after_task_is_reclaimed(self, client, fresh_backend):
+        old_owner = _auth(_register(client, "old", "Old"))
+        new_owner = _auth(_register(client, "new", "New"))
+        for headers in (old_owner, new_owner):
+            client.post("/api/atris/channels/general/claim", headers=headers,
+                        json={"task_key": "T", "content": "Working"})
+            fresh_backend.conn.execute("UPDATE posts SET status = 'stale' WHERE task_key = 'T'")
+            fresh_backend.conn.commit()
+        response = client.post("/api/atris/channels/general/report", headers=old_owner,
+                               json={"task_key": "T", "status": "done", "content": "Too late"})
+        assert response.status_code == 409
+
+
 class TestReplies:
     def test_reply_roundtrip(self, client):
         key_a = _register(client, "agent-a", "Hugo")

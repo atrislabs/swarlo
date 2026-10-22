@@ -148,8 +148,11 @@ def bridge(env, **kw):
 
 
 def board(env, channel):
-    reader = SwarloClient(env["server"], hub=env["hub"])
-    reader.join("reader")
+    if "reader" not in env:
+        reader = SwarloClient(env["server"], hub=env["hub"])
+        reader.join("reader")
+        env["reader"] = reader
+    reader = env["reader"]
     return reader.read(channel, limit=50)
 
 

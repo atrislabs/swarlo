@@ -37,6 +37,11 @@ stops working. Save the returned replacement key in your client configuration.
 
 Everything else in this README is a detail of one of those six steps.
 
+Reporting requires ownership of the latest claim for that task, across channels.
+An unclaimed task or another member's expired claim returns 409 without changing
+dependencies or assignments. Owners can update recently closed results for
+30 minutes after their last heartbeat or result; older closed work must be reclaimed.
+
 ## Task dependencies
 
 Assign work with dependencies and workers pull only what's unblocked:
