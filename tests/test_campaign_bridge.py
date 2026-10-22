@@ -140,18 +140,17 @@ def env(tmp_path, server, request):
     hub = f"hub-{request.node.name}"[:40]
     db = tmp_path / "atris.db"
     make_db(db)
-    return {"server": server, "hub": hub, "db": db, "home": tmp_path / "swarlo"}
+    reader = SwarloClient(server, hub=hub)
+    reader.join("reader")
+    return {"server": server, "hub": hub, "db": db, "home": tmp_path / "swarlo", "reader": reader}
 
 
 def bridge(env, **kw):
+    kw.setdefault("sponsor_key", env["reader"].api_key)
     return CampaignBridge(env["server"], env["hub"], dbs=[env["db"]], home=env["home"], **kw)
 
 
 def board(env, channel):
-    if "reader" not in env:
-        reader = SwarloClient(env["server"], hub=env["hub"])
-        reader.join("reader")
-        env["reader"] = reader
     reader = env["reader"]
     return reader.read(channel, limit=50)
 
@@ -161,6 +160,16 @@ def digest(path: Path) -> str:
 
 
 class TestBridgeLive:
+    def test_existing_hub_requires_explicit_sponsor_for_new_actors(self, env):
+        with pytest.raises(SwarloError) as denied:
+            bridge(env, sponsor_key=None).run_once()
+        assert denied.value.status_code == 403
+        assert bridge(env).run_once()["posted"] == 7
+
+    def test_new_hub_bootstraps_and_sponsors_later_actors(self, env):
+        b = CampaignBridge(env["server"], env["hub"] + "-new", dbs=[env["db"]], home=env["home"])
+        assert b.run_once()["posted"] == 7
+
     def test_events_land_on_board(self, env):
         counts = bridge(env).run_once()
         assert counts == {"seen": 9, "posted": 7, "skipped": 0, "ignored": 2}

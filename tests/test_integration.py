@@ -66,8 +66,8 @@ def test_three_agent_claim_report_conflict_cycle(live_server):
 
     # === Phase 1: Registration ===
     alice_key = alice.join("alice", name="Alice")
-    bob_key = bob.join("bob", name="Bob")
-    carol_key = carol.join("carol", name="Carol")
+    bob_key = bob.join("bob", name="Bob", invite_token=alice.create_invite()["invite_token"])
+    carol_key = carol.join("carol", name="Carol", invite_token=alice.create_invite()["invite_token"])
     assert alice_key and bob_key and carol_key
     assert alice_key != bob_key != carol_key  # distinct API keys
 
@@ -130,7 +130,7 @@ def test_mine_returns_own_claims_and_assignments(live_server):
     bob = SwarloClient(live_server, hub="mine-test")
 
     alice.join("alice", "human", name="Alice")
-    bob.join("bob", name="Bob")
+    bob.join("bob", name="Bob", invite_token=alice.create_invite()["invite_token"])
 
     # Alice claims her own task
     alice.claim("general", "task:alice-own", "Alice working")
@@ -158,7 +158,7 @@ def test_ping_finds_assigns_via_first_class_column(live_server):
     worker = SwarloClient(live_server, hub="ping-test")
 
     orchestrator.join("orch", "human", name="Orch")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=orchestrator.create_invite()["invite_token"])
 
     # Worker pings — should be quiet
     initial = worker.ping("worker")
@@ -186,8 +186,8 @@ def test_idle_uses_last_active_not_last_seen(live_server):
     observer = SwarloClient(live_server, hub="idle-split")
 
     poller.join("poller", name="Poller")
-    worker.join("worker", name="Worker")
-    observer.join("observer", name="Observer")
+    worker.join("worker", name="Worker", invite_token=poller.create_invite()["invite_token"])
+    observer.join("observer", name="Observer", invite_token=poller.create_invite()["invite_token"])
 
     # Worker actually produces work
     worker.post("general", "doing things")
@@ -218,7 +218,7 @@ def test_replies_eager_loaded_in_read_channel(live_server):
     bob = SwarloClient(live_server, hub="thread-test")
 
     alice.join("alice", name="Alice")
-    bob.join("bob", name="Bob")
+    bob.join("bob", name="Bob", invite_token=alice.create_invite()["invite_token"])
 
     # Alice starts a thread
     parent = alice._request("POST", "/api/thread-test/channels/general/posts", {
@@ -253,7 +253,7 @@ def test_wait_for_task_returns_when_done(live_server):
     requester = SwarloClient(live_server, hub="wait-test")
     worker = SwarloClient(live_server, hub="wait-test")
     requester.join("requester", name="Requester")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=requester.create_invite()["invite_token"])
 
     # Worker claims and immediately ships (synthetic — same process)
     worker.claim("general", "task:quick", "Doing it")
@@ -289,7 +289,7 @@ def test_precommit_hook_blocks_conflicting_files(live_server, tmp_path):
     alice = SwarloClient(live_server, hub="hook-test")
     bob = SwarloClient(live_server, hub="hook-test")
     alice_key = alice.join("alice", name="Alice")
-    bob_key = bob.join("bob", name="Bob")
+    bob_key = bob.join("bob", name="Bob", invite_token=alice.create_invite()["invite_token"])
 
     # Alice claims one file
     alice.claim_file("general", "src/contested.py")
@@ -357,7 +357,7 @@ def test_precommit_hook_auto_claims_staged_files(live_server, tmp_path):
     alice = SwarloClient(live_server, hub="autoclaim-test")
     observer = SwarloClient(live_server, hub="autoclaim-test")
     alice_key = alice.join("alice", name="Alice")
-    observer.join("observer", name="Observer")
+    observer.join("observer", name="Observer", invite_token=alice.create_invite()["invite_token"])
 
     # Before: no file claims on the board
     initial_paths = {c["file_path"] for c in observer.file_claims()}
@@ -408,7 +408,7 @@ def test_precommit_hook_autoclaim_opt_out(live_server, tmp_path):
     alice = SwarloClient(live_server, hub="autoclaim-off")
     observer = SwarloClient(live_server, hub="autoclaim-off")
     alice_key = alice.join("alice", name="Alice")
-    observer.join("observer", name="Observer")
+    observer.join("observer", name="Observer", invite_token=alice.create_invite()["invite_token"])
 
     fake_home = tmp_path / "home"
     (fake_home / ".swarlo").mkdir(parents=True)
@@ -455,7 +455,7 @@ def test_liveness_auto_expires_stale_claims(live_server):
     alice = SwarloClient(live_server, hub="liveness-sweep")
     observer = SwarloClient(live_server, hub="liveness-sweep")
     alice.join("alice", name="Alice")
-    observer.join("observer", name="Observer")
+    observer.join("observer", name="Observer", invite_token=alice.create_invite()["invite_token"])
 
     # Alice claims a task
     alice.claim("general", "task:will-go-stale", "Alice working")
@@ -492,7 +492,7 @@ def test_liveness_auto_expire_can_be_disabled(live_server):
     alice = SwarloClient(live_server, hub="liveness-observe")
     observer = SwarloClient(live_server, hub="liveness-observe")
     alice.join("alice", name="Alice")
-    observer.join("observer", name="Observer")
+    observer.join("observer", name="Observer", invite_token=alice.create_invite()["invite_token"])
 
     alice.claim("general", "task:stays-open", "Alice working")
 
@@ -513,7 +513,7 @@ def test_ping_with_include_mine_folds_task_list_into_response(live_server):
     orch = SwarloClient(live_server, hub="ping-include")
     worker = SwarloClient(live_server, hub="ping-include")
     orch.join("orch", "human", name="Orch")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=orch.create_invite()["invite_token"])
 
     # Default ping — no task list, unchanged behavior
     plain = worker.ping("worker")
@@ -574,7 +574,7 @@ def test_assign_records_deps_but_does_not_block(live_server):
     orch = SwarloClient(live_server, hub="deps-assign")
     worker = SwarloClient(live_server, hub="deps-assign")
     orch.join("orch", "human", name="Orch")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=orch.create_invite()["invite_token"])
 
     # Assign task:C which depends on task:A (not done). Assignment should
     # succeed even though the dep isn't met.
@@ -588,7 +588,7 @@ def test_ready_filters_out_unmet_dep_tasks(live_server):
     orch = SwarloClient(live_server, hub="deps-ready")
     worker = SwarloClient(live_server, hub="deps-ready")
     orch.join("orch", "human", name="Orch")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=orch.create_invite()["invite_token"])
 
     # Three assignments:
     # - task:free has no deps → always ready
@@ -621,7 +621,7 @@ def test_claim_next_picks_ready_and_skips_blocked(live_server):
     orch = SwarloClient(live_server, hub="claim-next-a")
     worker = SwarloClient(live_server, hub="claim-next-a")
     orch.join("orch", "human", name="Orch")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=orch.create_invite()["invite_token"])
 
     # Assign one task with no deps (ready) and one blocked on an unposted dep
     orch.assign("general", "task:ready", "worker", "no deps")
@@ -647,7 +647,7 @@ def test_claim_next_respects_priority(live_server):
     orch = SwarloClient(live_server, hub="priority-test")
     worker = SwarloClient(live_server, hub="priority-test")
     orch.join("orch", "human", name="Orch")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=orch.create_invite()["invite_token"])
 
     # Assign three tasks at different priorities — all ready (no deps)
     orch.assign("general", "task:low", "worker", "low priority work", priority=1)
@@ -674,7 +674,7 @@ def test_claim_next_returns_none_when_nothing_is_ready(live_server):
     orch = SwarloClient(live_server, hub="claim-next-empty")
     worker = SwarloClient(live_server, hub="claim-next-empty")
     orch.join("orch", "human", name="Orch")
-    worker.join("worker", name="Worker")
+    worker.join("worker", name="Worker", invite_token=orch.create_invite()["invite_token"])
 
     result = worker.claim_next("general")
     assert result is None
@@ -718,7 +718,7 @@ def test_cycle_detection_rejects_three_hop_cycle(live_server):
     # To actually test cycle detection across 3 hops, we need an existing chain
     # that includes our new task. Do this by setting up a fresh hub:
     bob = SwarloClient(live_server, hub="cycle-three-b")
-    bob.join("bob", "human", name="Bob")
+    bob.join("bob", "human", name="Bob", invite_token=alice.create_invite()["invite_token"])
 
     # Pre-populate a chain of open (not-yet-done) claims so the cycle check
     # walks through them. Use direct POST to bypass the "deps must be done"
@@ -775,7 +775,7 @@ def test_blocked_error_explains_in_progress_claim(live_server):
     alice = SwarloClient(live_server, hub="blocked-inprog")
     bob = SwarloClient(live_server, hub="blocked-inprog")
     alice.join("alice", name="Alice")
-    bob.join("bob", name="Bob")
+    bob.join("bob", name="Bob", invite_token=alice.create_invite()["invite_token"])
 
     alice.claim("general", "task:A", "alice doing A")
 
@@ -810,8 +810,8 @@ def test_three_agent_message_flow(live_server):
     carol = SwarloClient(live_server, hub="msg-flow")
 
     alice.join("a1", name="Alice")
-    bob.join("b1", name="Bob")
-    carol.join("c1", name="Carol")
+    bob.join("b1", name="Bob", invite_token=alice.create_invite()["invite_token"])
+    carol.join("c1", name="Carol", invite_token=alice.create_invite()["invite_token"])
 
     alice.post("general", "Status: working on auth")
     bob.post("general", "Status: refactoring credits")
@@ -843,7 +843,7 @@ def test_report_include_next_returns_ready_task(live_server):
     orch = SwarloClient(live_server, hub="report-next")
     alice = SwarloClient(live_server, hub="report-next")
     orch.join("orch", "human", name="Orchestrator")
-    alice.join("alice", name="Alice")
+    alice.join("alice", name="Alice", invite_token=orch.create_invite()["invite_token"])
 
     orch.assign("backend", "T1", assignee_id="alice", content="Build schema")
     orch.assign("backend", "T2", assignee_id="alice",

@@ -97,19 +97,27 @@ class SwarloClient:
     # ── Registration ──────────────────────────────────────────
 
     def join(self, member_id: str, member_type: str = "agent",
-             name: str = "", webhook_url: str | None = None) -> str:
-        """Register with the hub. Returns the API key."""
+             name: str = "", webhook_url: str | None = None, *,
+             invite_token: str | None = None) -> str:
+        """Join using an invite or this client's current member key; save the new key."""
         result = self._request("POST", "/api/register", {
             "member_id": member_id,
             "member_type": member_type,
             "member_name": name or member_id,
             "hub_id": self.hub,
             "webhook_url": webhook_url,
+            "invite_token": invite_token,
         })
         self.api_key = result["api_key"]
         self.member_id = result["member_id"]
         self.member_name = name or member_id
         return self.api_key
+
+    def create_invite(self, member_type: str = "agent", expires_in_minutes: int = 60) -> dict:
+        """Create a single-use invite. Only humans can invite another human."""
+        return self._request("POST", f"/api/{self.hub}/invites", {
+            "member_type": member_type, "expires_in_minutes": expires_in_minutes,
+        })
 
     def rotate_key(self) -> str:
         """Rotate this member's current key and use the replacement for future requests."""

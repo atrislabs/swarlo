@@ -225,6 +225,32 @@ def test_join_saves_config(monkeypatch, tmp_path, capsys):
     assert "Joined hub" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("source", ["flags", "environment"])
+def test_join_passes_invite_and_sponsor_key(monkeypatch, tmp_path, capsys, source):
+    monkeypatch.setenv("SWARLO_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.delenv("SWARLO_INVITE_TOKEN", raising=False)
+    monkeypatch.delenv("SWARLO_API_KEY", raising=False)
+    argv = ["swarlo", "join", "--server", "http://localhost:8080", "--hub", "team",
+            "--member-id", "guest"]
+    if source == "flags":
+        argv += ["--invite-token", "test-invite", "--api-key", "test-sponsor"]
+    else:
+        monkeypatch.setenv("SWARLO_INVITE_TOKEN", "test-invite")
+        monkeypatch.setenv("SWARLO_API_KEY", "test-sponsor")
+
+    def fake_request(method, url, payload=None, api_key=None):
+        credentials_passed = payload["invite_token"] == "test-invite" and api_key == "test-sponsor"
+        assert credentials_passed
+        return 201, {"member_id": "guest", "api_key": "test-new-key"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", argv)
+    cli.main()
+    output = capsys.readouterr().out
+    secrets_hidden = all(secret not in output for secret in ("test-invite", "test-sponsor", "test-new-key"))
+    assert secrets_hidden
+
+
 def test_claim_uses_saved_runtime(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server": "http://localhost:8080", "hub": "my-team", "api_key": "secret"}))

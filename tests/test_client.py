@@ -59,6 +59,34 @@ def server():
 
 
 class TestClientBasics:
+    def test_invite_join_and_single_use(self, server):
+        owner = SwarloClient(server, hub="client-invites")
+        owner.join("owner")
+        guest = SwarloClient(server, hub="client-invites")
+        with pytest.raises(SwarloError) as denied:
+            guest.join("guest")
+        assert denied.value.status_code == 403
+        invitation = owner.create_invite(expires_in_minutes=5)
+        assert invitation["hub_id"] == "client-invites"
+        assert invitation["member_type"] == "agent"
+        assert invitation["expires_at"]
+        guest.join("guest", invite_token=invitation["invite_token"])
+        assert guest.channels()
+        replay = SwarloClient(server, hub="client-invites")
+        with pytest.raises(SwarloError) as reused:
+            replay.join("replay", invite_token=invitation["invite_token"])
+        assert reused.value.status_code == 403
+
+    def test_current_member_key_sponsors_join(self, server):
+        owner = SwarloClient(server, hub="client-sponsor")
+        owner.join("owner")
+        guest = SwarloClient(server, hub="client-sponsor", api_key=owner.api_key)
+        guest.join("guest")
+        distinct = guest.api_key != owner.api_key
+        assert distinct
+        assert guest.channels()
+        assert owner.channels()
+
     def test_explicit_key_rotation(self, server):
         client = SwarloClient(server, hub="rotation")
         old_key = client.join("owner", name="Owner")
@@ -141,7 +169,7 @@ class TestClientCoordination:
         a = SwarloClient(server, hub="conflict")
         b = SwarloClient(server, hub="conflict")
         a.join("agent-a", name="Hugo")
-        b.join("agent-b", name="Gideon")
+        b.join("agent-b", name="Gideon", invite_token=a.create_invite()["invite_token"])
 
         a.claim("general", "task:contested", "I got it")
 
@@ -156,8 +184,8 @@ class TestHumanOrchestration:
         alice = SwarloClient(server, hub="human-orchestration")
         bob = SwarloClient(server, hub="human-orchestration")
         boss.join("boss", "human", name="Boss")
-        alice.join("alice", name="Alice")
-        bob.join("bob", name="Bob")
+        alice.join("alice", name="Alice", invite_token=boss.create_invite()["invite_token"])
+        bob.join("bob", name="Bob", invite_token=boss.create_invite()["invite_token"])
         boss.assign("backend", "T1", "alice", "Design schema")
         boss.assign("backend", "T2", "bob", "Build API", depends_on=["T1"])
         boss.assign("backend", "T3", "bob", "Write tests", depends_on=["T2"])
@@ -181,7 +209,7 @@ class TestClientMentions:
         a = SwarloClient(server, hub="mentions")
         b = SwarloClient(server, hub="mentions")
         a.join("scout", name="Scout")
-        b.join("designer", name="DesignAgent")
+        b.join("designer", name="DesignAgent", invite_token=a.create_invite()["invite_token"])
 
         post = a.post("general", "Found shops. @DesignAgent make pages")
         assert "designer" in post.get("mentions", [])
@@ -209,7 +237,7 @@ class TestClientConvenience:
     def test_members(self, server):
         client = SwarloClient(server, hub="members-test")
         client.join("mem-1", name="Hugo")
-        client.join("mem-2", name="Gideon")
+        client.join("mem-2", name="Gideon", invite_token=client.create_invite()["invite_token"])
         members = client.members()
         names = [m["member_name"] for m in members]
         assert "Hugo" in names
@@ -219,7 +247,7 @@ class TestClientConvenience:
         client = SwarloClient(server, hub="remove-test")
         client.join("keep-1", "human", name="Keeper")
         goner = SwarloClient(server, hub="remove-test")
-        goner.join("gone-1", name="Goner")
+        goner.join("gone-1", name="Goner", invite_token=client.create_invite()["invite_token"])
 
         result = client.remove_member("gone-1")
         assert result["deleted"] == "gone-1"
@@ -264,8 +292,8 @@ class TestFullFlow:
         ops = SwarloClient(server, hub="coffee")
 
         scout.join("scout", name="Scout")
-        design.join("design", name="DesignAgent")
-        ops.join("ops", name="OpsAgent")
+        design.join("design", name="DesignAgent", invite_token=scout.create_invite()["invite_token"])
+        ops.join("ops", name="OpsAgent", invite_token=scout.create_invite()["invite_token"])
 
         # Scout claims research
         scout.claim("general", "task:find-shops", "Finding coffee shops in MV")
@@ -352,7 +380,7 @@ class TestClientFileClaiming:
         a = SwarloClient(server, hub="files3")
         b = SwarloClient(server, hub="files3")
         a.join("agent-a", name="Alice")
-        b.join("agent-b", name="Bob")
+        b.join("agent-b", name="Bob", invite_token=a.create_invite()["invite_token"])
 
         a.claim_file("general", "backend/services/contested.py")
         # Second agent should hit conflict

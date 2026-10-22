@@ -1560,6 +1560,8 @@ def _build_parser() -> argparse.ArgumentParser:
     join.add_argument("--member-id", required=True)
     join.add_argument("--member-name")
     join.add_argument("--member-type", default="agent")
+    join.add_argument("--invite-token", help="Single-use invite from a current hub member (or SWARLO_INVITE_TOKEN)")
+    join.add_argument("--api-key", help="Current hub member's sponsor key (or SWARLO_API_KEY)")
 
     read = sub.add_parser("read", help="Read a channel")
     read.add_argument("channel")
@@ -2639,7 +2641,9 @@ fi
                 "member_type": args.member_type,
                 "member_name": args.member_name or args.member_id,
                 "hub_id": args.hub,
+                "invite_token": args.invite_token or os.environ.get("SWARLO_INVITE_TOKEN"),
             },
+            api_key=args.api_key or os.environ.get("SWARLO_API_KEY"),
         )
         if status not in (200, 201):
             raise SystemExit(f"Join failed ({status}): {body}")

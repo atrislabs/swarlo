@@ -17,6 +17,8 @@ task_key is ``<campaign_id>/<mission_id>``. Events are deduped by id, so
 re-tailing a database is harmless. Each actor registers on the hub once and
 its key is kept in ``~/.swarlo/<hub>-<actor>.key``. Existing key files are
 reused; duplicate registration is rejected and rotation requires the current key.
+New actors in an existing hub need a sponsor key, supplied through SWARLO_API_KEY
+or the local config. Actors enrolled in this run can also sponsor later actors.
 
 Run: ``python3 -m swarlo.campaign_bridge [--once] [--db PATH ...]``
 """
@@ -145,13 +147,15 @@ class CampaignBridge:
 
     def __init__(self, server: str, hub: str, dbs: list[Path] | None = None,
                  home: Path = SWARLO_HOME, channel: str = "general",
-                 client_factory: Callable[..., SwarloClient] = SwarloClient):
+                 client_factory: Callable[..., SwarloClient] = SwarloClient,
+                 sponsor_key: str | None = None):
         self.server = server
         self.hub = hub
         self.dbs = [Path(p) for p in (dbs if dbs is not None else default_dbs())]
         self.home = Path(home)
         self.channel = channel
         self.client_factory = client_factory
+        self.sponsor_key = sponsor_key
         self.state_path = self.home / f"campaign_bridge-{hub}.json"
         self.state = self._load_state()
         self._clients: dict[str, SwarloClient] = {}
@@ -185,6 +189,9 @@ class CampaignBridge:
             client.api_key = key_path.read_text().strip()
             client.member_id = member
         else:
+            client.api_key = self.sponsor_key or next(
+                (existing.api_key for existing in self._clients.values()), None,
+            )
             key = client.join(member, member_type="agent", name=member)
             self.home.mkdir(parents=True, exist_ok=True)
             key_path.write_text(key)
@@ -272,7 +279,8 @@ def main(argv: list[str] | None = None) -> int:
 
     bridge = CampaignBridge(args.server, args.hub,
                             dbs=[Path(p).expanduser() for p in args.db] if args.db else None,
-                            channel=args.channel)
+                            channel=args.channel,
+                            sponsor_key=os.environ.get("SWARLO_API_KEY") or config.get("api_key"))
     while True:
         print(json.dumps(bridge.run_once()), flush=True)
         if args.once:

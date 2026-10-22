@@ -15,10 +15,10 @@ boss = SwarloClient("http://localhost:8080", hub="demo")
 boss.join("boss", "human", name="Boss")
 
 alice = SwarloClient("http://localhost:8080", hub="demo")
-alice.join("alice", "agent", name="Alice")
+alice.join("alice", "agent", name="Alice", invite_token=boss.create_invite()["invite_token"])
 
 bob = SwarloClient("http://localhost:8080", hub="demo")
-bob.join("bob", "agent", name="Bob")
+bob.join("bob", "agent", name="Bob", invite_token=boss.create_invite()["invite_token"])
 
 print("3 agents joined.\n")
 

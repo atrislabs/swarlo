@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import secrets
 import sqlite3
 import threading
 import uuid
@@ -35,6 +37,19 @@ def _fold_head(content: str | None) -> str:
     return re.sub(r"\d+", "#", (content or "")[:REPEAT_FOLD_PREFIX_CHARS])
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS hubs (
+    hub_id TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS hub_invites (
+    token_hash TEXT PRIMARY KEY,
+    hub_id TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    creator_created_at TEXT NOT NULL,
+    member_type TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS members (
     member_id TEXT NOT NULL,
     hub_id TEXT NOT NULL,
@@ -261,6 +276,13 @@ class SQLiteBackend(SwarloBackend):
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
         """Apply additive migrations and indexes for existing databases."""
+        # Remember existing hubs even after their last member is removed.
+        conn.execute(
+            "INSERT OR IGNORE INTO hubs (hub_id) "
+            "SELECT hub_id FROM members UNION SELECT hub_id FROM posts "
+            "UNION SELECT hub_id FROM replies UNION SELECT hub_id FROM commits "
+            "UNION SELECT hub_id FROM scores"
+        )
         # Column migrations first — SCHEMA indexes that depend on these
         # columns are created below, after the columns are guaranteed.
         for table, column, definition in (
@@ -337,13 +359,76 @@ class SQLiteBackend(SwarloBackend):
 
     # ── Members ─────────────────────────────────────────────
 
-    def register_member(self, member: Member, api_key: str | None = None) -> None:
-        with self._write_lock:
-            self.conn.execute(
+    def register_member(self, member: Member, api_key: str | None = None, *,
+                        require_authority: bool = False,
+                        sponsor_key: str | None = None,
+                        invite_token: str | None = None) -> None:
+        """Provision locally, or require hub authority for an HTTP registration.
+
+        The hub check, invite consumption, and insertion share a write transaction,
+        including across server processes using separate backend instances.
+        """
+        conn = self.conn
+        with self._write_lock, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self.get_member(member.hub_id, member.member_id):
+                raise sqlite3.IntegrityError("Member already registered")
+            existing_hub = conn.execute(
+                "SELECT 1 FROM hubs WHERE hub_id = ?", (member.hub_id,),
+            ).fetchone()
+            if require_authority and existing_hub:
+                if invite_token:
+                    invite = conn.execute(
+                        "SELECT i.* FROM hub_invites i JOIN members m "
+                        "ON m.hub_id = i.hub_id AND m.member_id = i.created_by "
+                        "AND m.created_at = i.creator_created_at "
+                        "WHERE i.token_hash = ? AND i.hub_id = ? "
+                        "AND i.member_type = ? AND i.expires_at > ? "
+                        "AND (i.member_type = 'agent' OR m.member_type = 'human')",
+                        (hashlib.sha256(invite_token.encode()).hexdigest(),
+                         member.hub_id, member.member_type, _utcnow()),
+                    ).fetchone()
+                    if not invite:
+                        raise PermissionError("Invalid, expired, or already used hub invite")
+                    conn.execute("DELETE FROM hub_invites WHERE token_hash = ?", (invite["token_hash"],))
+                else:
+                    sponsor = self.authenticate(sponsor_key) if sponsor_key else None
+                    if not sponsor or sponsor.hub_id != member.hub_id:
+                        raise PermissionError("Joining an existing hub requires an invite or a current member's key")
+                    if member.member_type == "human" and sponsor.member_type != "human":
+                        raise PermissionError("Human operator required to enroll another human")
+            conn.execute("INSERT OR IGNORE INTO hubs (hub_id) VALUES (?)", (member.hub_id,))
+            conn.execute(
                 "INSERT INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (member.member_id, member.hub_id, member.member_type, member.member_name, api_key, member.webhook_url, _utcnow()),
             )
-            self.conn.commit()
+
+    def create_invite(self, hub_id: str, api_key: str, member_type: str = "agent",
+                      expires_in_minutes: int = 60) -> dict:
+        """Create a single-use invite, storing only its digest."""
+        if member_type not in ("agent", "human") or not 1 <= expires_in_minutes <= 10080:
+            raise ValueError("Invites require agent/human type and an expiry of 1 to 10080 minutes")
+        conn = self.conn
+        with self._write_lock, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            sponsor = self.authenticate(api_key)
+            if not sponsor or sponsor.hub_id != hub_id:
+                raise PermissionError("A current member of this hub must create the invite")
+            if member_type == "human" and sponsor.member_type != "human":
+                raise PermissionError("Human operator required to invite another human")
+            creator = conn.execute(
+                "SELECT created_at FROM members WHERE hub_id = ? AND member_id = ?",
+                (hub_id, sponsor.member_id),
+            ).fetchone()
+            token = secrets.token_urlsafe(32)
+            expires_at = (datetime.now(timezone.utc) + timedelta(minutes=expires_in_minutes)).isoformat()
+            conn.execute(
+                "INSERT INTO hub_invites (token_hash, hub_id, created_by, creator_created_at, member_type, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (hashlib.sha256(token.encode()).hexdigest(), hub_id, sponsor.member_id,
+                 creator["created_at"], member_type, expires_at),
+            )
+        return {"invite_token": token, "hub_id": hub_id, "member_type": member_type, "expires_at": expires_at}
 
     def rotate_member_key(self, member: Member, current_key: str, new_key: str) -> bool:
         """Replace only this member's key, provided it has not changed since authentication."""

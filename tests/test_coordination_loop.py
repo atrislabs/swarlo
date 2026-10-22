@@ -32,12 +32,17 @@ def client():
 
 
 def _join(client, member_id, name, member_type="agent"):
-    resp = client.post("/api/register", json={
+    sponsors = getattr(client, "_test_hub_sponsors", {})
+    sponsor_key = sponsors.get("team")
+    resp = client.post("/api/register", headers=_auth(sponsor_key) if sponsor_key else {}, json={
         "member_id": member_id, "member_type": member_type,
         "member_name": name, "hub_id": "team",
     })
     assert resp.status_code == 201
-    return resp.json()["api_key"]
+    key = resp.json()["api_key"]
+    sponsors.setdefault("team", key)
+    client._test_hub_sponsors = sponsors
+    return key
 
 
 def _auth(key):

@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -165,10 +165,16 @@ class RegisterRequest(BaseModel):
     """Request to register a new member with the coordination hub."""
 
     member_id: str
-    member_type: str = "agent"
+    member_type: Literal["agent", "human"] = "agent"
     member_name: str = ""
     hub_id: str = "default"
     webhook_url: Optional[str] = None
+    invite_token: Optional[str] = None
+
+
+class InviteRequest(BaseModel):
+    member_type: Literal["agent", "human"] = "agent"
+    expires_in_minutes: int = Field(default=60, ge=1, le=10080)
 
 
 class PostRequest(BaseModel):
@@ -218,21 +224,16 @@ class ReplyRequest(BaseModel):
     content: str
 
 
-# ── Registration (no auth) ──────────────────────────────────
+# ── Registration and invites ────────────────────────────────
 
 @app.post("/api/register", status_code=201)
 async def register(body: RegisterRequest, request: Request):
-    """Register a new member (agent or human) and receive an API key."""
+    """Create a hub openly; require an invite or current member key to join one."""
     if body.webhook_url and not _is_safe_webhook_url(body.webhook_url):
         raise HTTPException(400, "Invalid webhook URL: must be HTTPS and not target private networks")
     be = get_backend()
     if be.get_member(body.hub_id, body.member_id):
         raise HTTPException(409, "Member already registered; use the current key to rotate credentials")
-    # Only the first member can bootstrap a human identity without a sponsor.
-    if body.member_type == "human" and be.conn.execute(
-        "SELECT 1 FROM members WHERE hub_id = ? LIMIT 1", (body.hub_id,),
-    ).fetchone():
-        _require_human(_get_member(request, body.hub_id))
     api_key = secrets.token_hex(32)
     member = Member(
         member_id=body.member_id,
@@ -242,11 +243,30 @@ async def register(body: RegisterRequest, request: Request):
         webhook_url=body.webhook_url,
     )
     try:
-        get_backend().register_member(member, api_key=api_key)
+        auth = request.headers.get("Authorization", "")
+        be.register_member(
+            member, api_key=api_key, require_authority=True,
+            sponsor_key=auth[7:] if auth.startswith("Bearer ") else None,
+            invite_token=body.invite_token,
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from None
     except sqlite3.IntegrityError:
         get_backend().conn.rollback()
         raise HTTPException(409, "Member already registered; use the current key to rotate credentials")
     return {"member_id": member.member_id, "api_key": api_key, "hub_id": member.hub_id}
+
+
+@app.post("/api/{hub_id}/invites", status_code=201)
+async def create_invite(hub_id: str, body: InviteRequest, request: Request):
+    """Invite one new member with a bounded lifetime and explicit member type."""
+    _get_member(request, hub_id)
+    try:
+        return get_backend().create_invite(
+            hub_id, request.headers["Authorization"][7:], body.member_type, body.expires_in_minutes,
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from None
 
 
 @app.post("/api/{hub_id}/rotate-key")

@@ -34,12 +34,17 @@ def client():
 
 
 def _register(client, member_id="agent-1", name="Hugo", hub="atris", member_type="agent"):
-    resp = client.post("/api/register", json={
+    sponsors = getattr(client, "_test_hub_sponsors", {})
+    sponsor_key = sponsors.get(hub)
+    resp = client.post("/api/register", headers=_auth(sponsor_key) if sponsor_key else {}, json={
         "member_id": member_id, "member_type": member_type,
         "member_name": name, "hub_id": hub,
     })
     assert resp.status_code == 201
-    return resp.json()["api_key"]
+    key = resp.json()["api_key"]
+    sponsors.setdefault(hub, key)
+    client._test_hub_sponsors = sponsors
+    return key
 
 
 def _auth(api_key):
@@ -107,6 +112,7 @@ class TestMemberRegistrationSecurity:
 
 
 HUB_ROUTE_CASES = [
+    ("POST", "/invites", {}, 201),
     ("POST", "/rotate-key", None, 200),
     ("GET", "/channels", None, 200),
     ("GET", "/channels/general/posts", None, 200),
@@ -1191,7 +1197,7 @@ class TestAssignmentSecurity:
     def test_human_enrollment_cannot_be_self_granted_on_existing_hub(self, client):
         agent = _auth(_register(client, "agent", "Agent"))
         payload = {"hub_id": "atris", "member_id": "impostor", "member_type": "human"}
-        assert client.post("/api/register", json=payload).status_code == 401
+        assert client.post("/api/register", json=payload).status_code == 403
         assert client.post("/api/register", json=payload, headers=agent).status_code == 403
 
     def test_operator_can_enroll_another_human(self, client):
