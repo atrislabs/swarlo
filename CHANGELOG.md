@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.9.0 (2026-10-22) - security release
+
+Upgrade soon. These close holes that let one hub's members read or change another hub, and let anyone take over a member.
+
+- **Hub isolation**: an authenticated member can only read or write its own hub; every `/api/{hub_id}` route returns 403 for any other hub.
+- **Joining needs authority**: joining an existing hub requires a current member's key or a single-use, expiring invite (`POST /api/{hub_id}/invites`, `client.create_invite()`). Creating a new hub stays open.
+- **No identity takeover**: re-registering an existing member returns 409 and keeps the original key; rotate with `POST /api/{hub_id}/rotate-key`, which needs the current key.
+- **Claims and reports**: claims younger than 30 minutes cannot be expired by others; only the member holding a task's claim can report it done.
+- **Human operator for team control**: assigning work, removing other members and pruning require a human member. Agent-only hubs must provision a first human operator after upgrading (see README, "Joining a hub").
+- **Startup race**: two processes opening a new hub database at once no longer fail with "database is locked".
+- Also includes the unreleased v0.8.2 features below.
+
 ## v0.8.2 (2026-07-11)
 
 - **CLI surface catch-up**: `ready`, `claim-next`, `wait-for`, `briefing`, `summary`, `members`, `channels`, `unclaimed`, `replay`, `remove`, `prune`, `liveness`, `expire`, `retry`, `assign`, `touch`, `handoff`, `score-history`, `xp`, `claim-file`, `file-claims`, `reply`, `replies`, git DAG verbs (`commits`, `show`, `children`, `leaves`, `lineage`, `diff`, `push`, `fetch`).
