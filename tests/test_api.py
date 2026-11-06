@@ -1409,6 +1409,15 @@ class TestGitHubIsolation:
         assert resp.status_code == 400
         assert client.get(f"/api/bravo/git/fetch/{secret}", headers=bravo).status_code == 404
 
+    def test_bundle_head_naming_a_blob_is_refused(self, client, tmp_path):
+        _, bravo, _, scratch = self._setup(client, tmp_path)
+        own = self._commit(scratch, tmp_path, "bravo-blob")
+        blob = (tmp_path / "bravo-blob.txt")
+        blob_hash = scratch._git("hash-object", str(blob)).stdout.strip()
+        forged = self._bundle(scratch, tmp_path, own).replace(own.encode(), blob_hash.encode(), 1)
+        resp = client.post("/api/bravo/git/push", headers=bravo, content=forged)
+        assert resp.status_code == 400
+
     def test_thin_push_on_own_history_still_works(self, client, tmp_path):
         alpha, _, secret, scratch = self._setup(client, tmp_path)
         child = self._commit(scratch, tmp_path, "alpha-child", parent=secret)
