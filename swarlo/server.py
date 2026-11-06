@@ -29,7 +29,7 @@ TaskKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 from . import gc
 from .sqlite_backend import SQLiteBackend
-from .git_dag import GitDAG
+from .git_dag import GitDAG, bundle_prerequisites
 from .types import Member
 
 logger = logging.getLogger("swarlo.server")
@@ -533,16 +533,8 @@ async def ping(hub_id: str, member_id: str, request: Request,
         (hub_id, since, member_id),
     ).fetchone()[0]
 
-    # Bump last_seen
-    from datetime import datetime, timezone
-    try:
-        be.conn.execute(
-            "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
-            (datetime.now(timezone.utc).isoformat(), member_id, hub_id),
-        )
-        be.conn.commit()
-    except Exception:
-        pass
+    # _get_member already refreshed the caller's own last_seen. Writing it for
+    # the URL's member_id would let anyone keep a dead member looking alive.
 
     response = {
         "new_posts": new_posts,
@@ -1566,6 +1558,25 @@ async def list_scores(hub_id: str, request: Request, limit: int = 10):
 
 # ── Git DAG ─────────────────────────────────────────────────
 
+FULL_HASH_LEN = (40, 64)
+
+
+def _hub_commit(hub_id: str, commit_hash: str) -> None:
+    """404 unless the commit is in this hub's history. The store is shared by
+    every hub, so existence alone would let one hub read another's code, and
+    short hashes would let it guess them."""
+    if len(commit_hash) not in FULL_HASH_LEN or not _hub_reaches(hub_id, commit_hash, get_dag()):
+        raise HTTPException(404, "Commit not found")
+
+
+def _hub_reaches(hub_id: str, commit_hash: str, dag: GitDAG) -> bool:
+    """True when the commit is this hub's, or an ancestor of one of its commits."""
+    backend = get_backend()
+    if backend.get_commit(hub_id, commit_hash):
+        return True
+    return any(dag.is_ancestor(commit_hash, leaf["hash"]) for leaf in backend.get_leaves(hub_id))
+
+
 @app.post("/api/{hub_id}/git/push", status_code=201)
 async def git_push(hub_id: str, request: Request):
     """Push a git bundle to the hub's DAG store."""
@@ -1575,6 +1586,10 @@ async def git_push(hub_id: str, request: Request):
         raise HTTPException(413, "Bundle too large (max 50MB)")
 
     dag = get_dag()
+    # A thin bundle can name another hub's commit as its base, then fetch it back.
+    for prereq in bundle_prerequisites(body):
+        if not _hub_reaches(hub_id, prereq, dag):
+            raise HTTPException(403, "Bundle builds on a commit this hub does not have")
     hashes = await dag.unbundle(body)
 
     # Index each commit in SQLite
@@ -1593,6 +1608,7 @@ async def git_push(hub_id: str, request: Request):
 async def git_fetch(hub_id: str, hash: str, request: Request):
     """Fetch a commit bundle by hash from the DAG store."""
     _get_member(request, hub_id)
+    _hub_commit(hub_id, hash)
     dag = get_dag()
     if not dag.commit_exists(hash):
         raise HTTPException(404, "Commit not found")
@@ -1644,6 +1660,8 @@ async def git_lineage(hub_id: str, hash: str, request: Request):
 async def git_diff(hub_id: str, hash_a: str, hash_b: str, request: Request):
     """Get the diff between two commits as plain text."""
     _get_member(request, hub_id)
+    _hub_commit(hub_id, hash_a)
+    _hub_commit(hub_id, hash_b)
     dag = get_dag()
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(dag.diff(hash_a, hash_b))

@@ -1345,3 +1345,81 @@ class TestFullFlow:
         # Full history
         posts = client.get("/api/atris/channels/experiments/posts?limit=50", headers=ha).json()
         assert posts["count"] == 4
+
+
+class TestGitHubIsolation:
+    """One git store serves every hub; reads must stay inside the caller's hub."""
+
+    def _commit(self, tmp_path, message, parent=None):
+        dag = get_dag()
+        empty = tmp_path / "empty"
+        empty.write_bytes(b"")
+        tree = dag._git("hash-object", "-w", "-t", "tree", str(empty)).stdout.strip()
+        args = ["-c", "user.name=T", "-c", "user.email=t@example.com", "commit-tree", tree, "-m", message]
+        if parent:
+            args += ["-p", parent]
+        return dag._git(*args).stdout.strip()
+
+    def _setup(self, client, tmp_path):
+        alpha = _auth(_register(client, "worker", "Worker", hub="alpha"))
+        bravo = _auth(_register(client, "worker", "Worker", hub="bravo"))
+        secret = self._commit(tmp_path, "alpha-private")
+        resp = client.post("/api/alpha/git/push", headers=alpha, content=get_dag().create_bundle(secret))
+        assert resp.status_code == 201
+        return alpha, bravo, secret
+
+    def test_owner_hub_can_fetch_and_diff(self, client, tmp_path):
+        alpha, _, secret = self._setup(client, tmp_path)
+        assert client.get(f"/api/alpha/git/fetch/{secret}", headers=alpha).status_code == 200
+        assert client.get(f"/api/alpha/git/diff/{secret}/{secret}", headers=alpha).status_code == 200
+
+    def test_other_hub_cannot_fetch_or_diff_by_full_hash(self, client, tmp_path):
+        _, bravo, secret = self._setup(client, tmp_path)
+        assert client.get(f"/api/bravo/git/fetch/{secret}", headers=bravo).status_code == 404
+        resp = client.get(f"/api/bravo/git/diff/{secret}/{secret}", headers=bravo)
+        assert resp.status_code == 404
+        assert "alpha-private" not in resp.text
+
+    def test_short_hash_guessing_is_refused_even_for_owner(self, client, tmp_path):
+        alpha, bravo, secret = self._setup(client, tmp_path)
+        for headers, hub in ((bravo, "bravo"), (alpha, "alpha")):
+            assert client.get(f"/api/{hub}/git/fetch/{secret[:4]}", headers=headers).status_code == 404
+
+    def test_thin_push_cannot_build_on_another_hubs_commit(self, client, tmp_path):
+        _, bravo, secret = self._setup(client, tmp_path)
+        dag = get_dag()
+        child = self._commit(tmp_path, "bravo-child", parent=secret)
+        bundle = tmp_path / "thin.bundle"
+        dag._git("update-ref", "refs/tmp/thin", child)
+        dag._git("bundle", "create", str(bundle), "refs/tmp/thin", f"^{secret}")
+        dag._git("update-ref", "-d", "refs/tmp/thin")
+        resp = client.post("/api/bravo/git/push", headers=bravo, content=bundle.read_bytes())
+        assert resp.status_code == 403
+        assert client.get(f"/api/bravo/git/fetch/{child}", headers=bravo).status_code == 404
+
+    def test_thin_push_on_own_history_still_works(self, client, tmp_path):
+        alpha, _, secret = self._setup(client, tmp_path)
+        dag = get_dag()
+        child = self._commit(tmp_path, "alpha-child", parent=secret)
+        bundle = tmp_path / "own-thin.bundle"
+        dag._git("update-ref", "refs/tmp/own", child)
+        dag._git("bundle", "create", str(bundle), "refs/tmp/own", f"^{secret}")
+        dag._git("update-ref", "-d", "refs/tmp/own")
+        resp = client.post("/api/alpha/git/push", headers=alpha, content=bundle.read_bytes())
+        assert resp.status_code == 201
+        assert client.get(f"/api/alpha/git/fetch/{child}", headers=alpha).status_code == 200
+
+
+def test_ping_does_not_refresh_another_members_last_seen(client, fresh_backend):
+    caller = _auth(_register(client, "caller", "Caller", hub="alpha"))
+    _register(client, "idle", "Idle", hub="alpha")
+    fresh_backend.conn.execute(
+        "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
+        ("2000-01-01T00:00:00+00:00", "idle", "alpha"),
+    )
+    fresh_backend.conn.commit()
+    assert client.get("/api/alpha/ping/idle", headers=caller).status_code == 200
+    row = fresh_backend.conn.execute(
+        "SELECT last_seen FROM members WHERE member_id = ? AND hub_id = ?", ("idle", "alpha"),
+    ).fetchone()
+    assert row[0] == "2000-01-01T00:00:00+00:00"
