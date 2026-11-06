@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 
@@ -202,7 +203,7 @@ class TestHubAuthorization:
         request_options = {"json": body} if body is not None else {}
         if path.startswith("/git/"):
             # Real local git objects exercise successful same-hub transport too.
-            dag = get_dag()
+            dag = get_dag("alpha")
             empty_tree = tmp_path / "empty-tree"
             empty_tree.write_bytes(b"")
             tree_hash = dag._git("hash-object", "-w", "-t", "tree", str(empty_tree)).stdout.strip()
@@ -1348,66 +1349,78 @@ class TestFullFlow:
 
 
 class TestGitHubIsolation:
-    """One git store serves every hub; reads must stay inside the caller's hub."""
+    """Each hub has its own git store; nothing pushed to one hub is readable from another."""
 
-    def _commit(self, tmp_path, message, parent=None):
-        dag = get_dag()
-        empty = tmp_path / "empty"
-        empty.write_bytes(b"")
-        tree = dag._git("hash-object", "-w", "-t", "tree", str(empty)).stdout.strip()
+    def _commit(self, dag, tmp_path, message, parent=None):
+        blob = tmp_path / f"{message}.txt"
+        blob.write_text(f"{message} secret source\n")
+        blob_hash = dag._git("hash-object", "-w", str(blob)).stdout.strip()
+        tree = subprocess.run(
+            ["git", "mktree"], input=f"100644 blob {blob_hash}\tcode.txt\n",
+            capture_output=True, text=True, check=True, env={**os.environ, "GIT_DIR": str(dag.path)},
+        ).stdout.strip()
         args = ["-c", "user.name=T", "-c", "user.email=t@example.com", "commit-tree", tree, "-m", message]
         if parent:
             args += ["-p", parent]
         return dag._git(*args).stdout.strip()
 
+    def _bundle(self, dag, tmp_path, tip, exclude=None):
+        bundle = tmp_path / f"{tip[:8]}.bundle"
+        dag._git("update-ref", "refs/tmp/b", tip)
+        dag._git("bundle", "create", str(bundle), "refs/tmp/b", *([f"^{exclude}"] if exclude else []))
+        dag._git("update-ref", "-d", "refs/tmp/b")
+        return bundle.read_bytes()
+
     def _setup(self, client, tmp_path):
         alpha = _auth(_register(client, "worker", "Worker", hub="alpha"))
         bravo = _auth(_register(client, "worker", "Worker", hub="bravo"))
-        secret = self._commit(tmp_path, "alpha-private")
-        resp = client.post("/api/alpha/git/push", headers=alpha, content=get_dag().create_bundle(secret))
+        scratch = GitDAG(str(tmp_path / "scratch.git"))
+        scratch.init()
+        secret = self._commit(scratch, tmp_path, "alpha-private")
+        resp = client.post("/api/alpha/git/push", headers=alpha, content=self._bundle(scratch, tmp_path, secret))
         assert resp.status_code == 201
-        return alpha, bravo, secret
+        return alpha, bravo, secret, scratch
 
     def test_owner_hub_can_fetch_and_diff(self, client, tmp_path):
-        alpha, _, secret = self._setup(client, tmp_path)
+        alpha, _, secret, _ = self._setup(client, tmp_path)
         assert client.get(f"/api/alpha/git/fetch/{secret}", headers=alpha).status_code == 200
         assert client.get(f"/api/alpha/git/diff/{secret}/{secret}", headers=alpha).status_code == 200
 
-    def test_other_hub_cannot_fetch_or_diff_by_full_hash(self, client, tmp_path):
-        _, bravo, secret = self._setup(client, tmp_path)
-        assert client.get(f"/api/bravo/git/fetch/{secret}", headers=bravo).status_code == 404
-        resp = client.get(f"/api/bravo/git/diff/{secret}/{secret}", headers=bravo)
-        assert resp.status_code == 404
-        assert "alpha-private" not in resp.text
+    def test_other_hub_cannot_fetch_or_diff_by_hash_or_prefix(self, client, tmp_path):
+        _, bravo, secret, _ = self._setup(client, tmp_path)
+        for h in (secret, secret[:4]):
+            assert client.get(f"/api/bravo/git/fetch/{h}", headers=bravo).status_code == 404
+            resp = client.get(f"/api/bravo/git/diff/{h}/{h}", headers=bravo)
+            assert resp.status_code == 404
+            assert "alpha-private" not in resp.text
 
-    def test_short_hash_guessing_is_refused_even_for_owner(self, client, tmp_path):
-        alpha, bravo, secret = self._setup(client, tmp_path)
-        for headers, hub in ((bravo, "bravo"), (alpha, "alpha")):
-            assert client.get(f"/api/{hub}/git/fetch/{secret[:4]}", headers=headers).status_code == 404
-
-    def test_thin_push_cannot_build_on_another_hubs_commit(self, client, tmp_path):
-        _, bravo, secret = self._setup(client, tmp_path)
-        dag = get_dag()
-        child = self._commit(tmp_path, "bravo-child", parent=secret)
-        bundle = tmp_path / "thin.bundle"
-        dag._git("update-ref", "refs/tmp/thin", child)
-        dag._git("bundle", "create", str(bundle), "refs/tmp/thin", f"^{secret}")
-        dag._git("update-ref", "-d", "refs/tmp/thin")
-        resp = client.post("/api/bravo/git/push", headers=bravo, content=bundle.read_bytes())
-        assert resp.status_code == 403
+    def test_thin_push_on_another_hubs_commit_is_refused(self, client, tmp_path):
+        _, bravo, secret, scratch = self._setup(client, tmp_path)
+        child = self._commit(scratch, tmp_path, "bravo-child", parent=secret)
+        resp = client.post("/api/bravo/git/push", headers=bravo, content=self._bundle(scratch, tmp_path, child, secret))
+        assert resp.status_code == 400
         assert client.get(f"/api/bravo/git/fetch/{child}", headers=bravo).status_code == 404
 
+    def test_forged_bundle_head_naming_another_hubs_commit_is_refused(self, client, tmp_path):
+        _, bravo, secret, scratch = self._setup(client, tmp_path)
+        own = self._commit(scratch, tmp_path, "bravo-own")
+        forged = self._bundle(scratch, tmp_path, own).replace(own.encode(), secret.encode(), 1)
+        resp = client.post("/api/bravo/git/push", headers=bravo, content=forged)
+        assert resp.status_code == 400
+        assert client.get(f"/api/bravo/git/fetch/{secret}", headers=bravo).status_code == 404
+
     def test_thin_push_on_own_history_still_works(self, client, tmp_path):
-        alpha, _, secret = self._setup(client, tmp_path)
-        dag = get_dag()
-        child = self._commit(tmp_path, "alpha-child", parent=secret)
-        bundle = tmp_path / "own-thin.bundle"
-        dag._git("update-ref", "refs/tmp/own", child)
-        dag._git("bundle", "create", str(bundle), "refs/tmp/own", f"^{secret}")
-        dag._git("update-ref", "-d", "refs/tmp/own")
-        resp = client.post("/api/alpha/git/push", headers=alpha, content=bundle.read_bytes())
+        alpha, _, secret, scratch = self._setup(client, tmp_path)
+        child = self._commit(scratch, tmp_path, "alpha-child", parent=secret)
+        resp = client.post("/api/alpha/git/push", headers=alpha, content=self._bundle(scratch, tmp_path, child, secret))
         assert resp.status_code == 201
         assert client.get(f"/api/alpha/git/fetch/{child}", headers=alpha).status_code == 200
+        assert client.get(f"/api/alpha/git/diff/{secret}/{child}", headers=alpha).status_code == 200
+
+    def test_hub_id_never_becomes_a_path(self, tmp_path):
+        root = get_dag()
+        dag = get_dag("../../escape")
+        assert dag.path.parent == root.path / "hubs"
 
 
 def test_ping_does_not_refresh_another_members_last_seen(client, fresh_backend):

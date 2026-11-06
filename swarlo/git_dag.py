@@ -69,13 +69,6 @@ class GitDAG:
         result = self._git("cat-file", "-t", hash, check=False)
         return result.returncode == 0
 
-    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        """True when ancestor is reachable from descendant (or is it)."""
-        if not _valid_hash(ancestor) or not _valid_hash(descendant):
-            return False
-        result = self._git("merge-base", "--is-ancestor", ancestor, descendant, check=False)
-        return result.returncode == 0
-
     def get_commit_info(self, hash: str) -> tuple[str, str]:
         """Return (parent_hash, message) for a commit."""
         if not _valid_hash(hash):
@@ -149,22 +142,6 @@ class GitDAG:
             raise ValueError(f"Invalid hash: {commit_hash}")
         result = self._git("show", f"{commit_hash}:{file_path}")
         return result.stdout
-
-
-def bundle_prerequisites(bundle_bytes: bytes) -> list[str]:
-    """Commits a thin bundle assumes the store already has.
-
-    The bundle header is text up to the first blank line; prerequisite lines
-    start with "-<hash>".
-    """
-    header = bundle_bytes.split(b"\n\n", 1)[0].decode("utf-8", "replace")
-    out = []
-    for line in header.split("\n")[1:]:
-        if line.startswith("-"):
-            h = line[1:].split(" ", 1)[0]
-            if _valid_hash(h):
-                out.append(h)
-    return out
 
 
 def _parse_head_hashes(output: str) -> list[str]:
