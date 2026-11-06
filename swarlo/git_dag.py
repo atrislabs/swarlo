@@ -67,7 +67,7 @@ class GitDAG:
         if not _valid_hash(hash):
             return False
         result = self._git("cat-file", "-t", hash, check=False)
-        return result.returncode == 0
+        return result.returncode == 0 and result.stdout.strip() == "commit"
 
     def get_commit_info(self, hash: str) -> tuple[str, str]:
         """Return (parent_hash, message) for a commit."""

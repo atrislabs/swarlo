@@ -9,10 +9,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import secrets
 import sqlite3
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal, Optional
@@ -83,13 +85,31 @@ def get_backend() -> SQLiteBackend:
     return _backend
 
 
-def get_dag() -> GitDAG:
-    """Get or create the global GitDAG instance for commit tracking."""
+_hub_dags: dict[str, GitDAG] = {}
+
+
+def get_dag(hub_id: str | None = None) -> GitDAG:
+    """Get the git store for commit tracking.
+
+    Each hub gets its own store under the root one, so a hub can only ever
+    read objects it pushed. A shared store let any member fetch another hub's
+    code by hash, or forge a bundle head that named it. The directory is a
+    hash of the hub id, so a hub id never becomes a path.
+    """
     global _git_dag
     if _git_dag is None:
         _git_dag = GitDAG("swarlo.git")
         _git_dag.init()
-    return _git_dag
+    if hub_id is None:
+        return _git_dag
+    key = f"{_git_dag.path}\0{hub_id}"
+    dag = _hub_dags.get(key)
+    if dag is None:
+        name = hashlib.sha256(hub_id.encode("utf-8")).hexdigest()[:32]
+        dag = GitDAG(str(_git_dag.path / "hubs" / f"{name}.git"))
+        dag.init()
+        _hub_dags[key] = dag
+    return dag
 
 
 def set_backend(backend: SQLiteBackend):
@@ -533,16 +553,8 @@ async def ping(hub_id: str, member_id: str, request: Request,
         (hub_id, since, member_id),
     ).fetchone()[0]
 
-    # Bump last_seen
-    from datetime import datetime, timezone
-    try:
-        be.conn.execute(
-            "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
-            (datetime.now(timezone.utc).isoformat(), member_id, hub_id),
-        )
-        be.conn.commit()
-    except Exception:
-        pass
+    # _get_member already refreshed the caller's own last_seen. Writing it for
+    # the URL's member_id would let anyone keep a dead member looking alive.
 
     response = {
         "new_posts": new_posts,
@@ -1574,8 +1586,14 @@ async def git_push(hub_id: str, request: Request):
     if len(body) > 50 * 1024 * 1024:
         raise HTTPException(413, "Bundle too large (max 50MB)")
 
-    dag = get_dag()
-    hashes = await dag.unbundle(body)
+    dag = get_dag(hub_id)
+    try:
+        hashes = await dag.unbundle(body)
+    except (ValueError, subprocess.CalledProcessError):
+        raise HTTPException(400, "Bundle could not be imported into this hub")
+    # A forged header can name a commit the bundle never carried.
+    if not all(dag.commit_exists(h) for h in hashes):
+        raise HTTPException(400, "Bundle names a commit it does not contain")
 
     # Index each commit in SQLite
     backend = get_backend()
@@ -1593,7 +1611,7 @@ async def git_push(hub_id: str, request: Request):
 async def git_fetch(hub_id: str, hash: str, request: Request):
     """Fetch a commit bundle by hash from the DAG store."""
     _get_member(request, hub_id)
-    dag = get_dag()
+    dag = get_dag(hub_id)
     if not dag.commit_exists(hash):
         raise HTTPException(404, "Commit not found")
     from fastapi.responses import Response
@@ -1644,6 +1662,8 @@ async def git_lineage(hub_id: str, hash: str, request: Request):
 async def git_diff(hub_id: str, hash_a: str, hash_b: str, request: Request):
     """Get the diff between two commits as plain text."""
     _get_member(request, hub_id)
-    dag = get_dag()
+    dag = get_dag(hub_id)
+    if not dag.commit_exists(hash_a) or not dag.commit_exists(hash_b):
+        raise HTTPException(404, "Commit not found")
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(dag.diff(hash_a, hash_b))
