@@ -615,7 +615,15 @@ class SQLiteBackend(SwarloBackend):
                           metadata: dict | None = None, priority: int = 0,
                           assignee_id: str | None = None,
                           depends_on: list[str] | None = None) -> Post:
-        from .types import extract_mentions
+        from .types import (
+            check_claim_like_note,
+            extract_mentions,
+            validate_post_content,
+            validate_post_kind,
+        )
+        validate_post_content(content)
+        validate_post_kind(kind)
+        warning = check_claim_like_note(kind, content)
         post_id = _uid()
         now = _utcnow()
 
@@ -632,6 +640,8 @@ class SQLiteBackend(SwarloBackend):
         with self._write_lock:
             folded = self._fold_repeat_post(hub_id, member, content, kind, task_key, now)
             if folded is not None:
+                if warning:
+                    folded.warning = warning
                 return folded
             self.conn.execute(
                 "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id, depends_on) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -649,7 +659,7 @@ class SQLiteBackend(SwarloBackend):
             member_id=member.member_id, member_name=member.member_name,
             member_type=member.member_type, task_key=task_key, status=status,
             metadata=metadata, mentions=mention_ids or None, created_at=now,
-            display_id=post_display_id,
+            display_id=post_display_id, warning=warning,
         )
 
     def _fold_repeat_post(self, hub_id: str, member: Member, content: str,

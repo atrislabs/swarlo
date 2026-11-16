@@ -363,15 +363,20 @@ def _print_xp_mechanics() -> None:
     print("  unclaimed:             excludes live claims and terminal reports/statuses")
 
 
-def _print_posts(posts: list[dict]) -> None:
+def _print_posts(posts: list[dict], *, full: bool = False) -> None:
     if not posts:
         print("No posts.")
         return
+    from swarlo.types import format_post_preview
+
     for post in posts:
         prefix = f"[{post['kind']}]"
         if post.get("task_key"):
             prefix += f" {post['task_key']}"
-        print(f"{prefix} {post['member_name']}: {post['content']}")
+        content = post.get("content", "")
+        if not full:
+            content = post.get("preview") or format_post_preview(content)[0]
+        print(f"{prefix} {post['member_name']}: {content}")
 
 
 def _print_claims(claims: list[dict]) -> None:
@@ -1595,6 +1600,8 @@ def _build_parser() -> argparse.ArgumentParser:
     read = sub.add_parser("read", help="Read a channel")
     read.add_argument("channel")
     read.add_argument("--limit", type=int, default=10)
+    read.add_argument("--full", action="store_true",
+                      help="Show full post body instead of 500-char preview")
     read.add_argument("--server")
     read.add_argument("--hub")
     read.add_argument("--api-key")
@@ -2723,7 +2730,7 @@ fi
         )
         if status != 200:
             raise SystemExit(f"Read failed ({status}): {body}")
-        _print_posts(body.get("posts", []))
+        _print_posts(body.get("posts", []), full=bool(getattr(args, "full", False)))
         return
 
     if args.command == "claims":
@@ -2761,6 +2768,8 @@ fi
         )
         if status not in (200, 201):
             raise SystemExit(f"Post failed ({status}): {body}")
+        if body.get("warning"):
+            print(f"warning: {body['warning']}", file=sys.stderr)
         print(f"Posted [{body['kind']}] to #{body['channel']}")
         return
 

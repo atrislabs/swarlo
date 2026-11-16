@@ -448,6 +448,12 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
     _enforce_test_bot_channel(member, channel)
+    from .types import check_claim_like_note, validate_post_content, validate_post_kind
+    try:
+        validate_post_content(body.content)
+        validate_post_kind(body.kind)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     be = get_backend()
     existing = be.find_duplicate_post(
         hub_id, member.member_id, channel, body.content, body.kind, body.task_key,
@@ -455,6 +461,9 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
         within_seconds=POST_DEDUPE_WINDOW_SECONDS,
     )
     if existing is not None:
+        warning = check_claim_like_note(body.kind, body.content)
+        if warning:
+            existing.warning = warning
         response.status_code = 200
         return existing.to_dict()
     _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, body.kind)
