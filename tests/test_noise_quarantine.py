@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from swarlo.server import app, set_backend, set_dag, _post_attempts
+from swarlo.server import app, set_backend, set_dag, _post_attempts, _task_post_attempts
 from swarlo.sqlite_backend import SQLiteBackend
 from swarlo.git_dag import GitDAG
 
@@ -119,6 +119,38 @@ class TestTestBotChannelQuarantine:
 
 
 class TestPostRateLimit:
+    @pytest.mark.parametrize("kind", ["status", "result", "failed"])
+    def test_task_kind_flood_is_throttled_after_dedupe(self, client, fresh_backend, kind):
+        key = _register(client, "atris", "Atris")
+        args = {"channel": "team-loop", "kind": kind, "task_key": "member:op-test"}
+        first = _post(client, key, content="first", **args)
+        assert first.status_code == 201
+        assert _post(client, key, content="second", **args).status_code == 201
+        assert _post(client, key, content="third", **args).status_code == 429
+        retry = _post(client, key, content="first", **args)
+        assert retry.status_code == 200
+        assert retry.json()["post_id"] == first.json()["post_id"]
+        assert _row_count(fresh_backend) == 2
+        attempts = _task_post_attempts[("atris", "atris", "member:op-test", kind)]
+        for i in range(len(attempts)):
+            attempts[i] -= 61
+        assert _post(client, key, content="after window", **args).status_code == 201
+
+    def test_task_limit_is_scoped_and_rejections_do_not_spend_global_slots(self, client):
+        key = _register(client, "atris", "Atris")
+        other = _register(client, "other", "Other")
+        args = {"kind": "status", "task_key": "member:browser-dev"}
+        for i in range(2):
+            assert _post(client, key, content=f"status {i}", **args).status_code == 201
+        for i in range(3):
+            assert _post(client, key, content=f"rejected {i}", **args).status_code == 429
+        assert _post(client, key, content="other task", kind="status", task_key="other").status_code == 201
+        assert _post(client, key, content="other kind", kind="result", task_key=args["task_key"]).status_code == 201
+        assert _post(client, other, content="other member", **args).status_code == 201
+        for i in range(6):
+            assert _post(client, key, content=f"ordinary {i}").status_code == 201
+        assert _post(client, key, content="global cap").status_code == 429
+
     def test_eleventh_post_in_a_minute_gets_429(self, client):
         key = _register(client)
         for i in range(10):
@@ -232,7 +264,7 @@ class TestPostDedupe:
 
     def test_different_priority_or_metadata_is_not_a_duplicate(self, client, fresh_backend):
         key = _register(client)
-        body = {"content": "same words", "kind": "result", "task_key": "t-1"}
+        body = {"content": "same words", "kind": "message", "task_key": "t-1"}
         first = client.post("/api/atris/channels/general/posts",
                             headers=_auth(key), json=body)
         by_priority = client.post("/api/atris/channels/general/posts",

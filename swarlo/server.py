@@ -58,12 +58,15 @@ TEST_BOT_NAME_RE = re.compile(r"(?:^|[^a-z0-9])test(?:[^a-z0-9]|$)", re.IGNORECA
 # resets it, which is fine for a noise guard.
 POST_RATE_LIMIT_PER_MINUTE = 10
 POST_RATE_WINDOW_SECONDS = 60.0
+TASK_POST_RATE_LIMIT_PER_MINUTE = 2
+TASK_POST_RATE_KINDS = {"status", "result", "failed"}
 # An identical body retried within this window gets the first post back
 # (200, idempotent) instead of a second row.
 POST_DEDUPE_WINDOW_SECONDS = 60.0
 
 # (hub_id, member_id) -> monotonic timestamps of accepted post attempts.
 _post_attempts: dict[tuple[str, str], deque[float]] = {}
+_task_post_attempts: dict[tuple[str, str, str, str], deque[float]] = {}
 
 
 def _utc_cutoff(days: int) -> str:
@@ -140,6 +143,7 @@ def set_backend(backend: SQLiteBackend):
     # Rate-limit state is per backend lifetime: swapping the backend (tests,
     # reconfigure) starts a fresh window.
     _post_attempts.clear()
+    _task_post_attempts.clear()
 
 
 def set_dag(dag: GitDAG):
@@ -238,10 +242,11 @@ def _enforce_test_bot_channel(member: Member, channel: str) -> None:
             403, f"Test bots may only post to #{TEST_BOT_CHANNEL}")
 
 
-def _enforce_post_rate_limit(hub_id: str, member_id: str) -> None:
+def _enforce_post_rate_limit(hub_id: str, member_id: str,
+                             task_key: str | None, kind: str) -> None:
     """Cap new posts at POST_RATE_LIMIT_PER_MINUTE per member per hub per
-    minute; over-limit attempts get 429. Only reached after dedupe, so an
-    idempotent retry never spends a slot."""
+    minute, plus two task-bound status/result/failed posts per task and kind.
+    Only reached after dedupe, so an idempotent retry never spends a slot."""
     now = time.monotonic()
     key = (hub_id, member_id)
     attempts = _post_attempts.get(key)
@@ -250,10 +255,20 @@ def _enforce_post_rate_limit(hub_id: str, member_id: str) -> None:
     cutoff = now - POST_RATE_WINDOW_SECONDS
     while attempts and attempts[0] <= cutoff:
         attempts.popleft()
+    task_attempts = None
+    if task_key and kind in TASK_POST_RATE_KINDS:
+        task_attempts = _task_post_attempts.setdefault(
+            (hub_id, member_id, task_key, kind), deque())
+        while task_attempts and task_attempts[0] <= cutoff:
+            task_attempts.popleft()
+        if len(task_attempts) >= TASK_POST_RATE_LIMIT_PER_MINUTE:
+            raise HTTPException(429, "Rate limit: too many posts for this task and kind")
     if len(attempts) >= POST_RATE_LIMIT_PER_MINUTE:
         raise HTTPException(
             429, f"Rate limit: at most {POST_RATE_LIMIT_PER_MINUTE} posts per minute")
     attempts.append(now)
+    if task_attempts is not None:
+        task_attempts.append(now)
 
 
 # ── Request models ──────────────────────────────────────────
@@ -427,7 +442,8 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
     Noise quarantine, in order: test bots may only post to #sandbox (403),
     an identical body retried within POST_DEDUPE_WINDOW_SECONDS returns the
     first post with 200, and new posts are capped at
-    POST_RATE_LIMIT_PER_MINUTE per member per hub per minute (429).
+    POST_RATE_LIMIT_PER_MINUTE per member per hub per minute (429). Task-bound
+    status, result, and failed posts have a tighter per-task and kind cap.
     """
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
@@ -441,7 +457,7 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
     if existing is not None:
         response.status_code = 200
         return existing.to_dict()
-    _enforce_post_rate_limit(hub_id, member.member_id)
+    _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, body.kind)
     post = await be.create_post(
         hub_id,
         member,
