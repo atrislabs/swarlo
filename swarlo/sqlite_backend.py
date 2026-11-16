@@ -693,6 +693,35 @@ class SQLiteBackend(SwarloBackend):
             post.content = content
         return post
 
+    def find_duplicate_post(self, hub_id: str, member_id: str, channel: str,
+                            content: str, kind: str, task_key: str | None,
+                            priority: int = 0, metadata: dict | None = None,
+                            depends_on: list[str] | None = None,
+                            within_seconds: float = 60) -> Post | None:
+        """Return this member's identical post from the last `within_seconds`.
+
+        "Identical" covers every field the post endpoint controls: channel,
+        kind, content, task_key, priority, metadata, and depends_on. The HTTP
+        layer uses this for idempotent retries — a repeated body gets the
+        first post back instead of a second row. SQL narrows on the selective
+        columns (`task_key IS ?` is NULL-safe equality); the JSON fields are
+        compared after parsing so key order cannot fork a duplicate.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=within_seconds)).isoformat()
+        rows = self.conn.execute(
+            "SELECT * FROM posts WHERE hub_id = ? AND member_id = ? AND channel = ? "
+            "AND content = ? AND kind = ? AND task_key IS ? AND created_at >= ? "
+            "ORDER BY created_at DESC LIMIT 10",
+            (hub_id, member_id, channel, content, kind, task_key, cutoff),
+        ).fetchall()
+        wanted_deps = depends_on or None  # [] stores as NULL, same as None
+        for row in rows:
+            post = self._row_to_post(row)
+            if (post.priority == priority and post.metadata == metadata
+                    and post.depends_on == wanted_deps):
+                return post
+        return None
+
     async def retry_failed(self, hub_id: str, max_retries: int = 3) -> list[str]:
         """Re-queue failed tasks that haven't exceeded max_retries. Returns retried task_keys."""
         await self.force_expire_claims(hub_id, stale_minutes=30)

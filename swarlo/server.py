@@ -12,15 +12,18 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, StringConstraints
 
 # A task identifier that must be non-empty. Leading/trailing whitespace is
@@ -43,6 +46,24 @@ _git_dag: GitDAG | None = None
 BRIEFING_LOOKBACK_DAYS = 14
 REPLAY_MAX_LOOKBACK_DAYS = 7
 OPEN_CLAIM_STALE_MINUTES = 30
+
+# Noise quarantine on POST /channels/{channel}/posts.
+# Members carry no bot flag, so a test bot is marked by a standalone "test"
+# token in member_id or member_name ("op-test", "wake-test", "test-1",
+# "Test Bot"). "latest" and "contest" do not match: the token must stand
+# alone. Test bots may post only to #sandbox.
+TEST_BOT_CHANNEL = "sandbox"
+TEST_BOT_NAME_RE = re.compile(r"(?:^|[^a-z0-9])test(?:[^a-z0-9]|$)", re.IGNORECASE)
+# Sliding-window cap on new posts, per member per hub. In-memory: a restart
+# resets it, which is fine for a noise guard.
+POST_RATE_LIMIT_PER_MINUTE = 10
+POST_RATE_WINDOW_SECONDS = 60.0
+# An identical body retried within this window gets the first post back
+# (200, idempotent) instead of a second row.
+POST_DEDUPE_WINDOW_SECONDS = 60.0
+
+# (hub_id, member_id) -> monotonic timestamps of accepted post attempts.
+_post_attempts: dict[tuple[str, str], deque[float]] = {}
 
 
 def _utc_cutoff(days: int) -> str:
@@ -116,6 +137,9 @@ def set_backend(backend: SQLiteBackend):
     """Set the global SQLite backend instance for server requests."""
     global _backend
     _backend = backend
+    # Rate-limit state is per backend lifetime: swapping the backend (tests,
+    # reconfigure) starts a fresh window.
+    _post_attempts.clear()
 
 
 def set_dag(dag: GitDAG):
@@ -194,6 +218,42 @@ def _enforce_claimed_member(member: Member, claimed_id: str | None,
     if claimed_name and claimed_name != member.member_name:
         raise HTTPException(
             403, "Claimed member_name does not match the authenticated member")
+
+
+def _is_test_bot(member: Member) -> bool:
+    """True when the member's id or name carries a standalone "test" token.
+
+    Members have no bot flag, so the name is the marker: "op-test",
+    "wake-test", "lane-test", "test-1", and "Test Bot" match, while
+    "latest", "contest", and "testing" do not (the token must stand alone).
+    """
+    return bool(TEST_BOT_NAME_RE.search(member.member_id)
+                or TEST_BOT_NAME_RE.search(member.member_name))
+
+
+def _enforce_test_bot_channel(member: Member, channel: str) -> None:
+    """Quarantine test bots to #sandbox; every other channel is a 403."""
+    if _is_test_bot(member) and channel != TEST_BOT_CHANNEL:
+        raise HTTPException(
+            403, f"Test bots may only post to #{TEST_BOT_CHANNEL}")
+
+
+def _enforce_post_rate_limit(hub_id: str, member_id: str) -> None:
+    """Cap new posts at POST_RATE_LIMIT_PER_MINUTE per member per hub per
+    minute; over-limit attempts get 429. Only reached after dedupe, so an
+    idempotent retry never spends a slot."""
+    now = time.monotonic()
+    key = (hub_id, member_id)
+    attempts = _post_attempts.get(key)
+    if attempts is None:
+        attempts = _post_attempts[key] = deque()
+    cutoff = now - POST_RATE_WINDOW_SECONDS
+    while attempts and attempts[0] <= cutoff:
+        attempts.popleft()
+    if len(attempts) >= POST_RATE_LIMIT_PER_MINUTE:
+        raise HTTPException(
+            429, f"Rate limit: at most {POST_RATE_LIMIT_PER_MINUTE} posts per minute")
+    attempts.append(now)
 
 
 # ── Request models ──────────────────────────────────────────
@@ -360,11 +420,29 @@ async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 1
 # ── Post ────────────────────────────────────────────────────
 
 @app.post("/api/{hub_id}/channels/{channel}/posts", status_code=201)
-async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request, background_tasks: BackgroundTasks):
-    """Create a new post in a channel. Resolves @mentions and fires webhooks."""
+async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request,
+                      background_tasks: BackgroundTasks, response: Response):
+    """Create a new post in a channel. Resolves @mentions and fires webhooks.
+
+    Noise quarantine, in order: test bots may only post to #sandbox (403),
+    an identical body retried within POST_DEDUPE_WINDOW_SECONDS returns the
+    first post with 200, and new posts are capped at
+    POST_RATE_LIMIT_PER_MINUTE per member per hub per minute (429).
+    """
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
-    post = await get_backend().create_post(
+    _enforce_test_bot_channel(member, channel)
+    be = get_backend()
+    existing = be.find_duplicate_post(
+        hub_id, member.member_id, channel, body.content, body.kind, body.task_key,
+        priority=body.priority, metadata=body.metadata, depends_on=body.depends_on,
+        within_seconds=POST_DEDUPE_WINDOW_SECONDS,
+    )
+    if existing is not None:
+        response.status_code = 200
+        return existing.to_dict()
+    _enforce_post_rate_limit(hub_id, member.member_id)
+    post = await be.create_post(
         hub_id,
         member,
         channel,

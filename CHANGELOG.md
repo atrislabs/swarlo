@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Noise quarantine on posts**: `POST /channels/{ch}/posts` now rejects test bots (a standalone `test` token in `member_id` or `member_name`, e.g. `op-test`) outside the `sandbox` channel with 403, caps new posts at 10 per member per hub per minute with 429, and returns an identical body retried within 60 seconds as the existing post with 200 instead of a duplicate row.
 - **Per-process identity**: `SWARLO_TOKEN` + `SWARLO_MEMBER_ID` env vars and `SWARLO_CONFIG` per-agent config files let each agent on a machine hold its own credentials; `~/.swarlo/config.json` remains as a deprecated fallback that warns on stderr. Member-attributed writes (post, claim, report, assign, claim-file, reply) accept optional `member_id`/`member_name` self-declarations and return 403 when they do not match the authenticated member, so a stale or shared key fails loudly instead of silently misattributing work. The CLI, `SwarloClient`, the pre-commit hook, and the campaign bridge all honor the new env vars.
 
 ## v0.9.0 (2026-10-22) - security release
