@@ -21,7 +21,9 @@ Install in a consumer repo:
 
 What it does on every `git commit`:
 
-1. Reads ~/.swarlo/config.json for the member_id, server URL, and api_key.
+1. Resolves member_id, server URL, and api_key from SWARLO_* env vars
+   (SWARLO_MEMBER_ID, SWARLO_SERVER, SWARLO_HUB, SWARLO_TOKEN) or the
+   swarlo config file (SWARLO_CONFIG, default ~/.swarlo/config.json).
 2. Asks the swarlo server which files are currently claimed.
 3. Compares against the staged files in the current commit.
 4. If a staged file is claimed by ANOTHER member, blocks the commit and
@@ -55,16 +57,24 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".swarlo" / "config.json"
 TIMEOUT_SECONDS = 3
+
+
+def _config_path() -> Path:
+    """SWARLO_CONFIG override, else the shared default config."""
+    override = os.environ.get("SWARLO_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".swarlo" / "config.json"
 
 
 def _load_config() -> dict | None:
     """Load swarlo config. Returns None if missing or unreadable."""
-    if not CONFIG_PATH.exists():
+    path = _config_path()
+    if not path.exists():
         return None
     try:
-        return json.loads(CONFIG_PATH.read_text())
+        return json.loads(path.read_text())
     except Exception:
         return None
 
@@ -126,21 +136,21 @@ def _claim_file(server: str, hub: str, api_key: str, file_path: str) -> bool:
 
 
 def main() -> int:
-    config = _load_config()
-    if not config:
-        print("[swarlo-hook] no ~/.swarlo/config.json — allowing commit", file=sys.stderr)
-        return 0
+    config = _load_config() or {}
 
     # Env vars override config so the same hook works for multiple identities
-    # on one machine (human + agents) without editing ~/.swarlo/config.json.
+    # on one machine (human + agents) without a shared config file. A full
+    # SWARLO_* identity needs no config file at all.
     member_id = os.environ.get("SWARLO_MEMBER_ID") or config.get("member_id")
     server = os.environ.get("SWARLO_SERVER") or config.get("server")
     hub = os.environ.get("SWARLO_HUB") or config.get("hub", "atris")
-    api_key = os.environ.get("SWARLO_API_KEY") or config.get("api_key")
+    api_key = (os.environ.get("SWARLO_TOKEN") or os.environ.get("SWARLO_API_KEY")
+               or config.get("api_key"))
 
     if not member_id or not server or not api_key:
         print(
-            "[swarlo-hook] config missing member_id/server/api_key — allowing commit",
+            "[swarlo-hook] missing member_id/server/api_key in SWARLO_* env "
+            "or config — allowing commit",
             file=sys.stderr,
         )
         return 0

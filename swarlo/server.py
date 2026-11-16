@@ -179,7 +179,35 @@ def _require_human(member: Member) -> None:
         raise HTTPException(403, "Human operator required")
 
 
+def _enforce_claimed_member(member: Member, claimed_id: str | None,
+                            claimed_name: str | None) -> None:
+    """Reject a write that claims a different member than the API key's owner.
+
+    Attribution always comes from the authenticated member, so these fields
+    are a self-declared cross-check: a client holding a stale or shared
+    credential fails loudly (403) instead of silently posting as someone
+    else. Absent fields keep older clients working unchanged.
+    """
+    if claimed_id and claimed_id != member.member_id:
+        raise HTTPException(
+            403, "Claimed member_id does not match the authenticated member")
+    if claimed_name and claimed_name != member.member_name:
+        raise HTTPException(
+            403, "Claimed member_name does not match the authenticated member")
+
+
 # ── Request models ──────────────────────────────────────────
+
+class _ClaimedIdentity(BaseModel):
+    """Optional self-declared identity on member-attributed writes.
+
+    Each field present must match the authenticated member exactly; a
+    mismatch is rejected with 403 (see _enforce_claimed_member).
+    """
+
+    member_id: Optional[str] = None
+    member_name: Optional[str] = None
+
 
 class RegisterRequest(BaseModel):
     """Request to register a new member with the coordination hub."""
@@ -197,7 +225,7 @@ class InviteRequest(BaseModel):
     expires_in_minutes: int = Field(default=60, ge=1, le=10080)
 
 
-class PostRequest(BaseModel):
+class PostRequest(_ClaimedIdentity):
     """Request to create a new post in a channel."""
 
     content: str
@@ -208,7 +236,7 @@ class PostRequest(BaseModel):
     metadata: Optional[dict] = None
 
 
-class ClaimRequest(BaseModel):
+class ClaimRequest(_ClaimedIdentity):
     """Request to claim a task for exclusive work."""
 
     task_key: TaskKey
@@ -216,7 +244,7 @@ class ClaimRequest(BaseModel):
     depends_on: Optional[list[str]] = None
 
 
-class ReportRequest(BaseModel):
+class ReportRequest(_ClaimedIdentity):
     """Request to report task completion status."""
 
     task_key: TaskKey
@@ -228,7 +256,7 @@ class ReportRequest(BaseModel):
     suggest_if_empty: bool = False  # if True AND include_next returns null, auto-suggest
 
 
-class AssignRequest(BaseModel):
+class AssignRequest(_ClaimedIdentity):
     """Request to push-assign a task to a specific member."""
 
     task_key: TaskKey
@@ -238,7 +266,7 @@ class AssignRequest(BaseModel):
     priority: int = 0  # 0-5, higher = claimed first by claim_next
 
 
-class ReplyRequest(BaseModel):
+class ReplyRequest(_ClaimedIdentity):
     """Request to reply to an existing post."""
 
     content: str
@@ -335,6 +363,7 @@ async def list_posts(hub_id: str, channel: str, request: Request, limit: int = 1
 async def create_post(hub_id: str, channel: str, body: PostRequest, request: Request, background_tasks: BackgroundTasks):
     """Create a new post in a channel. Resolves @mentions and fires webhooks."""
     member = _get_member(request, hub_id)
+    _enforce_claimed_member(member, body.member_id, body.member_name)
     post = await get_backend().create_post(
         hub_id,
         member,
@@ -357,6 +386,7 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
 async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Request):
     """Claim a task to prevent duplicate work. Returns 409 if already claimed."""
     member = _get_member(request, hub_id)
+    _enforce_claimed_member(member, body.member_id, body.member_name)
     result = await get_backend().claim(
         hub_id, member, channel, body.task_key, body.content,
         depends_on=body.depends_on,
@@ -368,7 +398,7 @@ async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Req
 
 # ── File Claims ────────────────────────────────────────────
 
-class FileClaimRequest(BaseModel):
+class FileClaimRequest(_ClaimedIdentity):
     """Request to claim exclusive access to a file."""
 
     file_path: str
@@ -380,6 +410,7 @@ async def claim_file(hub_id: str, channel: str, body: FileClaimRequest, request:
     """Claim a file to prevent two agents editing it simultaneously.
     Uses task_key = 'file:<path>' convention on the existing claim system."""
     member = _get_member(request, hub_id)
+    _enforce_claimed_member(member, body.member_id, body.member_name)
     task_key = f"file:{body.file_path}"
     desc = body.content or f"Editing {body.file_path}"
     result = await get_backend().claim(hub_id, member, channel, task_key, desc)
@@ -415,6 +446,7 @@ async def list_file_claims(hub_id: str, request: Request):
 async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: Request, background_tasks: BackgroundTasks):
     """Push-assign a task to a specific member. Creates a claim on their behalf and notifies via webhook."""
     assigner = _get_member(request, hub_id)
+    _enforce_claimed_member(assigner, body.member_id, body.member_name)
     _require_human(assigner)
     be = get_backend()
     result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
@@ -452,6 +484,7 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
     in one call. The agent loop becomes event-driven instead of timer-driven.
     """
     member = _get_member(request, hub_id)
+    _enforce_claimed_member(member, body.member_id, body.member_name)
     try:
         post = await get_backend().report(
             hub_id, member, channel, body.task_key, body.status, body.content,
@@ -1027,6 +1060,7 @@ async def list_replies(hub_id: str, post_id: str, request: Request):
 async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: Request):
     """Create a reply to an existing post."""
     member = _get_member(request, hub_id)
+    _enforce_claimed_member(member, body.member_id, body.member_name)
     reply = await get_backend().reply(hub_id, member, post_id, body.content)
     return reply.to_dict()
 

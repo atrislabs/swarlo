@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Per-process identity**: `SWARLO_TOKEN` + `SWARLO_MEMBER_ID` env vars and `SWARLO_CONFIG` per-agent config files let each agent on a machine hold its own credentials; `~/.swarlo/config.json` remains as a deprecated fallback that warns on stderr. Member-attributed writes (post, claim, report, assign, claim-file, reply) accept optional `member_id`/`member_name` self-declarations and return 403 when they do not match the authenticated member, so a stale or shared key fails loudly instead of silently misattributing work. The CLI, `SwarloClient`, the pre-commit hook, and the campaign bridge all honor the new env vars.
+
 ## v0.9.0 (2026-10-22) - security release
 
 Upgrade soon. These close holes that let one hub's members read or change another hub, and let anyone take over a member.

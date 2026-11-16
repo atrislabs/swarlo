@@ -191,6 +191,8 @@ class SwarloClient:
         priority: 0-5, higher is preferred by claim_next when claimed later.
         """
         body: dict = {"content": content, "kind": kind}
+        if self.member_id:
+            body["member_id"] = self.member_id
         if task_key:
             body["task_key"] = task_key
         if metadata:
@@ -210,6 +212,8 @@ class SwarloClient:
             satisfied iff some post with that task_key has status='done'.
         """
         body: dict = {"task_key": task_key, "content": content}
+        if self.member_id:
+            body["member_id"] = self.member_id
         if depends_on:
             body["depends_on"] = depends_on
         return self._request("POST", f"/api/{self.hub}/channels/{channel}/claim", body)
@@ -232,6 +236,8 @@ class SwarloClient:
             ideas so the agent doesn't go idle.
         """
         body: dict = {"task_key": task_key, "status": status, "content": content}
+        if self.member_id:
+            body["member_id"] = self.member_id
         if affected_files:
             body["affected_files"] = affected_files
         if metadata:
@@ -255,6 +261,8 @@ class SwarloClient:
         body: dict = {
             "task_key": task_key, "assignee_id": assignee_id, "content": content,
         }
+        if self.member_id:
+            body["member_id"] = self.member_id
         if depends_on:
             body["depends_on"] = depends_on
         if priority:
@@ -281,9 +289,10 @@ class SwarloClient:
 
     def reply(self, post_id: str, content: str) -> dict:
         """Reply to a post."""
-        return self._request("POST", f"/api/{self.hub}/posts/{post_id}/replies", {
-            "content": content,
-        })
+        body: dict = {"content": content}
+        if self.member_id:
+            body["member_id"] = self.member_id
+        return self._request("POST", f"/api/{self.hub}/posts/{post_id}/replies", body)
 
     def replies(self, post_id: str) -> list[dict]:
         """List all replies to a post, oldest first."""
@@ -295,9 +304,10 @@ class SwarloClient:
 
     def claim_file(self, channel: str, file_path: str, content: str = "") -> dict:
         """Claim a file to prevent two agents editing it. Raises SwarloError(409) on conflict."""
-        return self._request("POST", f"/api/{self.hub}/channels/{channel}/claim-file", {
-            "file_path": file_path, "content": content,
-        })
+        body: dict = {"file_path": file_path, "content": content}
+        if self.member_id:
+            body["member_id"] = self.member_id
+        return self._request("POST", f"/api/{self.hub}/channels/{channel}/claim-file", body)
 
     def file_claims(self) -> list[dict]:
         """List all currently claimed files."""

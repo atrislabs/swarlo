@@ -25,6 +25,8 @@ except ImportError:  # pragma: no cover - direct file loading in tests
 
 
 CONFIG_ENV = "SWARLO_CONFIG"
+TOKEN_ENV = "SWARLO_TOKEN"
+_shared_config_warned = False
 SPEED_CHECK_REPORT_SCHEMA_VERSION = 1
 SPEED_PROOF_SUMMARY_SCHEMA_VERSION = 1
 SPEED_LIVE_DATA_TABLES = ("members", "posts", "scores")
@@ -151,15 +153,37 @@ def _config_path() -> Path:
     return Path.home() / ".swarlo" / "config.json"
 
 
+def _warn_shared_config() -> None:
+    """One-line notice when falling back to the machine-wide config file.
+
+    ~/.swarlo/config.json is shared by every agent on the machine, so the
+    last writer's key silently becomes everyone's identity. Per-process
+    identity lives in SWARLO_TOKEN/SWARLO_MEMBER_ID or a SWARLO_CONFIG file.
+    """
+    global _shared_config_warned
+    if _shared_config_warned:
+        return
+    _shared_config_warned = True
+    print(
+        "warning: using shared ~/.swarlo/config.json; set SWARLO_CONFIG=<path> "
+        "or SWARLO_TOKEN=<key> for per-process identity",
+        file=sys.stderr,
+    )
+
+
 def _load_config() -> dict:
     path = _config_path()
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text())
+    if path.exists():
+        if not os.getenv(CONFIG_ENV):
+            _warn_shared_config()
+        return json.loads(path.read_text())
+    return {}
 
 
 def _save_config(config: dict) -> None:
     path = _config_path()
+    if not os.getenv(CONFIG_ENV):
+        _warn_shared_config()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2) + "\n")
 
@@ -264,7 +288,12 @@ def _require_runtime(args, *, auth: bool = True, hub: bool = True) -> dict:
     config = _load_config()
     runtime = {
         "server": getattr(args, "server", None) or os.getenv("SWARLO_SERVER") or config.get("server"),
-        "api_key": getattr(args, "api_key", None) or os.getenv("SWARLO_API_KEY") or config.get("api_key"),
+        "api_key": (
+            getattr(args, "api_key", None)
+            or os.getenv(TOKEN_ENV)
+            or os.getenv("SWARLO_API_KEY")
+            or config.get("api_key")
+        ),
         "hub": getattr(args, "hub", None) or os.getenv("SWARLO_HUB") or config.get("hub"),
         "member_id": (
             getattr(args, "member_id", None)
@@ -2125,8 +2154,9 @@ def _run_doctor() -> int:
     config writes, just reads and HTTP HEADs.
 
     Checks, in order:
-      1. ~/.swarlo/config.json exists and parses as JSON
-      2. Config has the required fields (server, hub, member_id, api_key)
+      1. Config file (SWARLO_CONFIG or ~/.swarlo/config.json) exists and parses,
+         unless a complete SWARLO_* env identity replaces it
+      2. Effective config has the required fields (server, hub, member_id, api_key)
       3. Server responds to /api/health
       4. Our member_id is registered on the server (listed in /members)
       5. Running inside a git repo (optional — only a WARN if not)
@@ -2143,13 +2173,26 @@ def _run_doctor() -> int:
     print(f"  {colors['dim']}swarlo doctor — diagnostics{colors['reset']}")
     print()
 
+    # Env identity overrides config fields, same resolution as _require_runtime.
+    env_identity = {
+        "server": os.getenv("SWARLO_SERVER"),
+        "hub": os.getenv("SWARLO_HUB"),
+        "member_id": os.getenv("SWARLO_MEMBER_ID"),
+        "api_key": os.getenv(TOKEN_ENV) or os.getenv("SWARLO_API_KEY"),
+    }
+    env_complete = all(env_identity.values())
+
     # Check 1: config file exists and parses
     cfg_path = _config_path()
     config: dict = {}
     if not cfg_path.exists():
-        _check(f"config file at {cfg_path}", "fail",
-               "missing — run `swarlo join ...` first", colors)
-        any_fail = True
+        if env_complete:
+            _check(f"config file at {cfg_path}", "warn",
+                   "missing — identity comes from SWARLO_* env vars", colors)
+        else:
+            _check(f"config file at {cfg_path}", "fail",
+                   "missing — run `swarlo join ...` first or set SWARLO_* env", colors)
+            any_fail = True
     else:
         try:
             config = json.loads(cfg_path.read_text())
@@ -2159,21 +2202,26 @@ def _run_doctor() -> int:
                    f"invalid JSON: {exc}", colors)
             any_fail = True
 
+    effective = dict(config)
+    for key, value in env_identity.items():
+        if value:
+            effective[key] = value
+
     # Check 2: required fields present
     required = ["server", "hub", "member_id", "api_key"]
-    missing = [k for k in required if not config.get(k)]
-    if config and missing:
+    missing = [k for k in required if not effective.get(k)]
+    if effective and missing:
         _check("required config fields",
                "fail" if "server" in missing else "warn",
                f"missing: {', '.join(missing)}", colors)
         if "server" in missing:
             any_fail = True
-    elif config:
+    elif effective:
         _check("required config fields", "ok",
                "server, hub, member_id, api_key present", colors)
 
     # Check 3: server is reachable
-    server = config.get("server")
+    server = effective.get("server")
     server_ok = False
     if server:
         try:
@@ -2194,9 +2242,9 @@ def _run_doctor() -> int:
             any_fail = True
 
     # Check 4: our member_id is registered
-    hub = config.get("hub")
-    member_id = config.get("member_id")
-    api_key = config.get("api_key")
+    hub = effective.get("hub")
+    member_id = effective.get("member_id")
+    api_key = effective.get("api_key")
     if server_ok and hub and member_id and api_key:
         try:
             req = urllib.request.Request(
@@ -2643,7 +2691,11 @@ fi
                 "hub_id": args.hub,
                 "invite_token": args.invite_token or os.environ.get("SWARLO_INVITE_TOKEN"),
             },
-            api_key=args.api_key or os.environ.get("SWARLO_API_KEY"),
+            api_key=(
+                args.api_key
+                or os.environ.get(TOKEN_ENV)
+                or os.environ.get("SWARLO_API_KEY")
+            ),
         )
         if status not in (200, 201):
             raise SystemExit(f"Join failed ({status}): {body}")
@@ -2691,6 +2743,8 @@ fi
         runtime = _require_runtime(args)
         channel = urllib.parse.quote(args.channel, safe="")
         payload: dict = {"content": args.content, "kind": args.kind}
+        if runtime.get("member_id"):
+            payload["member_id"] = runtime["member_id"]
         if args.task_key:
             payload["task_key"] = args.task_key
         if args.priority:
@@ -2714,6 +2768,8 @@ fi
         runtime = _require_runtime(args)
         channel = urllib.parse.quote(args.channel, safe="")
         payload = {"task_key": args.task_key, "content": args.content}
+        if runtime.get("member_id"):
+            payload["member_id"] = runtime["member_id"]
         if args.depends_on:
             payload["depends_on"] = [
                 d.strip() for d in args.depends_on.split(",") if d.strip()
@@ -2739,6 +2795,8 @@ fi
             "status": args.status,
             "content": args.content,
         }
+        if runtime.get("member_id"):
+            payload["member_id"] = runtime["member_id"]
         if args.include_next:
             payload["include_next"] = True
         if args.suggest_if_empty:
@@ -2774,6 +2832,8 @@ fi
             "assignee_id": args.assignee_id,
             "content": args.content,
         }
+        if runtime.get("member_id"):
+            payload["member_id"] = runtime["member_id"]
         if args.priority:
             payload["priority"] = args.priority
         if args.depends_on:
@@ -3192,7 +3252,11 @@ fi
         status, body = _request(
             "POST",
             f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/channels/{channel}/claim-file",
-            {"file_path": args.file_path, "content": args.content},
+            {
+                "file_path": args.file_path,
+                "content": args.content,
+                **({"member_id": runtime["member_id"]} if runtime.get("member_id") else {}),
+            },
             api_key=runtime["api_key"],
         )
         if status == 409:
@@ -3230,7 +3294,10 @@ fi
         status, body = _request(
             "POST",
             f"{runtime['server'].rstrip('/')}/api/{runtime['hub']}/posts/{post_id}/replies",
-            {"content": args.content},
+            {
+                "content": args.content,
+                **({"member_id": runtime["member_id"]} if runtime.get("member_id") else {}),
+            },
             api_key=runtime["api_key"],
         )
         if status not in (200, 201):

@@ -17,8 +17,8 @@ task_key is ``<campaign_id>/<mission_id>``. Events are deduped by id, so
 re-tailing a database is harmless. Each actor registers on the hub once and
 its key is kept in ``~/.swarlo/<hub>-<actor>.key``. Existing key files are
 reused; duplicate registration is rejected and rotation requires the current key.
-New actors in an existing hub need a sponsor key, supplied through SWARLO_API_KEY
-or the local config. Actors enrolled in this run can also sponsor later actors.
+New actors in an existing hub need a sponsor key, supplied through SWARLO_TOKEN,
+SWARLO_API_KEY, or the local config. Actors enrolled in this run can also sponsor later actors.
 
 Run: ``python3 -m swarlo.campaign_bridge [--once] [--db PATH ...]``
 """
@@ -264,8 +264,9 @@ class CampaignBridge:
 
 def main(argv: list[str] | None = None) -> int:
     config = {}
+    config_path = Path(os.environ.get("SWARLO_CONFIG", SWARLO_HOME / "config.json")).expanduser()
     try:
-        config = json.loads((SWARLO_HOME / "config.json").read_text())
+        config = json.loads(config_path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     parser = argparse.ArgumentParser(prog="swarlo.campaign_bridge", description=__doc__.splitlines()[0])
@@ -280,7 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     bridge = CampaignBridge(args.server, args.hub,
                             dbs=[Path(p).expanduser() for p in args.db] if args.db else None,
                             channel=args.channel,
-                            sponsor_key=os.environ.get("SWARLO_API_KEY") or config.get("api_key"))
+                            sponsor_key=(os.environ.get("SWARLO_TOKEN")
+                                         or os.environ.get("SWARLO_API_KEY")
+                                         or config.get("api_key")))
     while True:
         print(json.dumps(bridge.run_once()), flush=True)
         if args.once:

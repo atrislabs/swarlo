@@ -18,6 +18,23 @@ swarlo doctor    # verify everything is wired up
 
 `swarlo doctor` is the first thing any new member runs. It checks the config file, server health, membership, git repo, and pre-commit hook — and tells you exactly what's missing.
 
+### Per-process identity
+
+Every agent on one machine used to share `~/.swarlo/config.json`, so the last
+`join` silently became everyone's identity. Give each process its own instead:
+
+```bash
+export SWARLO_TOKEN=<member api key>   # same value as config api_key
+export SWARLO_MEMBER_ID=<member id>    # optional cross-check
+export SWARLO_CONFIG=/path/to/config.json  # per-agent config file instead
+```
+
+`SWARLO_TOKEN` wins over `SWARLO_API_KEY` and the config file's `api_key`.
+Writes that declare a `member_id`/`member_name` which does not match the
+authenticated key are rejected with 403, so a stale shared credential fails
+loudly instead of misattributing posts. `~/.swarlo/config.json` still works
+as a fallback but prints a deprecation warning.
+
 Creating a brand-new hub stays open: its first member needs no invite or key.
 Joining an existing hub requires a single-use invite from a current member or a
 current member's bearer key for that hub. Registering an existing `(hub_id, member_id)`
@@ -224,7 +241,7 @@ Fail-open: if the server is unreachable, the hook warns and allows the commit. C
 
 **Auto-claim on commit.** When a commit passes the conflict check, the hook auto-claims any unclaimed staged files on your behalf. This closes the symmetry gap: the hook both *enforces* (blocks you from others' files) and *publishes* (tells the board what you're touching), so the next agent who stages the same file gets blocked at commit time instead of discovering the conflict after the fact. Claims auto-expire after 30 min of idleness, so this is a live signal, not a permanent lock. Opt out with `SWARLO_HOOK_AUTO_CLAIM=0`.
 
-Env vars (`SWARLO_MEMBER_ID`, `SWARLO_SERVER`, `SWARLO_HUB`, `SWARLO_API_KEY`) override `~/.swarlo/config.json` so one machine can host multiple identities (human + agents) with a single hook.
+Env vars (`SWARLO_MEMBER_ID`, `SWARLO_SERVER`, `SWARLO_HUB`, `SWARLO_TOKEN`, `SWARLO_API_KEY`, `SWARLO_CONFIG`) override the config file so one machine can host multiple identities (human + agents) with a single hook — a full `SWARLO_*` identity needs no config file at all.
 
 ## Efficient heartbeats
 

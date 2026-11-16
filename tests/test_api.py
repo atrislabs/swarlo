@@ -297,6 +297,67 @@ class TestPosts:
         assert resp.json()["count"] == 1
 
 
+class TestClaimedMemberIdentity:
+    """Writes may self-declare member_id/member_name; a claim that does not
+    match the API key's member is a 403 so a stale or shared credential
+    fails loudly instead of silently posting as someone else."""
+
+    def test_post_without_claim_fields_still_works(self, client):
+        key = _register(client)
+        resp = client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                           json={"content": "plain"})
+        assert resp.status_code == 201
+
+    def test_post_with_matching_member_id_accepted(self, client):
+        key = _register(client, "agent-1", "Hugo")
+        resp = client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                           json={"content": "hi", "member_id": "agent-1"})
+        assert resp.status_code == 201
+        assert resp.json()["member_id"] == "agent-1"
+
+    def test_post_with_mismatched_member_id_rejected(self, client):
+        key = _register(client, "agent-1", "Hugo")
+        _register(client, "agent-2", "Gideon")
+        resp = client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                           json={"content": "hi", "member_id": "agent-2"})
+        assert resp.status_code == 403
+
+    def test_post_with_matching_member_name_accepted(self, client):
+        key = _register(client, "agent-1", "Hugo")
+        resp = client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                           json={"content": "hi", "member_name": "Hugo"})
+        assert resp.status_code == 201
+
+    def test_post_with_mismatched_member_name_rejected(self, client):
+        key = _register(client, "agent-1", "Hugo")
+        resp = client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                           json={"content": "hi", "member_name": "Gideon"})
+        assert resp.status_code == 403
+
+    def test_claim_with_mismatched_member_id_rejected(self, client):
+        key = _register(client, "agent-1", "Hugo")
+        resp = client.post("/api/atris/channels/experiments/claim", headers=_auth(key),
+                           json={"task_key": "task:x", "content": "mine",
+                                 "member_id": "agent-2"})
+        assert resp.status_code == 403
+
+    def test_report_with_mismatched_member_id_rejected(self, client):
+        key = _register(client, "agent-1", "Hugo")
+        resp = client.post("/api/atris/channels/experiments/report", headers=_auth(key),
+                           json={"task_key": "task:1", "status": "done",
+                                 "content": "done", "member_id": "agent-2"})
+        assert resp.status_code == 403
+
+    def test_reply_with_mismatched_member_id_rejected(self, client):
+        key = _register(client, "agent-1", "Hugo")
+        post = client.post("/api/atris/channels/general/posts", headers=_auth(key),
+                           json={"content": "parent"})
+        post_id = post.json()["post_id"]
+        resp = client.post(f"/api/atris/posts/{post_id}/replies", headers=_auth(key),
+                           json={"content": "reply", "member_id": "agent-2"})
+        assert resp.status_code == 403
+
+
 class TestClaims:
     def test_claim_succeeds(self, client):
         key = _register(client)

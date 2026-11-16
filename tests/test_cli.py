@@ -4677,3 +4677,145 @@ def test_push_and_fetch_bundle_roundtrip_cli(monkeypatch, tmp_path, capsys):
     cli.main()
     assert out_path.read_bytes() == b"GITBUNDLEFAKE"
     assert "Wrote 13 bytes" in capsys.readouterr().out
+
+
+def test_post_identity_from_env_needs_no_config(monkeypatch, tmp_path):
+    """SWARLO_TOKEN + SWARLO_MEMBER_ID + SWARLO_SERVER/HUB carry a full
+    per-process identity with no config file at all."""
+    monkeypatch.delenv("SWARLO_CONFIG", raising=False)
+    monkeypatch.delenv("SWARLO_API_KEY", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # default config path stays empty
+    monkeypatch.setenv("SWARLO_TOKEN", "env-token")
+    monkeypatch.setenv("SWARLO_MEMBER_ID", "agent-9")
+    monkeypatch.setenv("SWARLO_SERVER", "http://localhost:8080")
+    monkeypatch.setenv("SWARLO_HUB", "env-hub")
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called.update({"url": url, "payload": payload, "api_key": api_key})
+        return 201, {"kind": "message", "channel": "general"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "post", "general", "hello"])
+
+    cli.main()
+    assert called["api_key"] == "env-token"
+    assert called["url"] == "http://localhost:8080/api/env-hub/channels/general/posts"
+    assert called["payload"]["member_id"] == "agent-9"
+
+
+def test_swarlo_token_beats_config_and_legacy_env(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "config-key",
+        "member_id": "cfg-member",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+    monkeypatch.setenv("SWARLO_API_KEY", "legacy-key")
+    monkeypatch.setenv("SWARLO_TOKEN", "token-key")
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert api_key == "token-key"
+        return 201, {"kind": "message", "channel": "general"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "post", "general", "hi"])
+
+    cli.main()
+
+
+def test_swarlo_api_key_still_works_as_legacy_alias(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "config-key",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+    monkeypatch.delenv("SWARLO_TOKEN", raising=False)
+    monkeypatch.setenv("SWARLO_API_KEY", "legacy-key")
+
+    def fake_request(method, url, payload=None, api_key=None):
+        assert api_key == "legacy-key"
+        return 201, {"kind": "message", "channel": "general"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "post", "general", "hi"])
+
+    cli.main()
+
+
+def test_post_sends_configured_member_id(monkeypatch, tmp_path):
+    """The CLI declares its member_id so the server can 403 a stale key
+    whose config name belongs to someone else."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+        "member_id": "agent-1",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+
+    called = {}
+
+    def fake_request(method, url, payload=None, api_key=None):
+        called["payload"] = payload
+        return 201, {"kind": "message", "channel": "general"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "post", "general", "hi"])
+
+    cli.main()
+    assert called["payload"]["member_id"] == "agent-1"
+
+
+def test_shared_config_fallback_warns_on_stderr(monkeypatch, tmp_path, capsys):
+    """Reading the machine-wide ~/.swarlo/config.json prints a one-line
+    deprecation warning so agents migrate to per-process identity."""
+    monkeypatch.delenv("SWARLO_CONFIG", raising=False)
+    monkeypatch.delenv("SWARLO_TOKEN", raising=False)
+    monkeypatch.delenv("SWARLO_API_KEY", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_shared_config_warned", False)
+    shared = tmp_path / ".swarlo" / "config.json"
+    shared.parent.mkdir(parents=True)
+    shared.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+
+    def fake_request(method, url, payload=None, api_key=None):
+        return 201, {"kind": "message", "channel": "general"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "post", "general", "hi"])
+
+    cli.main()
+    err = capsys.readouterr().err
+    assert "shared ~/.swarlo/config.json" in err
+    assert "SWARLO_TOKEN" in err
+
+
+def test_explicit_swarlo_config_does_not_warn(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "server": "http://localhost:8080",
+        "hub": "my-team",
+        "api_key": "secret",
+    }))
+    monkeypatch.setenv("SWARLO_CONFIG", str(config_path))
+    monkeypatch.setattr(cli, "_shared_config_warned", False)
+
+    def fake_request(method, url, payload=None, api_key=None):
+        return 201, {"kind": "message", "channel": "general"}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["swarlo", "post", "general", "hi"])
+
+    cli.main()
+    assert "shared ~/.swarlo/config.json" not in capsys.readouterr().err
