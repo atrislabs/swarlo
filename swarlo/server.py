@@ -10,21 +10,26 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
+import json
 import logging
 import os
+import posixpath
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 # A task identifier that must be non-empty. Leading/trailing whitespace is
 # stripped so "task:foo " and "task:foo" name the same lock, and a
@@ -60,13 +65,23 @@ POST_RATE_LIMIT_PER_MINUTE = 10
 POST_RATE_WINDOW_SECONDS = 60.0
 TASK_POST_RATE_LIMIT_PER_MINUTE = 2
 TASK_POST_RATE_KINDS = {"status", "result", "failed"}
+# Registration rate limit per client IP per minute.
+REGISTER_RATE_LIMIT_PER_MINUTE = 100
+REGISTER_RATE_WINDOW_SECONDS = 60.0
+# In-memory cache caps to prevent unbounded RAM growth under churn.
+MAX_HUB_DAGS = 256
+MAX_RATE_LIMIT_BUCKETS = 10_000
+MAX_GIT_BUNDLE_BYTES = 50 * 1024 * 1024
+MAX_WINDOW_MINUTES = 525600
+_ID_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 # An identical body retried within this window gets the first post back
 # (200, idempotent) instead of a second row.
 POST_DEDUPE_WINDOW_SECONDS = 60.0
 
 # (hub_id, member_id) -> monotonic timestamps of accepted post attempts.
-_post_attempts: dict[tuple[str, str], deque[float]] = {}
-_task_post_attempts: dict[tuple[str, str, str, str], deque[float]] = {}
+_post_attempts: OrderedDict[tuple[str, str], deque[float]] = OrderedDict()
+_task_post_attempts: OrderedDict[tuple[str, str, str, str], deque[float]] = OrderedDict()
+_register_attempts: OrderedDict[str, deque[float]] = OrderedDict()
 
 
 def _utc_cutoff(days: int) -> str:
@@ -109,7 +124,7 @@ def get_backend() -> SQLiteBackend:
     return _backend
 
 
-_hub_dags: dict[str, GitDAG] = {}
+_hub_dags: OrderedDict[str, GitDAG] = OrderedDict()
 
 
 def get_dag(hub_id: str | None = None) -> GitDAG:
@@ -128,11 +143,15 @@ def get_dag(hub_id: str | None = None) -> GitDAG:
         return _git_dag
     key = f"{_git_dag.path}\0{hub_id}"
     dag = _hub_dags.get(key)
-    if dag is None:
-        name = hashlib.sha256(hub_id.encode("utf-8")).hexdigest()[:32]
-        dag = GitDAG(str(_git_dag.path / "hubs" / f"{name}.git"))
-        dag.init()
-        _hub_dags[key] = dag
+    if dag is not None:
+        _hub_dags.move_to_end(key)
+        return dag
+    name = hashlib.sha256(hub_id.encode("utf-8")).hexdigest()[:32]
+    dag = GitDAG(str(_git_dag.path / "hubs" / f"{name}.git"))
+    dag.init()
+    _hub_dags[key] = dag
+    while len(_hub_dags) > MAX_HUB_DAGS:
+        _hub_dags.popitem(last=False)
     return dag
 
 
@@ -144,12 +163,14 @@ def set_backend(backend: SQLiteBackend):
     # reconfigure) starts a fresh window.
     _post_attempts.clear()
     _task_post_attempts.clear()
+    _register_attempts.clear()
 
 
 def set_dag(dag: GitDAG):
     """Set the global GitDAG instance for commit tracking."""
     global _git_dag
     _git_dag = dag
+    _hub_dags.clear()
 
 
 # Daily self-prune of the live hub (~/.swarlo). Only runs when this server
@@ -191,12 +212,12 @@ def _get_member(request: Request, hub_id: str) -> Member:
         raise HTTPException(403, "Member does not belong to this hub")
     # Bump last_seen on every authenticated call
     try:
-        from datetime import datetime, timezone
-        be.conn.execute(
-            "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
-            (datetime.now(timezone.utc).isoformat(), member.member_id, member.hub_id),
-        )
-        be.conn.commit()
+        with be._write_lock:
+            be.conn.execute(
+                "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
+                (datetime.now(timezone.utc).isoformat(), member.member_id, member.hub_id),
+            )
+            be.conn.commit()
     except Exception:
         pass  # best-effort, don't break auth
     return member
@@ -242,6 +263,35 @@ def _enforce_test_bot_channel(member: Member, channel: str) -> None:
             403, f"Test bots may only post to #{TEST_BOT_CHANNEL}")
 
 
+def _prune_rate_buckets(store: OrderedDict, cutoff: float) -> None:
+    if len(store) <= MAX_RATE_LIMIT_BUCKETS:
+        return
+    stale_keys = [k for k, dq in store.items() if not dq or dq[-1] <= cutoff]
+    for k in stale_keys:
+        store.pop(k, None)
+    while len(store) > MAX_RATE_LIMIT_BUCKETS:
+        store.popitem(last=False)
+
+
+def _enforce_register_rate_limit(client_key: str) -> None:
+    """Cap registration attempts per client IP per minute."""
+    now = time.monotonic()
+    cutoff = now - REGISTER_RATE_WINDOW_SECONDS
+    attempts = _register_attempts.get(client_key)
+    if attempts is None:
+        attempts = _register_attempts[client_key] = deque()
+    else:
+        _register_attempts.move_to_end(client_key)
+    while attempts and attempts[0] <= cutoff:
+        attempts.popleft()
+    if len(attempts) >= REGISTER_RATE_LIMIT_PER_MINUTE:
+        raise HTTPException(
+            429, f"Rate limit: at most {REGISTER_RATE_LIMIT_PER_MINUTE} registrations per minute",
+        )
+    attempts.append(now)
+    _prune_rate_buckets(_register_attempts, cutoff)
+
+
 def _enforce_post_rate_limit(hub_id: str, member_id: str,
                              task_key: str | None, kind: str) -> None:
     """Cap new posts at POST_RATE_LIMIT_PER_MINUTE per member per hub per
@@ -252,13 +302,19 @@ def _enforce_post_rate_limit(hub_id: str, member_id: str,
     attempts = _post_attempts.get(key)
     if attempts is None:
         attempts = _post_attempts[key] = deque()
+    else:
+        _post_attempts.move_to_end(key)
     cutoff = now - POST_RATE_WINDOW_SECONDS
     while attempts and attempts[0] <= cutoff:
         attempts.popleft()
     task_attempts = None
     if task_key and kind in TASK_POST_RATE_KINDS:
-        task_attempts = _task_post_attempts.setdefault(
-            (hub_id, member_id, task_key, kind), deque())
+        task_key_bucket = (hub_id, member_id, task_key, kind)
+        task_attempts = _task_post_attempts.get(task_key_bucket)
+        if task_attempts is None:
+            task_attempts = _task_post_attempts[task_key_bucket] = deque()
+        else:
+            _task_post_attempts.move_to_end(task_key_bucket)
         while task_attempts and task_attempts[0] <= cutoff:
             task_attempts.popleft()
         if len(task_attempts) >= TASK_POST_RATE_LIMIT_PER_MINUTE:
@@ -269,6 +325,8 @@ def _enforce_post_rate_limit(hub_id: str, member_id: str,
     attempts.append(now)
     if task_attempts is not None:
         task_attempts.append(now)
+    _prune_rate_buckets(_post_attempts, cutoff)
+    _prune_rate_buckets(_task_post_attempts, cutoff)
 
 
 # ── Request models ──────────────────────────────────────────
@@ -293,6 +351,24 @@ class RegisterRequest(BaseModel):
     hub_id: str = "default"
     webhook_url: Optional[str] = None
     invite_token: Optional[str] = None
+
+    @field_validator("member_id", "hub_id")
+    @classmethod
+    def _validate_identifier(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped or len(stripped) > 128 or ".." in stripped or not _ID_SLUG_RE.fullmatch(stripped):
+            raise ValueError(
+                "Identifier must be 1-128 chars matching [A-Za-z0-9._:@-], start with alphanumeric, and contain no '..' or path separators"
+            )
+        return stripped
+
+    @field_validator("member_name")
+    @classmethod
+    def _validate_member_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > 128 or any(ord(c) < 32 for c in stripped):
+            raise ValueError("member_name must be at most 128 chars with no control characters")
+        return stripped
 
 
 class InviteRequest(BaseModel):
@@ -352,11 +428,11 @@ class ReplyRequest(_ClaimedIdentity):
 @app.post("/api/register", status_code=201)
 async def register(body: RegisterRequest, request: Request):
     """Create a hub openly; require an invite or current member key to join one."""
-    if body.webhook_url and not _is_safe_webhook_url(body.webhook_url):
+    client_host = request.client.host if request.client else "unknown"
+    _enforce_register_rate_limit(client_host)
+    if body.webhook_url and not await _is_safe_webhook_url_async(body.webhook_url):
         raise HTTPException(400, "Invalid webhook URL: must be HTTPS and not target private networks")
     be = get_backend()
-    if be.get_member(body.hub_id, body.member_id):
-        raise HTTPException(409, "Member already registered; use the current key to rotate credentials")
     api_key = secrets.token_hex(32)
     member = Member(
         member_id=body.member_id,
@@ -375,7 +451,6 @@ async def register(body: RegisterRequest, request: Request):
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from None
     except sqlite3.IntegrityError:
-        get_backend().conn.rollback()
         raise HTTPException(409, "Member already registered; use the current key to rotate credentials")
     return {"member_id": member.member_id, "api_key": api_key, "hub_id": member.hub_id}
 
@@ -448,10 +523,18 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
     _enforce_test_bot_channel(member, channel)
-    from .types import check_claim_like_note, validate_post_content, validate_post_kind
+    from .types import (
+        check_claim_like_note,
+        validate_depends_on,
+        validate_metadata,
+        validate_post_content,
+        validate_post_kind,
+    )
     try:
         validate_post_content(body.content)
         validate_post_kind(body.kind)
+        validate_metadata(body.metadata)
+        validate_depends_on(body.depends_on)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
     be = get_backend()
@@ -467,17 +550,20 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
         response.status_code = 200
         return existing.to_dict()
     _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, body.kind)
-    post = await be.create_post(
-        hub_id,
-        member,
-        channel,
-        body.content,
-        body.kind,
-        body.task_key,
-        metadata=body.metadata,
-        priority=body.priority,
-        depends_on=body.depends_on,
-    )
+    try:
+        post = await be.create_post(
+            hub_id,
+            member,
+            channel,
+            body.content,
+            body.kind,
+            body.task_key,
+            metadata=body.metadata,
+            priority=body.priority,
+            depends_on=body.depends_on,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     if post.mentions:
         background_tasks.add_task(_dispatch_webhooks, hub_id, post)
     return post.to_dict()
@@ -490,10 +576,21 @@ async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Req
     """Claim a task to prevent duplicate work. Returns 409 if already claimed."""
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
-    result = await get_backend().claim(
-        hub_id, member, channel, body.task_key, body.content,
-        depends_on=body.depends_on,
-    )
+    _enforce_test_bot_channel(member, channel)
+    from .types import validate_depends_on, validate_post_content
+    try:
+        validate_post_content(body.content)
+        validate_depends_on(body.depends_on)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, "claim")
+    try:
+        result = await get_backend().claim(
+            hub_id, member, channel, body.task_key, body.content,
+            depends_on=body.depends_on,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     if result.conflict:
         raise HTTPException(409, result.to_dict())
     return result.to_dict()
@@ -507,6 +604,20 @@ class FileClaimRequest(_ClaimedIdentity):
     file_path: str
     content: str = ""
 
+    @field_validator("file_path")
+    @classmethod
+    def _normalize_file_path(cls, value: str) -> str:
+        raw = value.strip()
+        if not raw or len(raw) > 512 or any(ord(c) < 32 for c in raw):
+            raise ValueError("file_path must be a non-empty relative path without control characters")
+        raw = raw.replace("\\", "/")
+        if raw.startswith("/"):
+            raise ValueError("file_path must be relative, not absolute")
+        norm = posixpath.normpath(raw)
+        if norm in (".", "..", "/") or norm.startswith("../") or norm.startswith("/"):
+            raise ValueError("file_path must not escape the repository root or be '.'")
+        return norm
+
 
 @app.post("/api/{hub_id}/channels/{channel}/claim-file", status_code=201)
 async def claim_file(hub_id: str, channel: str, body: FileClaimRequest, request: Request):
@@ -514,9 +625,19 @@ async def claim_file(hub_id: str, channel: str, body: FileClaimRequest, request:
     Uses task_key = 'file:<path>' convention on the existing claim system."""
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
+    _enforce_test_bot_channel(member, channel)
+    from .types import validate_post_content
+    desc = body.content if body.content != "" else f"Editing {body.file_path}"
+    try:
+        validate_post_content(desc)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     task_key = f"file:{body.file_path}"
-    desc = body.content or f"Editing {body.file_path}"
-    result = await get_backend().claim(hub_id, member, channel, task_key, desc)
+    _enforce_post_rate_limit(hub_id, member.member_id, task_key, "claim")
+    try:
+        result = await get_backend().claim(hub_id, member, channel, task_key, desc)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     if result.conflict:
         raise HTTPException(409, result.to_dict())
     return result.to_dict()
@@ -551,9 +672,20 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
     assigner = _get_member(request, hub_id)
     _enforce_claimed_member(assigner, body.member_id, body.member_name)
     _require_human(assigner)
+    _enforce_test_bot_channel(assigner, channel)
+    from .types import validate_depends_on, validate_post_content
+    try:
+        validate_post_content(body.content)
+        validate_depends_on(body.depends_on)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    _enforce_post_rate_limit(hub_id, assigner.member_id, body.task_key, "assign")
     be = get_backend()
-    result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
-                             depends_on=body.depends_on, priority=body.priority)
+    try:
+        result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
+                                 depends_on=body.depends_on, priority=body.priority)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     if not result.claimed:
         if result.conflict:
             raise HTTPException(409, result.to_dict())
@@ -588,6 +720,15 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
     """
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
+    _enforce_test_bot_channel(member, channel)
+    from .types import validate_metadata, validate_post_content
+    try:
+        validate_post_content(body.content)
+        validate_metadata(body.metadata)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    report_kind = "result" if body.status == "done" else "failed" if body.status == "failed" else body.status
+    _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, report_kind)
     try:
         post = await get_backend().report(
             hub_id, member, channel, body.task_key, body.status, body.content,
@@ -595,7 +736,9 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
             metadata=body.metadata,
         )
     except PermissionError as exc:
-        raise HTTPException(409, str(exc))
+        raise HTTPException(409, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
 
     result = post.to_dict()
 
@@ -674,10 +817,11 @@ async def ping(hub_id: str, member_id: str, request: Request,
         (hub_id, since),
     ).fetchone()[0]
 
-    # Count @mentions of this member
+    # Count @mentions of this member (escape LIKE wildcards % and _)
+    escaped_member_id = member_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     new_mentions = be.conn.execute(
-        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND created_at > ? AND mentions LIKE ?",
-        (hub_id, since, f'%"{member_id}"%'),
+        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND created_at > ? AND mentions LIKE ? ESCAPE '\\'",
+        (hub_id, since, f'%"{escaped_member_id}"%'),
     ).fetchone()[0]
 
     # Count assignments to this member. Uses the first-class assignee_id
@@ -788,6 +932,7 @@ async def detect_idle(hub_id: str, request: Request, idle_minutes: int = 15):
     """
     _get_member(request, hub_id)
     be = get_backend()
+    idle_minutes = max(1, min(int(idle_minutes), MAX_WINDOW_MINUTES))
 
     now = datetime.now(timezone.utc)
     alive_cutoff = (now - timedelta(minutes=30)).isoformat()
@@ -964,7 +1109,11 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30,
     """
     _get_member(request, hub_id)
     be = get_backend()
-    from datetime import datetime, timezone, timedelta
+    stale_minutes = int(stale_minutes)
+    if stale_minutes < 0:
+        stale_minutes = 1
+    elif stale_minutes > MAX_WINDOW_MINUTES:
+        stale_minutes = MAX_WINDOW_MINUTES
 
     # Passive cleanup: expire stale claims before computing orphans. This
     # way the orphaned_claims list reflects what's *still* stuck after
@@ -972,7 +1121,7 @@ async def check_liveness(hub_id: str, request: Request, stale_minutes: int = 30,
     expired_keys: list[str] = []
     if auto_expire:
         expired_keys = await be.force_expire_claims(
-            hub_id, stale_minutes=max(OPEN_CLAIM_STALE_MINUTES, stale_minutes),
+            hub_id, stale_minutes=min(MAX_WINDOW_MINUTES, max(OPEN_CLAIM_STALE_MINUTES, stale_minutes)),
         )
 
     now = datetime.now(timezone.utc)
@@ -1038,7 +1187,7 @@ async def expire_stale_claims(hub_id: str, request: Request):
     raw_stale = body.get("stale_minutes", 30) if isinstance(body, dict) else 30
     # Cleanup cannot shorten the normal claim heartbeat budget.
     try:
-        stale_minutes = max(OPEN_CLAIM_STALE_MINUTES, int(raw_stale))
+        stale_minutes = max(OPEN_CLAIM_STALE_MINUTES, min(int(raw_stale), MAX_WINDOW_MINUTES))
     except (TypeError, ValueError):
         raise HTTPException(400, "stale_minutes must be an integer")
     expired = await get_backend().force_expire_claims(hub_id, stale_minutes=stale_minutes)
@@ -1164,71 +1313,168 @@ async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: R
     """Create a reply to an existing post."""
     member = _get_member(request, hub_id)
     _enforce_claimed_member(member, body.member_id, body.member_name)
-    reply = await get_backend().reply(hub_id, member, post_id, body.content)
+    from .types import validate_post_content
+    try:
+        validate_post_content(body.content)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    be = get_backend()
+    parent = be.conn.execute(
+        "SELECT channel FROM posts WHERE hub_id = ? AND post_id = ?",
+        (hub_id, post_id),
+    ).fetchone()
+    if not parent:
+        raise HTTPException(404, f"Post {post_id} not found in hub {hub_id}")
+    _enforce_test_bot_channel(member, parent["channel"])
+    _enforce_post_rate_limit(hub_id, member.member_id, None, "reply")
+    try:
+        reply = await be.reply(hub_id, member, post_id, body.content)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     return reply.to_dict()
 
 
 # ── Webhooks ───────────────────────────────────────────────
 
-import ipaddress
-from urllib.parse import urlparse
+_LOCALHOST = frozenset({"localhost", "127.0.0.1", "::1"})
+_LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_server_bind_host: str = "127.0.0.1"
 
 
-_LOCALHOST = ("localhost", "127.0.0.1", "::1")
+def set_bind_host(host: str) -> None:
+    """Record the server bind host to gate default localhost webhook allowance."""
+    global _server_bind_host
+    _server_bind_host = (host or "").strip().lower()
+
+
+def _allow_localhost_webhooks() -> bool:
+    env = os.environ.get("SWARLO_ALLOW_LOCALHOST_WEBHOOKS")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return _server_bind_host in _LOOPBACK_BIND_HOSTS
+
+
+def _is_global_ip(raw_ip: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(raw_ip)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return bool(
+        ip.is_global
+        and not ip.is_private
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_multicast
+        and not ip.is_reserved
+        and not ip.is_unspecified
+    )
+
+
+def _classify_webhook_url(url: str) -> tuple[str, str | None, int | None]:
+    """Validate URL syntax, port, scheme, and literal IPs.
+
+    Returns ("allow", None, None), ("deny", None, None), or ("resolve", hostname, port).
+    """
+    if not isinstance(url, str) or not url or any(ord(c) < 32 for c in url):
+        return ("deny", None, None)
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return ("deny", None, None)
+
+    if not parsed.scheme or not parsed.hostname:
+        return ("deny", None, None)
+    if parsed.scheme not in ("http", "https"):
+        return ("deny", None, None)
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return ("deny", None, None)
+    if port is not None and not (1 <= port <= 65535):
+        return ("deny", None, None)
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if not hostname:
+        return ("deny", None, None)
+
+    if hostname in _LOCALHOST:
+        return ("allow", None, None) if _allow_localhost_webhooks() else ("deny", None, None)
+
+    # External webhooks must use HTTPS.
+    if parsed.scheme != "https":
+        return ("deny", None, None)
+
+    # If hostname is an IP literal, check directly without DNS.
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return ("resolve", hostname, port or 443)
+    return ("allow", None, None) if _is_global_ip(hostname) else ("deny", None, None)
+
+
+def _resolved_addrs_are_global(resolved) -> bool:
+    if not resolved:
+        return False
+    for _, _, _, _, addr in resolved:
+        if not addr or not _is_global_ip(addr[0]):
+            return False
+    return True
 
 
 def _is_safe_webhook_url(url: str, at_dispatch: bool = False) -> bool:
     """Validate webhook URL against SSRF.
 
     Rules:
-    - localhost: always allowed (server itself is local)
-    - External: must be HTTPS, must resolve to a globally-routable IP
-    - at_dispatch=True: DNS must resolve (blocks rebinding attacks)
+    - Invalid ports/schemes are always rejected (at registration and dispatch).
+    - Localhost is allowed only when SWARLO_ALLOW_LOCALHOST_WEBHOOKS is enabled
+      (defaults to enabled only for loopback/testclient binds, disabled otherwise).
+    - External: must be HTTPS and resolve exclusively to globally-routable IPs.
+    - at_dispatch=True: DNS must resolve (blocks rebinding attacks).
     """
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-
-    if not parsed.scheme or not parsed.hostname:
-        return False
-
-    if parsed.scheme not in ("http", "https"):
-        return False
-
-    # Localhost is always allowed (the server runs locally)
-    if parsed.hostname in _LOCALHOST:
+    action, hostname, port = _classify_webhook_url(url)
+    if action == "allow":
         return True
-
-    # External: require HTTPS
-    if parsed.scheme != "https":
+    if action == "deny":
+        return False
+    try:
+        resolved = socket.getaddrinfo(hostname, port)
+        return _resolved_addrs_are_global(resolved)
+    except socket.gaierror:
+        return not at_dispatch
+    except (ValueError, OSError):
         return False
 
-    # Resolve DNS and require globally-routable IPs
-    try:
-        import socket
-        resolved = socket.getaddrinfo(parsed.hostname, parsed.port or 443)
-        for _, _, _, _, addr in resolved:
-            ip = ipaddress.ip_address(addr[0])
-            if not ip.is_global:
-                return False
-    except (socket.gaierror, ValueError):
-        if at_dispatch:
-            return False  # Must resolve at dispatch time
-        # Registration: allow — will re-check at dispatch
 
-    return True
+async def _is_safe_webhook_url_async(url: str, at_dispatch: bool = False) -> bool:
+    """Async SSRF check that offloads DNS resolution via asyncio.to_thread."""
+    action, hostname, port = _classify_webhook_url(url)
+    if action == "allow":
+        return True
+    if action == "deny":
+        return False
+    try:
+        resolved = await asyncio.to_thread(socket.getaddrinfo, hostname, port)
+        return _resolved_addrs_are_global(resolved)
+    except socket.gaierror:
+        return not at_dispatch
+    except (ValueError, OSError):
+        return False
 
 
 async def _dispatch_webhooks(hub_id: str, post):
     """Fire webhook callbacks for @mentioned members. Best-effort, no retries."""
     backend = get_backend()
     members = backend.get_members_by_ids(hub_id, post.mentions)
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
         for m in members:
             if not m.webhook_url:
                 continue
-            if not _is_safe_webhook_url(m.webhook_url, at_dispatch=True):
+            if not await _is_safe_webhook_url_async(m.webhook_url, at_dispatch=True):
                 logger.warning(f"Blocked unsafe webhook for member {m.member_id}")
                 continue
             try:
@@ -1310,7 +1556,7 @@ async def suggest_tasks(hub_id: str, request: Request):
 
     # 3. Find patterns in completed work — what kind of tasks ship successfully?
     recent_results = be.conn.execute(
-        "SELECT content, task_key FROM posts WHERE hub_id = ? AND kind = 'result' ORDER BY created_at DESC LIMIT 20",
+        "SELECT content, task_key FROM posts WHERE hub_id = ? AND kind = 'result' AND status = 'done' ORDER BY created_at DESC LIMIT 20",
         (hub_id,),
     ).fetchall()
     shipped_keywords = {}
@@ -1322,7 +1568,7 @@ async def suggest_tasks(hub_id: str, request: Request):
 
     # 4. Find failed tasks that could be retried with different approach
     recent_failures = be.conn.execute(
-        "SELECT task_key, content FROM posts WHERE hub_id = ? AND kind = 'failed' ORDER BY created_at DESC LIMIT 5",
+        "SELECT task_key, content FROM posts WHERE hub_id = ? AND kind = 'failed' AND status = 'failed' ORDER BY created_at DESC LIMIT 5",
         (hub_id,),
     ).fetchall()
 
@@ -1406,7 +1652,7 @@ async def prune_members(hub_id: str, request: Request):
     raw_stale = body.get("stale_minutes", 60) if isinstance(body, dict) else 60
     # A non-numeric value would otherwise 500. The backend clamps to >= 1.
     try:
-        stale_minutes = int(raw_stale)
+        stale_minutes = max(1, min(int(raw_stale), MAX_WINDOW_MINUTES))
     except (TypeError, ValueError):
         raise HTTPException(400, "stale_minutes must be an integer >= 1")
     pruned = get_backend().prune_members(hub_id, stale_minutes)
@@ -1445,9 +1691,9 @@ async def compute_score(hub_id: str, request: Request):
         (hub_id, open_claim_cutoff),
     ).fetchone()[0]
 
-    # Completed results
+    # Completed results (authoritative status required; freeform kind='result' with status=NULL ignored)
     tasks_shipped = be.conn.execute(
-        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND kind = 'result'",
+        "SELECT COUNT(*) FROM posts WHERE hub_id = ? AND kind = 'result' AND status = 'done'",
         (hub_id,),
     ).fetchone()[0]
 
@@ -1464,6 +1710,7 @@ async def compute_score(hub_id: str, request: Request):
           AND t.kind = 'message'
           AND t.task_key IS NOT NULL
           AND c.kind = 'claim'
+          AND c.status IS NOT NULL
         ORDER BY c.created_at DESC
         LIMIT 100
         """,
@@ -1503,7 +1750,7 @@ async def compute_score(hub_id: str, request: Request):
         """
         SELECT task_key, COUNT(DISTINCT member_id) as editors
         FROM posts
-        WHERE hub_id = ? AND task_key LIKE 'file:%' AND kind = 'claim'
+        WHERE hub_id = ? AND task_key LIKE 'file:%' AND kind = 'claim' AND status IS NOT NULL
         GROUP BY task_key
         HAVING editors > 1
         """,
@@ -1515,7 +1762,7 @@ async def compute_score(hub_id: str, request: Request):
     # +10 per shipped task, +5 per active agent, -20 per multi-editor file, -5 per unclaimed task
     unclaimed_tasks = be.conn.execute(
         "SELECT COUNT(DISTINCT task_key) FROM posts WHERE hub_id = ? AND kind = 'message' AND task_key IS NOT NULL "
-        "AND task_key NOT IN (SELECT task_key FROM posts WHERE hub_id = ? AND kind = 'claim' AND task_key IS NOT NULL)",
+        "AND task_key NOT IN (SELECT task_key FROM posts WHERE hub_id = ? AND kind = 'claim' AND status IS NOT NULL AND task_key IS NOT NULL)",
         (hub_id, hub_id),
     ).fetchone()[0]
 
@@ -1527,12 +1774,13 @@ async def compute_score(hub_id: str, request: Request):
     # the SCHEMA block at startup (sqlite_backend.py) — no need to
     # CREATE TABLE IF NOT EXISTS on every request.
     try:
-        be.conn.execute(
-            "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, computed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, now),
-        )
-        be.conn.commit()
+        with be._write_lock:
+            be.conn.execute(
+                "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, computed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, now),
+            )
+            be.conn.commit()
     except Exception:
         pass  # Non-critical
 
@@ -1557,6 +1805,7 @@ def _compute_per_agent_xp(be: SQLiteBackend, hub_id: str) -> list[dict]:
     """XP ledger matching CLI mechanics: claim +2, done +10, failed -3, blocked -1.
 
     file: task keys are excluded. Order is XP desc, then member_id.
+    Only authoritative claims/reports (status IS NOT NULL) award or deduct XP.
     """
     events = be.conn.execute(
         "SELECT member_id, member_name, kind, status, task_key FROM posts WHERE hub_id = ?",
@@ -1566,6 +1815,10 @@ def _compute_per_agent_xp(be: SQLiteBackend, hub_id: str) -> list[dict]:
     for event in events:
         task_key = event["task_key"]
         if task_key and str(task_key).startswith("file:"):
+            continue
+        kind = event["kind"]
+        status = event["status"]
+        if status is None:
             continue
         member_id = event["member_id"] or "unknown"
         row = by_member.setdefault(
@@ -1580,18 +1833,16 @@ def _compute_per_agent_xp(be: SQLiteBackend, hub_id: str) -> list[dict]:
                 "blocked": 0,
             },
         )
-        kind = event["kind"]
-        status = event["status"]
         if kind == "claim" and status != "retracted":
             row["xp"] += 2
             row["claims"] += 1
-        elif status == "blocked" or kind == "blocked":
+        elif kind != "claim" and status == "blocked":
             row["xp"] -= 1
             row["blocked"] += 1
-        elif status == "failed" or kind == "failed":
+        elif kind != "claim" and status == "failed":
             row["xp"] -= 3
             row["failed"] += 1
-        elif status == "done" or kind == "result":
+        elif kind != "claim" and status == "done":
             row["xp"] += 10
             row["shipped"] += 1
     return sorted(
@@ -1621,8 +1872,7 @@ def _list_unclaimed_tasks(
         row["task_key"]
         for row in be.conn.execute(
             "SELECT DISTINCT task_key FROM posts WHERE hub_id = ? AND task_key IS NOT NULL "
-            "AND task_key NOT LIKE 'file:%' AND (kind IN ('result', 'blocked') "
-            "OR status IN ('done', 'failed', 'blocked'))",
+            "AND task_key NOT LIKE 'file:%' AND status IN ('done', 'failed', 'blocked')",
             (hub_id,),
         ).fetchall()
         if row["task_key"]
@@ -1719,18 +1969,33 @@ async def list_scores(hub_id: str, request: Request, limit: int = 10):
 async def git_push(hub_id: str, request: Request):
     """Push a git bundle to the hub's DAG store."""
     member = _get_member(request, hub_id)
-    body = await request.body()
-    if len(body) > 50 * 1024 * 1024:
-        raise HTTPException(413, "Bundle too large (max 50MB)")
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            parsed_len = int(content_length)
+        except ValueError:
+            raise HTTPException(400, "Invalid Content-Length header")
+        if parsed_len < 0:
+            raise HTTPException(400, "Invalid Content-Length header")
+        if parsed_len > MAX_GIT_BUNDLE_BYTES:
+            raise HTTPException(413, "Bundle too large (max 50MB)")
 
-    dag = get_dag(hub_id)
+    chunks = bytearray()
+    async for chunk in request.stream():
+        if len(chunks) + len(chunk) > MAX_GIT_BUNDLE_BYTES:
+            raise HTTPException(413, "Bundle too large (max 50MB)")
+        chunks.extend(chunk)
+    body = bytes(chunks)
+
+    dag = await asyncio.to_thread(get_dag, hub_id)
     try:
         hashes = await dag.unbundle(body)
     except (ValueError, subprocess.CalledProcessError):
         raise HTTPException(400, "Bundle could not be imported into this hub")
     # A forged header can name a commit the bundle never carried.
-    if not all(dag.commit_exists(h) for h in hashes):
-        raise HTTPException(400, "Bundle names a commit it does not contain")
+    for h in hashes:
+        if not await asyncio.to_thread(dag.commit_exists, h):
+            raise HTTPException(400, "Bundle names a commit it does not contain")
 
     # Index each commit in SQLite
     backend = get_backend()
@@ -1738,7 +2003,7 @@ async def git_push(hub_id: str, request: Request):
         existing = backend.get_commit(hub_id, h)
         if existing:
             continue
-        parent_hash, message = dag.get_commit_info(h)
+        parent_hash, message = await asyncio.to_thread(dag.get_commit_info, h)
         backend.index_commit(hub_id, h, parent_hash, member.member_id, member.member_name, message)
 
     return {"hashes": hashes}
@@ -1748,11 +2013,11 @@ async def git_push(hub_id: str, request: Request):
 async def git_fetch(hub_id: str, hash: str, request: Request):
     """Fetch a commit bundle by hash from the DAG store."""
     _get_member(request, hub_id)
-    dag = get_dag(hub_id)
-    if not dag.commit_exists(hash):
+    dag = await asyncio.to_thread(get_dag, hub_id)
+    if not await asyncio.to_thread(dag.commit_exists, hash):
         raise HTTPException(404, "Commit not found")
     from fastapi.responses import Response
-    bundle_bytes = dag.create_bundle(hash)
+    bundle_bytes = await asyncio.to_thread(dag.create_bundle, hash)
     return Response(content=bundle_bytes, media_type="application/octet-stream",
                     headers={"Content-Disposition": f"attachment; filename={hash[:12]}.bundle"})
 
@@ -1799,8 +2064,10 @@ async def git_lineage(hub_id: str, hash: str, request: Request):
 async def git_diff(hub_id: str, hash_a: str, hash_b: str, request: Request):
     """Get the diff between two commits as plain text."""
     _get_member(request, hub_id)
-    dag = get_dag(hub_id)
-    if not dag.commit_exists(hash_a) or not dag.commit_exists(hash_b):
+    dag = await asyncio.to_thread(get_dag, hub_id)
+    exists_a = await asyncio.to_thread(dag.commit_exists, hash_a)
+    exists_b = await asyncio.to_thread(dag.commit_exists, hash_b)
+    if not exists_a or not exists_b:
         raise HTTPException(404, "Commit not found")
     from fastapi.responses import PlainTextResponse
-    return PlainTextResponse(dag.diff(hash_a, hash_b))
+    return PlainTextResponse(await asyncio.to_thread(dag.diff, hash_a, hash_b))

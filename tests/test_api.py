@@ -85,11 +85,18 @@ class TestAuth:
 class TestMemberRegistrationSecurity:
     def test_duplicate_registration_preserves_identity_and_key(self, client, fresh_backend):
         key = _register(client, "owner", "Owner")
+        # Unauthorized duplicate probe gets 403 (never 409 enumeration oracle).
         response = client.post("/api/register", json={
             "member_id": "owner", "hub_id": "atris", "member_name": "Impostor",
             "member_type": "human", "webhook_url": "https://example.com/stolen",
         })
-        assert response.status_code == 409
+        assert response.status_code == 403
+        # Authorized duplicate registration still returns 409 without overwriting identity.
+        sponsored_dup = client.post("/api/register", headers=_auth(key), json={
+            "member_id": "owner", "hub_id": "atris", "member_name": "Impostor",
+            "member_type": "agent", "webhook_url": "https://example.com/stolen",
+        })
+        assert sponsored_dup.status_code == 409
         assert client.get("/api/atris/channels", headers=_auth(key)).status_code == 200
         member = fresh_backend.get_member("atris", "owner")
         assert (member.member_name, member.member_type, member.webhook_url) == ("Owner", "agent", None)

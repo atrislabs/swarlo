@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 from pathlib import Path
@@ -88,24 +89,26 @@ class GitDAG:
 
     async def unbundle(self, bundle_bytes: bytes) -> list[str]:
         """Import a git bundle into the bare repo. Returns commit hashes."""
-        self._ensure_init()
+        await asyncio.to_thread(self._ensure_init)
         async with self._lock:
-            with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as f:
-                f.write(bundle_bytes)
-                bundle_path = f.name
-
+            bundle_path: str | None = None
             try:
+                with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as f:
+                    f.write(bundle_bytes)
+                    bundle_path = f.name
+
                 # List heads in the bundle
-                result = self._git("bundle", "list-heads", bundle_path)
+                result = await asyncio.to_thread(self._git, "bundle", "list-heads", bundle_path)
                 hashes = _parse_head_hashes(result.stdout)
                 if not hashes:
                     raise ValueError("Bundle contains no refs")
 
                 # Unbundle into bare repo
-                self._git("bundle", "unbundle", bundle_path)
+                await asyncio.to_thread(self._git, "bundle", "unbundle", bundle_path)
                 return hashes
             finally:
-                os.unlink(bundle_path)
+                if bundle_path and os.path.exists(bundle_path):
+                    os.unlink(bundle_path)
 
     def create_bundle(self, commit_hash: str) -> bytes:
         """Create a bundle containing a commit and its ancestors. Returns bundle bytes."""
@@ -113,8 +116,9 @@ class GitDAG:
         if not _valid_hash(commit_hash):
             raise ValueError(f"Invalid hash: {commit_hash}")
 
-        # Create a temporary ref for bundling
-        tmp_ref = f"refs/tmp/bundle-{commit_hash[:8]}"
+        # Unique per-call temporary ref avoids concurrent fetch ref races.
+        tmp_ref = f"refs/tmp/bundle-{secrets.token_hex(8)}"
+        bundle_path: str | None = None
         self._git("update-ref", tmp_ref, commit_hash)
 
         try:
@@ -126,7 +130,7 @@ class GitDAG:
                 return f.read()
         finally:
             self._git("update-ref", "-d", tmp_ref, check=False)
-            if os.path.exists(bundle_path):
+            if bundle_path and os.path.exists(bundle_path):
                 os.unlink(bundle_path)
 
     def diff(self, hash_a: str, hash_b: str) -> str:

@@ -169,24 +169,25 @@ def test_trim_scores_drops_old_rows_for_one_hub(live):
     assert trim_scores(live, "hub-1", days=7) == 0
 
 
-def test_drop_idle_members_removes_unseen_and_stale_for_one_hub(live):
+def test_drop_idle_members_removes_stale_agents_and_preserves_humans_and_unseen(live):
     rows = [
-        ("never", "hub-1", None),
-        ("stale", "hub-1", _ago(31)),
-        ("fresh", "hub-1", _ago(1)),
-        ("other", "hub-2", _ago(31)),
+        ("never", "hub-1", "agent", None),
+        ("stale", "hub-1", "agent", _ago(31)),
+        ("fresh", "hub-1", "agent", _ago(1)),
+        ("human-stale", "hub-1", "human", _ago(31)),
+        ("other", "hub-2", "agent", _ago(31)),
     ]
     with sqlite3.connect(live) as c:
         c.executemany(
             "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen) "
-            "VALUES (?, ?, 'agent', 'x', '2026-01-01T00:00:00', ?)",
+            "VALUES (?, ?, ?, 'x', '2026-01-01T00:00:00', ?)",
             rows,
         )
 
-    assert sorted(drop_idle_members(live, "hub-1", days=30)) == ["never", "stale"]
+    assert sorted(drop_idle_members(live, "hub-1", days=30)) == ["stale"]
     with sqlite3.connect(live) as c:
         left = sorted(r[0] for r in c.execute("SELECT member_id FROM members"))
-    assert left == ["fresh", "other"]
+    assert left == ["fresh", "human-stale", "never", "other"]
     assert drop_idle_members(live, "hub-1", days=30) == []
 
 

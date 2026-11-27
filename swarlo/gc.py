@@ -15,9 +15,9 @@ archive_posts(db_path, archive_dir, hub, days=30)
     is safe to repeat. Returns ``{archive_path: posts_archived}``.
 
 drop_idle_members(db_path, hub, days=30)
-    Deletes every member of ``hub`` whose ``last_seen`` is NULL or older than
-    ``days``, the same rule the self-pruning judge counts. Returns the ids
-    removed.
+    Deletes every non-human member of ``hub`` whose ``last_seen`` is not NULL
+    and older than ``days``, mirroring ``prune_members`` so human operators and
+    never-seen members are never dropped. Returns the ids removed.
 
 vacuum(db_path)
     Checkpoints the WAL into the database (TRUNCATE), rebuilds the file with
@@ -88,6 +88,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _TABLES = ("posts", "replies")
+_MONTH_RE = re.compile(r"\d{4}-\d{2}")
+
+
+def _sanitize_archive_hub(hub: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(hub or "")).strip("_")
+    return safe or "hub"
 
 
 def _columns(conn: sqlite3.Connection, schema: str, table: str) -> list[str]:
@@ -137,9 +143,14 @@ def archive_posts(db_path, archive_dir, hub: str, days: int = 30) -> dict[Path, 
             by_month.setdefault(month, []).append(post_id)
 
         archived: dict[Path, int] = {}
+        safe_hub = _sanitize_archive_hub(hub)
         for month, ids in sorted(by_month.items()):
+            if not isinstance(month, str) or not _MONTH_RE.fullmatch(month):
+                raise ValueError(f"Invalid archive month: {month!r}")
             archive_dir.mkdir(parents=True, exist_ok=True)
-            path = archive_dir / f"{hub}-{month}.db"
+            path = archive_dir / f"{safe_hub}-{month}.db"
+            # Guard against path traversal or symlink escape before ATTACH DATABASE.
+            path.resolve().relative_to(archive_dir.resolve())
             conn.execute("ATTACH DATABASE ? AS arc", (str(path),))
             try:
                 conn.execute("DROP TABLE IF EXISTS temp.gc_ids")
@@ -201,8 +212,9 @@ def trim_scores(db_path, hub: str, days: int = 7) -> int:
 
 
 def drop_idle_members(db_path, hub: str, days: int = 30) -> list[str]:
+    days = max(1, int(days))
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    where = "hub_id = ? AND (last_seen IS NULL OR last_seen < ?)"
+    where = "hub_id = ? AND last_seen IS NOT NULL AND last_seen < ? AND member_type != 'human'"
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA busy_timeout=5000")
@@ -280,12 +292,20 @@ def keep_backups(home, keep: int = 3) -> list[Path]:
 def backup(db_path) -> Path:
     db_path = Path(db_path)
     dest = db_path.with_name(f"{db_path.name}.backup-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}")
+    fd = os.open(str(dest), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except (AttributeError, OSError):
+        os.chmod(dest, 0o600)
+    finally:
+        os.close(fd)
     src, dst = sqlite3.connect(str(db_path)), sqlite3.connect(str(dest))
     try:
         src.backup(dst)
     finally:
         dst.close()
         src.close()
+    os.chmod(dest, 0o600)
     return dest
 
 

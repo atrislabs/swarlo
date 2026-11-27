@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -10,6 +11,9 @@ MENTION_RE = re.compile(r"@(\w[\w.-]*)")
 
 MAX_POST_CONTENT_LENGTH = 4000
 POST_PREVIEW_LENGTH = 500
+MAX_METADATA_BYTES = 16 * 1024
+MAX_DEPENDS_ON = 50
+MAX_TASK_KEY_LENGTH = 256
 
 TYPED_POST_KINDS = frozenset({
     "claim",
@@ -68,6 +72,46 @@ def validate_post_kind(kind: str) -> str:
         allowed = ", ".join(sorted(TYPED_POST_KINDS))
         raise ValueError(f"Invalid post kind {kind!r}. Must be one of: {allowed}")
     return kind
+
+
+def validate_metadata(metadata: dict | None) -> dict | None:
+    """Ensure metadata is None or a JSON object within MAX_METADATA_BYTES."""
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("Metadata must be a JSON object")
+    try:
+        encoded = json.dumps(metadata).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Metadata is not JSON-serializable: {exc}") from None
+    if len(encoded) > MAX_METADATA_BYTES:
+        raise ValueError(
+            f"Metadata exceeds {MAX_METADATA_BYTES} byte limit ({len(encoded)} bytes)"
+        )
+    return metadata
+
+
+def validate_depends_on(depends_on: list[str] | None) -> list[str] | None:
+    """Ensure depends_on is None or a bounded list of non-empty task keys."""
+    if depends_on is None:
+        return None
+    if not isinstance(depends_on, list):
+        raise ValueError("depends_on must be a list of task keys")
+    if len(depends_on) > MAX_DEPENDS_ON:
+        raise ValueError(
+            f"depends_on exceeds {MAX_DEPENDS_ON} item limit ({len(depends_on)} items)"
+        )
+    cleaned: list[str] = []
+    for item in depends_on:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("depends_on entries must be non-empty strings")
+        stripped = item.strip()
+        if len(stripped) > MAX_TASK_KEY_LENGTH:
+            raise ValueError(
+                f"depends_on entry exceeds {MAX_TASK_KEY_LENGTH} character limit"
+            )
+        cleaned.append(stripped)
+    return cleaned
 
 
 def format_post_preview(content: str, limit: int = POST_PREVIEW_LENGTH) -> tuple[str, bool]:

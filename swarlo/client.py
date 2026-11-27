@@ -558,8 +558,8 @@ class SwarloClient:
                     continue
                 kind = p.get("kind")
                 status = p.get("status")
-                # Match CLI wait-for: kind result/failed OR terminal status.
-                if kind in ("result", "failed") or status in ("done", "failed", "blocked"):
+                # Require authoritative terminal status (not freeform kind alone with status=None).
+                if status in ("done", "failed", "blocked") and kind != "claim":
                     return p
             _time.sleep(poll_interval)
         raise SwarloError(408, {"detail": f"timed out after {timeout}s waiting for {task_key}"})

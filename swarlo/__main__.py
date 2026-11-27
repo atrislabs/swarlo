@@ -185,7 +185,18 @@ def _save_config(config: dict) -> None:
     if not os.getenv(CONFIG_ENV):
         _warn_shared_config()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2) + "\n")
+    data = (json.dumps(config, indent=2) + "\n").encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            os.chmod(path, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
 
 
 def _request(method: str, url: str, payload: dict | None = None, api_key: str | None = None) -> tuple[int, dict]:
@@ -2675,9 +2686,10 @@ fi
         import uvicorn
         from .sqlite_backend import SQLiteBackend
         from .git_dag import GitDAG
-        from .server import app, set_backend, set_dag
+        from .server import app, set_backend, set_bind_host, set_dag
 
         set_backend(SQLiteBackend(args.db))
+        set_bind_host(args.host)
         dag = GitDAG(args.git_dir)
         dag.init()
         set_dag(dag)
@@ -3004,7 +3016,7 @@ fi
                     continue
                 kind = post.get("kind")
                 st = post.get("status")
-                if kind in ("result", "failed") or st in ("done", "failed", "blocked"):
+                if st in ("done", "failed", "blocked") and kind != "claim":
                     if args.json:
                         print(json.dumps(post, indent=2, sort_keys=True))
                     else:
