@@ -185,7 +185,18 @@ def _save_config(config: dict) -> None:
     if not os.getenv(CONFIG_ENV):
         _warn_shared_config()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2) + "\n")
+    data = (json.dumps(config, indent=2) + "\n").encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            os.chmod(path, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
 
 
 def _request(method: str, url: str, payload: dict | None = None, api_key: str | None = None) -> tuple[int, dict]:
@@ -548,8 +559,7 @@ def _build_tower_state(
         }
         terminal_rows = conn.execute(
             "SELECT DISTINCT task_key FROM posts WHERE hub_id = ? AND task_key IS NOT NULL "
-            "AND task_key NOT LIKE 'file:%' AND (kind IN ('result', 'blocked') "
-            "OR status IN ('done', 'failed', 'blocked'))",
+            "AND task_key NOT LIKE 'file:%' AND status IN ('done', 'failed', 'blocked')",
             (hub_id,),
         ).fetchall()
         terminal_keys = {row["task_key"] for row in terminal_rows}
@@ -572,7 +582,7 @@ def _build_tower_state(
             for row in conn.execute(
                 "SELECT channel, task_key, member_name, content, created_at FROM posts "
                 "WHERE hub_id = ? AND task_key IS NOT NULL AND task_key NOT LIKE 'file:%' "
-                "AND (kind = 'blocked' OR status = 'blocked') "
+                "AND status = 'blocked' AND kind != 'claim' "
                 "ORDER BY created_at DESC LIMIT ?",
                 (hub_id, limit * 5),
             ).fetchall()
@@ -601,6 +611,10 @@ def _build_tower_state(
             task_key = event["task_key"]
             if task_key and str(task_key).startswith("file:"):
                 continue
+            kind = event["kind"]
+            status = event["status"]
+            if status is None:
+                continue
             member_id = event["member_id"] or "unknown"
             row = xp_by_member.setdefault(
                 member_id,
@@ -614,18 +628,16 @@ def _build_tower_state(
                     "blocked": 0,
                 },
             )
-            kind = event["kind"]
-            status = event["status"]
             if kind == "claim" and status != "retracted":
                 row["xp"] += 2
                 row["claims"] += 1
-            elif status == "blocked" or kind == "blocked":
+            elif kind != "claim" and status == "blocked":
                 row["xp"] -= 1
                 row["blocked"] += 1
-            elif status == "failed" or kind == "failed":
+            elif kind != "claim" and status == "failed":
                 row["xp"] -= 3
                 row["failed"] += 1
-            elif status == "done" or kind == "result":
+            elif kind != "claim" and status == "done":
                 row["xp"] += 10
                 row["shipped"] += 1
 
@@ -2675,9 +2687,10 @@ fi
         import uvicorn
         from .sqlite_backend import SQLiteBackend
         from .git_dag import GitDAG
-        from .server import app, set_backend, set_dag
+        from .server import app, set_backend, set_bind_host, set_dag
 
         set_backend(SQLiteBackend(args.db))
+        set_bind_host(args.host)
         dag = GitDAG(args.git_dir)
         dag.init()
         set_dag(dag)
@@ -3004,7 +3017,7 @@ fi
                     continue
                 kind = post.get("kind")
                 st = post.get("status")
-                if kind in ("result", "failed") or st in ("done", "failed", "blocked"):
+                if st in ("done", "failed", "blocked") and kind != "claim":
                     if args.json:
                         print(json.dumps(post, indent=2, sort_keys=True))
                     else:

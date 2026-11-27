@@ -21,6 +21,16 @@ from .types import Member, Post, Reply, ClaimResult
 DEFAULT_CHANNELS = ["general", "experiments", "outreach", "ops", "policies", "escalations"]
 SQLITE_BUSY_TIMEOUT_MS = 5000
 EXPIRE_CLAIM_BATCH_LIMIT = 500
+MAX_WINDOW_MINUTES = 525600
+API_KEY_HASH_PREFIX = "sha256:"
+_HASHED_API_KEY_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# Only authoritative claims (with non-null status) or assignments (with non-null assignee_id)
+# define dependency graph edges — freeform /posts messages cannot poison other tasks.
+_AUTHORITATIVE_DEP_SQL = "((kind = 'claim' AND status IS NOT NULL) OR (kind = 'assign' AND assignee_id IS NOT NULL))"
+
+
+def _hash_api_key(api_key: str) -> str:
+    return f"{API_KEY_HASH_PREFIX}{hashlib.sha256(api_key.encode('utf-8')).hexdigest()}"
 # Same member + same hub + same kind + same first N chars (numbers ignored)
 # inside the window folds into the earlier post (repeat_count bump) instead
 # of a new row. Matches how the Real Coordination judge counts repeats.
@@ -96,13 +106,14 @@ CREATE TABLE IF NOT EXISTS replies (
 );
 
 CREATE TABLE IF NOT EXISTS commits (
-    hash TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
     parent_hash TEXT,
     hub_id TEXT NOT NULL,
     member_id TEXT NOT NULL,
     member_name TEXT NOT NULL,
     message TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (hub_id, hash)
 );
 
 CREATE TABLE IF NOT EXISTS scores (
@@ -183,7 +194,7 @@ class SQLiteBackend(SwarloBackend):
         self._conn: Optional[sqlite3.Connection] = None
         self._local = threading.local()
         self._schema_lock = threading.Lock()
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self._connections: dict[int, sqlite3.Connection] = {}
         self._connection_finalizers: dict[int, weakref.finalize] = {}
         self._connection_generation = 0
@@ -211,26 +222,33 @@ class SQLiteBackend(SwarloBackend):
             check_same_thread=False,
             timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
         )
-        conn.row_factory = sqlite3.Row
-        conn.create_function("fold_head", 1, _fold_head, deterministic=True)
-        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-        # Switching to WAL takes an exclusive lock that busy_timeout does not cover,
-        # so two backends opening a new database at once can see "database is
-        # locked". Skip it when already WAL, otherwise retry briefly.
-        if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
-            for attempt in range(50):
-                try:
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    break
-                except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).lower() or attempt == 49:
-                        raise
-                    time.sleep(0.05)
-        conn.execute("PRAGMA foreign_keys=ON")
-        with self._schema_lock:
-            conn.executescript(SCHEMA)
-            self._run_migrations(conn)
-            conn.commit()
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.create_function("fold_head", 1, _fold_head, deterministic=True)
+            conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            # Switching to WAL takes an exclusive lock that busy_timeout does not cover,
+            # so two backends opening a new database at once can see "database is
+            # locked". Skip it when already WAL, otherwise retry briefly.
+            if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
+                for attempt in range(50):
+                    try:
+                        conn.execute("PRAGMA journal_mode=WAL")
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() or attempt == 49:
+                            raise
+                        time.sleep(0.05)
+            conn.execute("PRAGMA foreign_keys=ON")
+            with self._schema_lock:
+                conn.executescript(SCHEMA)
+                self._run_migrations(conn)
+                conn.commit()
+        except BaseException:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
         finalizer = weakref.finalize(
             thread,
             SQLiteBackend._finalize_thread_connection,
@@ -345,6 +363,53 @@ class SQLiteBackend(SwarloBackend):
             ") WHERE kind = 'claim' AND status = 'open'"
         )
 
+        # Rebuild legacy commits table from PRIMARY KEY (hash) to composite PRIMARY KEY (hub_id, hash).
+        commit_pk_cols = [
+            row[1]
+            for row in sorted(
+                (r for r in conn.execute("PRAGMA table_info(commits)").fetchall() if r[5] > 0),
+                key=lambda r: r[5],
+            )
+        ]
+        if commit_pk_cols != ["hub_id", "hash"]:
+            conn.execute("DROP TABLE IF EXISTS commits_new")
+            conn.execute(
+                "CREATE TABLE commits_new ("
+                "hash TEXT NOT NULL, "
+                "parent_hash TEXT, "
+                "hub_id TEXT NOT NULL, "
+                "member_id TEXT NOT NULL, "
+                "member_name TEXT NOT NULL, "
+                "message TEXT, "
+                "created_at TEXT NOT NULL, "
+                "PRIMARY KEY (hub_id, hash)"
+                ")"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO commits_new (hash, parent_hash, hub_id, member_id, member_name, message, created_at) "
+                "SELECT hash, parent_hash, hub_id, member_id, member_name, message, created_at FROM commits"
+            )
+            conn.execute("DROP TABLE commits")
+            conn.execute("ALTER TABLE commits_new RENAME TO commits")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_commits_hub ON commits(hub_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_commits_hub_created ON commits(hub_id, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_commits_hub_member_created ON commits(hub_id, member_id, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_commits_hub_parent_created ON commits(hub_id, parent_hash, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_commits_member ON commits(member_id)")
+
+        # Upgrade any legacy plaintext API keys at rest to SHA-256 digests.
+        member_key_rows = conn.execute(
+            "SELECT member_id, hub_id, api_key FROM members WHERE api_key IS NOT NULL AND api_key != ''"
+        ).fetchall()
+        for row in member_key_rows:
+            raw_key = row["api_key"]
+            if not _HASHED_API_KEY_RE.fullmatch(raw_key):
+                conn.execute(
+                    "UPDATE members SET api_key = ? WHERE member_id = ? AND hub_id = ?",
+                    (_hash_api_key(raw_key), row["member_id"], row["hub_id"]),
+                )
+
     @property
     def conn(self) -> sqlite3.Connection:
         return self._get_conn()
@@ -383,11 +448,10 @@ class SQLiteBackend(SwarloBackend):
         conn = self.conn
         with self._write_lock, conn:
             conn.execute("BEGIN IMMEDIATE")
-            if self.get_member(member.hub_id, member.member_id):
-                raise sqlite3.IntegrityError("Member already registered")
             existing_hub = conn.execute(
                 "SELECT 1 FROM hubs WHERE hub_id = ?", (member.hub_id,),
             ).fetchone()
+            consumed_invite_hash: str | None = None
             if require_authority and existing_hub:
                 if invite_token:
                     invite = conn.execute(
@@ -402,17 +466,25 @@ class SQLiteBackend(SwarloBackend):
                     ).fetchone()
                     if not invite:
                         raise PermissionError("Invalid, expired, or already used hub invite")
-                    conn.execute("DELETE FROM hub_invites WHERE token_hash = ?", (invite["token_hash"],))
+                    consumed_invite_hash = invite["token_hash"]
                 else:
-                    sponsor = self.authenticate(sponsor_key) if sponsor_key else None
+                    sponsor = self.authenticate(sponsor_key, _upgrade=False) if sponsor_key else None
                     if not sponsor or sponsor.hub_id != member.hub_id:
                         raise PermissionError("Joining an existing hub requires an invite or a current member's key")
                     if member.member_type == "human" and sponsor.member_type != "human":
                         raise PermissionError("Human operator required to enroll another human")
+            # Duplicate-member check runs AFTER authority verification so unauthorized
+            # callers always receive 403 and cannot probe member_ids, while authorized
+            # callers with a valid invite still get 409 without consuming the invite.
+            if self.get_member(member.hub_id, member.member_id):
+                raise sqlite3.IntegrityError("Member already registered")
+            if consumed_invite_hash is not None:
+                conn.execute("DELETE FROM hub_invites WHERE token_hash = ?", (consumed_invite_hash,))
+            stored_key = _hash_api_key(api_key) if api_key else api_key
             conn.execute("INSERT OR IGNORE INTO hubs (hub_id) VALUES (?)", (member.hub_id,))
             conn.execute(
                 "INSERT INTO members (member_id, hub_id, member_type, member_name, api_key, webhook_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (member.member_id, member.hub_id, member.member_type, member.member_name, api_key, member.webhook_url, _utcnow()),
+                (member.member_id, member.hub_id, member.member_type, member.member_name, stored_key, member.webhook_url, _utcnow()),
             )
 
     def create_invite(self, hub_id: str, api_key: str, member_type: str = "agent",
@@ -423,7 +495,7 @@ class SQLiteBackend(SwarloBackend):
         conn = self.conn
         with self._write_lock, conn:
             conn.execute("BEGIN IMMEDIATE")
-            sponsor = self.authenticate(api_key)
+            sponsor = self.authenticate(api_key, _upgrade=False)
             if not sponsor or sponsor.hub_id != hub_id:
                 raise PermissionError("A current member of this hub must create the invite")
             if member_type == "human" and sponsor.member_type != "human":
@@ -444,12 +516,16 @@ class SQLiteBackend(SwarloBackend):
 
     def rotate_member_key(self, member: Member, current_key: str, new_key: str) -> bool:
         """Replace only this member's key, provided it has not changed since authentication."""
-        with self._write_lock:
-            cur = self.conn.execute(
-                "UPDATE members SET api_key = ? WHERE hub_id = ? AND member_id = ? AND api_key = ?",
-                (new_key, member.hub_id, member.member_id, current_key),
+        if not current_key or not new_key or _HASHED_API_KEY_RE.fullmatch(current_key):
+            return False
+        hashed_current = _hash_api_key(current_key)
+        hashed_new = _hash_api_key(new_key)
+        conn = self.conn
+        with self._write_lock, conn:
+            cur = conn.execute(
+                "UPDATE members SET api_key = ? WHERE hub_id = ? AND member_id = ? AND api_key IN (?, ?)",
+                (hashed_new, member.hub_id, member.member_id, hashed_current, current_key),
             )
-            self.conn.commit()
         return cur.rowcount == 1
 
     def get_member(self, hub_id: str, member_id: str) -> Member | None:
@@ -461,12 +537,36 @@ class SQLiteBackend(SwarloBackend):
             return None
         return self._row_to_member(row)
 
-    def authenticate(self, api_key: str) -> Member | None:
+    def authenticate(self, api_key: str, *, _upgrade: bool = True) -> Member | None:
+        if not api_key:
+            return None
+        hashed = _hash_api_key(api_key)
+        row = self.conn.execute(
+            "SELECT * FROM members WHERE api_key = ?", (hashed,)
+        ).fetchone()
+        if row:
+            return self._row_to_member(row)
+        # Never allow presenting a stored sha256 digest directly as a bearer token.
+        if _HASHED_API_KEY_RE.fullmatch(api_key):
+            return None
+        # Seamless legacy plaintext fallback + automatic upgrade on lookup.
         row = self.conn.execute(
             "SELECT * FROM members WHERE api_key = ?", (api_key,)
         ).fetchone()
         if not row:
             return None
+        if _upgrade:
+            try:
+                conn = self.conn
+                with self._write_lock:
+                    if not conn.in_transaction:
+                        with conn:
+                            conn.execute(
+                                "UPDATE members SET api_key = ? WHERE hub_id = ? AND member_id = ? AND api_key = ?",
+                                (hashed, row["hub_id"], row["member_id"], api_key),
+                            )
+            except Exception:
+                pass
         return self._row_to_member(row)
 
     def resolve_mentions(self, hub_id: str, names: list[str]) -> list[str]:
@@ -508,12 +608,12 @@ class SQLiteBackend(SwarloBackend):
 
     def delete_member(self, hub_id: str, member_id: str) -> bool:
         """Remove one member. Returns False if it was not on the hub."""
-        with self._write_lock:
-            cur = self.conn.execute(
+        conn = self.conn
+        with self._write_lock, conn:
+            cur = conn.execute(
                 "DELETE FROM members WHERE hub_id = ? AND member_id = ?",
                 (hub_id, member_id),
             )
-            self.conn.commit()
         return cur.rowcount > 0
 
     def prune_members(self, hub_id: str, stale_minutes: int = 60) -> list[str]:
@@ -523,20 +623,20 @@ class SQLiteBackend(SwarloBackend):
         the cutoff to now-or-later, which would prune every active member.
         Humans are never pruned, and members never seen (last_seen NULL) stay.
         """
-        stale_minutes = max(1, int(stale_minutes))
+        stale_minutes = max(1, min(int(stale_minutes), MAX_WINDOW_MINUTES))
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
-        with self._write_lock:
-            rows = self.conn.execute(
+        conn = self.conn
+        with self._write_lock, conn:
+            rows = conn.execute(
                 "SELECT member_id FROM members WHERE hub_id = ? AND (last_seen IS NOT NULL AND last_seen < ?) AND member_type != 'human'",
                 (hub_id, cutoff),
             ).fetchall()
             pruned = [r["member_id"] for r in rows]
             if pruned:
-                self.conn.execute(
+                conn.execute(
                     f"DELETE FROM members WHERE hub_id = ? AND member_id IN ({','.join('?' * len(pruned))})",
                     (hub_id, *pruned),
                 )
-                self.conn.commit()
         return pruned
 
     def _row_to_member(self, row) -> Member:
@@ -618,11 +718,17 @@ class SQLiteBackend(SwarloBackend):
         from .types import (
             check_claim_like_note,
             extract_mentions,
+            validate_depends_on,
+            validate_metadata,
             validate_post_content,
             validate_post_kind,
         )
         validate_post_content(content)
         validate_post_kind(kind)
+        validate_metadata(metadata)
+        depends_on = validate_depends_on(depends_on)
+        if task_key is not None:
+            task_key = task_key.strip() or None
         warning = check_claim_like_note(kind, content)
         post_id = _uid()
         now = _utcnow()
@@ -637,23 +743,27 @@ class SQLiteBackend(SwarloBackend):
         # Dependencies stored as JSON array of task_keys. None = no deps.
         depends_on_json = json.dumps(depends_on) if depends_on else None
 
-        with self._write_lock:
+        conn = self.conn
+        with self._write_lock, conn:
+            if task_key and depends_on:
+                cycle_path = self._find_cycle(hub_id, task_key, depends_on)
+                if cycle_path:
+                    raise ValueError(f"Dependency cycle detected: {' → '.join(cycle_path)}")
             folded = self._fold_repeat_post(hub_id, member, content, kind, task_key, now)
             if folded is not None:
                 if warning:
                     folded.warning = warning
                 return folded
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id, depends_on) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type, content, kind, task_key, status, priority, metadata_json, mentions_json, now, assignee_id, depends_on_json),
             )
             # Bump last_active — this is the "actually working" signal,
             # distinct from last_seen which fires on any auth touch.
-            self.conn.execute(
+            conn.execute(
                 "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
                 (now, hub_id, member.member_id),
             )
-            self.conn.commit()
         return Post(
             post_id=post_id, content=content, kind=kind, channel=channel,
             member_id=member.member_id, member_name=member.member_name,
@@ -668,7 +778,7 @@ class SQLiteBackend(SwarloBackend):
 
         Every post without a task_key folds (messages, orchestrator nudges,
         ...) except claims and results; task-bound posts carry coordination
-        state and must stay distinct rows. Caller holds _write_lock.
+        state and must stay distinct rows. Caller holds _write_lock and conn tx.
         """
         if (self.repeat_window_hours <= 0 or task_key
                 or kind in REPEAT_FOLD_EXEMPT_KINDS):
@@ -679,7 +789,8 @@ class SQLiteBackend(SwarloBackend):
             match, head = "fold_head(content) = ?", _fold_head(content)
         else:
             match, head = f"substr(content, 1, {REPEAT_FOLD_PREFIX_CHARS}) = ?", (content or "")[:REPEAT_FOLD_PREFIX_CHARS]
-        row = self.conn.execute(
+        conn = self.conn
+        row = conn.execute(
             "SELECT * FROM posts WHERE hub_id = ? AND member_id = ? AND kind = ? "
             f"AND task_key IS NULL AND created_at >= ? AND {match} "
             "ORDER BY created_at DESC LIMIT 1",
@@ -688,15 +799,14 @@ class SQLiteBackend(SwarloBackend):
         if row is None:
             return None
         newest = kind in REPEAT_FOLD_NUMBERS_KINDS  # status posts show their latest numbers
-        self.conn.execute(
+        conn.execute(
             "UPDATE posts SET repeat_count = COALESCE(repeat_count, 1) + 1, content = ? WHERE post_id = ?",
             (content if newest else row["content"], row["post_id"]),
         )
-        self.conn.execute(
+        conn.execute(
             "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
             (now, hub_id, member.member_id),
         )
-        self.conn.commit()
         post = self._row_to_post(row)
         post.repeat_count = (row["repeat_count"] or 1) + 1
         if newest:
@@ -770,29 +880,31 @@ class SQLiteBackend(SwarloBackend):
             retried.append(task_key)
 
         if update_ids:
-            with self._write_lock:
-                self.conn.executemany(
+            conn = self.conn
+            with self._write_lock, conn:
+                conn.executemany(
                     "UPDATE posts SET retry_count = retry_count + 1 WHERE post_id = ?",
                     [(pid,) for pid in update_ids],
                 )
-                self.conn.commit()
         return retried
 
     async def reply(self, hub_id: str, member: Member, post_id: str, content: str) -> Reply:
+        from .types import validate_post_content
+        validate_post_content(content)
         reply_id = _uid()
         now = _utcnow()
-        with self._write_lock:
-            parent = self.conn.execute(
+        conn = self.conn
+        with self._write_lock, conn:
+            parent = conn.execute(
                 "SELECT 1 FROM posts WHERE hub_id = ? AND post_id = ?",
                 (hub_id, post_id),
             ).fetchone()
             if not parent:
                 raise KeyError(f"Post {post_id} not found in hub {hub_id}")
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO replies (reply_id, post_id, hub_id, member_id, member_name, member_type, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (reply_id, post_id, hub_id, member.member_id, member.member_name, member.member_type, content, now),
             )
-            self.conn.commit()
         return Reply(
             reply_id=reply_id, post_id=post_id, content=content,
             member_id=member.member_id, member_name=member.member_name,
@@ -803,7 +915,15 @@ class SQLiteBackend(SwarloBackend):
                      task_key: str, assignee_id: str, content: str,
                      depends_on: list[str] | None = None,
                      priority: int = 0) -> ClaimResult:
-        """Reserve under the assigner until the designated worker accepts."""
+        """Atomically reserve under the assigner and post the visible assignment."""
+        from .types import (
+            extract_mentions,
+            validate_depends_on,
+            validate_post_content,
+        )
+        validate_post_content(content)
+        depends_on = validate_depends_on(depends_on)
+
         # Look up assignee
         assignee = self.get_member(hub_id, assignee_id)
         if not assignee:
@@ -812,104 +932,139 @@ class SQLiteBackend(SwarloBackend):
                 message=f"Member {assignee_id} not found in hub",
             )
 
-        # NOTE: we don't check dep readiness on assign — assignments are
-        # push notifications that work can eventually be done. Whether
-        # the assignee should *claim* right now is handled by /ready.
-        # This lets the orchestrator assign the whole dependency graph
-        # up front without having to wait for each level to finish first.
-        # So we DON'T pass depends_on to the inner claim (which would
-        # block on unmet deps); save deps on the reservation for acceptance
-        # and on the visible assignment for /ready.
-        result = await self.claim(hub_id, assigner, channel, task_key, content)
-        if not result.claimed:
-            return result
-        with self._write_lock:
-            self.conn.execute(
-                "UPDATE posts SET metadata = json_set(metadata, '$.pending_assignee', ?), "
-                "assignee_id = ?, depends_on = ? WHERE post_id = ?",
-                (assignee_id, assignee_id, json.dumps(depends_on or []), result.post_id),
+        # Validate the rendered assignment post length BEFORE opening a claim so
+        # an overlong body can never leave a dangling open claim behind.
+        assign_content = f"Assigned {task_key} to @{assignee.member_name}: {content}"
+        validate_post_content(assign_content)
+
+        now = _utcnow()
+        stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        claim_post_id = _uid()
+        assign_post_id = _uid()
+        claim_mention_names = extract_mentions(content)
+        claim_mention_ids = self.resolve_mentions(hub_id, claim_mention_names) if claim_mention_names else []
+        assign_mention_names = extract_mentions(assign_content)
+        assign_mention_ids = self.resolve_mentions(hub_id, assign_mention_names) if assign_mention_names else []
+
+        claim_metadata_json = json.dumps({"heartbeat_at": now, "pending_assignee": assignee_id})
+        claim_mentions_json = json.dumps(claim_mention_ids) if claim_mention_ids else None
+        assign_metadata_json = json.dumps({"assignee_id": assignee_id, "claim_post_id": claim_post_id})
+        assign_mentions_json = json.dumps(assign_mention_ids) if assign_mention_ids else None
+        depends_on_json = json.dumps(depends_on) if depends_on else None
+
+        conn = self.conn
+        try:
+            with self._write_lock, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if depends_on:
+                    cycle_path = self._find_cycle(hub_id, task_key, depends_on)
+                    if cycle_path:
+                        return ClaimResult(
+                            claimed=False, conflict=True,
+                            message=f"Dependency cycle detected: {' → '.join(cycle_path)}",
+                        )
+                # Expire any stale open claim on this task_key inside the same transaction.
+                conn.execute(
+                    "UPDATE posts SET status = 'stale' "
+                    "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' "
+                    "AND COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) < ?",
+                    (hub_id, task_key, stale_cutoff),
+                )
+                conn.execute(
+                    "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+                    "content, kind, task_key, status, metadata, mentions, created_at, assignee_id, depends_on) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?, ?, ?)",
+                    (claim_post_id, hub_id, channel, assigner.member_id, assigner.member_name,
+                     assigner.member_type, content, task_key, claim_metadata_json, claim_mentions_json,
+                     now, assignee_id, depends_on_json),
+                )
+                conn.execute(
+                    "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+                    "content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id, depends_on) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'assign', ?, NULL, ?, ?, ?, ?, ?, ?)",
+                    (assign_post_id, hub_id, channel, assigner.member_id, assigner.member_name,
+                     assigner.member_type, assign_content, task_key, priority, assign_metadata_json,
+                     assign_mentions_json, now, assignee_id, depends_on_json),
+                )
+                conn.execute(
+                    "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
+                    (now, hub_id, assigner.member_id),
+                )
+            return ClaimResult(
+                claimed=True, conflict=False,
+                post_id=claim_post_id, display_id=_post_display_id("claim", claim_post_id),
+                channel=channel, kind="claim",
             )
-            self.conn.commit()
-
-        # Claim succeeded — post the visible assignment message.
-        # assignee_id is passed as a first-class column so /ping can find it
-        # without json_extract gymnastics.
-        assign_post = await self.create_post(
-            hub_id, assigner, channel, f"Assigned {task_key} to @{assignee.member_name}: {content}",
-            kind="assign", task_key=task_key,
-            metadata={"assignee_id": assignee_id, "claim_post_id": result.post_id},
-            assignee_id=assignee_id,
-            depends_on=depends_on,
-            priority=priority,
-        )
-
-        return result
+        except sqlite3.IntegrityError:
+            existing = await self.get_open_claims(hub_id, task_key=task_key)
+            return ClaimResult(
+                claimed=False, conflict=True,
+                existing_claim=existing[0] if existing else None,
+                message=f"Already claimed by {existing[0].member_name}" if existing else "Claim conflict",
+            )
 
     async def claim(self, hub_id: str, member: Member, channel: str,
                     task_key: str, content: str,
                     depends_on: list[str] | None = None) -> ClaimResult:
-        # Auto-expire this task's stale claim first so reclaim does not need a
-        # full-hub sweep.
-        await self.force_expire_claims(
-            hub_id,
-            stale_minutes=30,
-            task_key=task_key,
-            limit=1,
-        )
-        pending = self.conn.execute(
-            "SELECT post_id, depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
-            "AND kind = 'claim' AND status = 'open' "
-            "AND json_extract(metadata, '$.pending_assignee') = ?",
-            (hub_id, task_key, member.member_id),
-        ).fetchone()
-        if pending:
-            depends_on = list(dict.fromkeys((depends_on or []) + json.loads(pending["depends_on"] or "[]")))
+        from .types import extract_mentions, validate_depends_on, validate_post_content
+        validate_post_content(content)
+        depends_on = validate_depends_on(depends_on)
 
-        # Cycle detection — reject a claim whose declared deps would
-        # transitively depend back on this task_key. Without this, a
-        # cycle like task:A depends on task:B and task:B depends on
-        # task:A silently causes /ready to return nothing forever and
-        # nobody knows why. Catch it at declaration time.
-        if depends_on:
-            cycle_path = self._find_cycle(hub_id, task_key, depends_on)
-            if cycle_path:
-                return ClaimResult(
-                    claimed=False, conflict=True,
-                    message=f"Dependency cycle detected: {' → '.join(cycle_path)}",
-                )
-
-        # Check that every declared dependency is already done. A dep is
-        # satisfied when there's a post with that task_key whose status is
-        # 'done'. Missing deps (no post at all) block — this prevents
-        # claiming work that depends on tasks that haven't even been
-        # posted yet, which is a silent-failure pattern I want to catch.
-        if depends_on:
-            blocked = await self._unmet_deps(hub_id, depends_on)
-            if blocked:
-                # Enrich the error with the current state of each blocked
-                # dep so the user knows whether to wait, reassign, or
-                # escalate. Without this, "Blocked by unmet deps: task:B"
-                # gives no actionable signal.
-                explained = self._explain_blocked_deps(hub_id, blocked)
-                return ClaimResult(
-                    claimed=False, conflict=True,
-                    message=f"Blocked by unmet dependencies: {explained}",
-                )
-
-        # Atomic claim via unique index — no TOCTOU race condition
-        from .types import extract_mentions
         post_id = _uid()
         now = _utcnow()
+        stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
         mention_names = extract_mentions(content)
         mention_ids = self.resolve_mentions(hub_id, mention_names) if mention_names else []
         metadata_json = json.dumps({"heartbeat_at": now})
         mentions_json = json.dumps(mention_ids) if mention_ids else None
-        depends_on_json = json.dumps(depends_on) if depends_on else None
 
+        conn = self.conn
         try:
-            with self._write_lock:
+            with self._write_lock, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                # Auto-expire this task's stale claim first inside the same transaction.
+                conn.execute(
+                    "UPDATE posts SET status = 'stale' "
+                    "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' "
+                    "AND COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) < ?",
+                    (hub_id, task_key, stale_cutoff),
+                )
+                pending = conn.execute(
+                    "SELECT post_id, depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
+                    "AND kind = 'claim' AND status = 'open' "
+                    "AND json_extract(metadata, '$.pending_assignee') = ?",
+                    (hub_id, task_key, member.member_id),
+                ).fetchone()
+                effective_deps = depends_on
                 if pending:
-                    accepted = self.conn.execute(
+                    effective_deps = list(dict.fromkeys((depends_on or []) + json.loads(pending["depends_on"] or "[]")))
+
+                # Cycle detection & dependency readiness inside the write transaction.
+                if effective_deps:
+                    cycle_path = self._find_cycle(hub_id, task_key, effective_deps)
+                    if cycle_path:
+                        return ClaimResult(
+                            claimed=False, conflict=True,
+                            message=f"Dependency cycle detected: {' → '.join(cycle_path)}",
+                        )
+                    placeholders = ",".join("?" * len(effective_deps))
+                    done_rows = conn.execute(
+                        f"SELECT DISTINCT task_key FROM posts "
+                        f"WHERE hub_id = ? AND task_key IN ({placeholders}) AND status = 'done'",
+                        (hub_id, *effective_deps),
+                    ).fetchall()
+                    done_set = {r["task_key"] for r in done_rows}
+                    blocked = [d for d in effective_deps if d not in done_set]
+                    if blocked:
+                        explained = self._explain_blocked_deps(hub_id, blocked)
+                        return ClaimResult(
+                            claimed=False, conflict=True,
+                            message=f"Blocked by unmet dependencies: {explained}",
+                        )
+
+                depends_on_json = json.dumps(effective_deps) if effective_deps else None
+                if pending:
+                    accepted = conn.execute(
                         "UPDATE posts SET member_id = ?, member_name = ?, member_type = ?, "
                         "metadata = json_remove(json_set(metadata, '$.heartbeat_at', ?), '$.pending_assignee') "
                         "WHERE post_id = ? AND status = 'open' "
@@ -918,16 +1073,15 @@ class SQLiteBackend(SwarloBackend):
                          pending["post_id"], member.member_id),
                     )
                     if accepted.rowcount:
-                        self.conn.execute(
+                        conn.execute(
                             "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
                             (now, hub_id, member.member_id),
                         )
-                        self.conn.commit()
                         return ClaimResult(
                             claimed=True, conflict=False, post_id=pending["post_id"],
                             display_id=_post_display_id("claim", pending["post_id"]), channel=channel, kind="claim",
                         )
-                self.conn.execute(
+                conn.execute(
                     "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
                     "content, kind, task_key, status, metadata, mentions, created_at, assignee_id, depends_on) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 'claim', ?, 'open', ?, ?, ?, ?, ?)",
@@ -936,18 +1090,16 @@ class SQLiteBackend(SwarloBackend):
                      member.member_id, depends_on_json),  # claimer is the assignee
                 )
                 # Bump last_active — claimer is producing work
-                self.conn.execute(
+                conn.execute(
                     "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
                     (now, hub_id, member.member_id),
                 )
-                self.conn.commit()
             return ClaimResult(
                 claimed=True, conflict=False,
                 post_id=post_id, display_id=_post_display_id("claim", post_id),
                 channel=channel, kind="claim",
             )
         except sqlite3.IntegrityError:
-            self.conn.rollback()
             # Unique index violation — someone else claimed first
             existing = await self.get_open_claims(hub_id, task_key=task_key)
             return ClaimResult(
@@ -1062,7 +1214,7 @@ class SQLiteBackend(SwarloBackend):
             rows = self.conn.execute(
                 f"SELECT task_key, depends_on FROM posts "
                 f"WHERE hub_id = ? AND task_key IN ({placeholders}) "
-                f"AND depends_on IS NOT NULL",
+                f"AND depends_on IS NOT NULL AND {_AUTHORITATIVE_DEP_SQL}",
                 (hub_id, *frontier),
             ).fetchall()
 
@@ -1115,44 +1267,18 @@ class SQLiteBackend(SwarloBackend):
                      parent_id: str | None = None,
                      affected_files: list[str] | None = None,
                      metadata: dict | None = None) -> Post:
-        pending = self.conn.execute(
-            "SELECT depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
-            "AND kind = 'claim' AND status = 'open' "
-            "AND json_extract(metadata, '$.pending_assignee') = ?",
-            (hub_id, task_key, member.member_id),
-        ).fetchone()
-        if pending:
-            accepted = await self.claim(hub_id, member, channel, task_key, content,
-                                        depends_on=json.loads(pending["depends_on"] or "[]"))
-            if not accepted.claimed:
-                raise PermissionError(accepted.message or f"Cannot accept task {task_key}")
-        existing = await self.get_open_claims(hub_id, task_key=task_key)
-        if existing and existing[0].member_id != member.member_id:
-            raise PermissionError(
-                f"Task {task_key} is claimed by {existing[0].member_name}"
-            )
-
-        claim = self.conn.execute(
-            "SELECT member_id, status, created_at, "
-            "COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) AS last_touch "
-            "FROM posts WHERE hub_id = ? AND task_key = ? AND kind = 'claim' "
-            "AND status IN ('open', 'done', 'failed', 'blocked', 'stale') "
-            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (hub_id, task_key),
-        ).fetchone()
-        if not claim or claim["member_id"] != member.member_id:
-            raise PermissionError(f"Claim task {task_key} before reporting it")
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-        if claim["status"] != "open" and claim["last_touch"] < cutoff:
-            recent_result = self.conn.execute(
-                "SELECT 1 FROM posts WHERE hub_id = ? AND task_key = ? AND member_id = ? "
-                "AND status IN ('done', 'failed', 'blocked') AND created_at >= ? LIMIT 1",
-                (hub_id, task_key, member.member_id, max(cutoff, claim["created_at"])),
-            ).fetchone()
-            if not recent_result:
-                raise PermissionError(f"Reclaim task {task_key} before reporting it")
-
+        from .types import (
+            extract_mentions,
+            validate_metadata,
+            validate_post_content,
+            validate_post_kind,
+        )
+        validate_post_content(content)
+        if status not in ("done", "failed", "blocked"):
+            raise ValueError(f"Invalid report status {status!r}")
         kind = "result" if status == "done" else "failed" if status == "failed" else status
+        validate_post_kind(kind)
+
         # Merge affected_files into metadata for downstream consumption
         report_meta = dict(metadata or {})
         if affected_files:
@@ -1160,31 +1286,140 @@ class SQLiteBackend(SwarloBackend):
             clean = [str(f) for f in affected_files if f][:100]
             if clean:
                 report_meta["affected_files"] = clean
-        post = await self.create_post(hub_id, member, channel, content,
-                                      kind=kind, task_key=task_key, status=status,
-                                      metadata=report_meta or None)
-        with self._write_lock:
-            self.conn.execute(
+        final_meta = report_meta or None
+        validate_metadata(final_meta)
+
+        post_id = _uid()
+        now = _utcnow()
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        mention_names = extract_mentions(content)
+        mention_ids = self.resolve_mentions(hub_id, mention_names) if mention_names else []
+        metadata_json = json.dumps(final_meta) if final_meta is not None else None
+        mentions_json = json.dumps(mention_ids) if mention_ids else None
+
+        conn = self.conn
+        with self._write_lock, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Auto-expire any stale open claim on this task_key atomically.
+            conn.execute(
+                "UPDATE posts SET status = 'stale' "
+                "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' "
+                "AND COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) < ?",
+                (hub_id, task_key, cutoff),
+            )
+
+            # Accept a pending assignment reservation for this member atomically.
+            pending = conn.execute(
+                "SELECT post_id, depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
+                "AND kind = 'claim' AND status = 'open' "
+                "AND json_extract(metadata, '$.pending_assignee') = ?",
+                (hub_id, task_key, member.member_id),
+            ).fetchone()
+            if pending:
+                pending_deps = [d for d in json.loads(pending["depends_on"] or "[]") if isinstance(d, str)]
+                if pending_deps:
+                    cycle_path = self._find_cycle(hub_id, task_key, pending_deps)
+                    if cycle_path:
+                        raise PermissionError(f"Dependency cycle detected: {' → '.join(cycle_path)}")
+                    placeholders = ",".join("?" * len(pending_deps))
+                    done_rows = conn.execute(
+                        f"SELECT DISTINCT task_key FROM posts "
+                        f"WHERE hub_id = ? AND task_key IN ({placeholders}) AND status = 'done'",
+                        (hub_id, *pending_deps),
+                    ).fetchall()
+                    done_set = {r["task_key"] for r in done_rows}
+                    blocked = [d for d in pending_deps if d not in done_set]
+                    if blocked:
+                        explained = self._explain_blocked_deps(hub_id, blocked)
+                        raise PermissionError(f"Blocked by unmet dependencies: {explained}")
+                conn.execute(
+                    "UPDATE posts SET member_id = ?, member_name = ?, member_type = ?, "
+                    "metadata = json_remove(json_set(metadata, '$.heartbeat_at', ?), '$.pending_assignee') "
+                    "WHERE post_id = ? AND status = 'open' "
+                    "AND json_extract(metadata, '$.pending_assignee') = ?",
+                    (member.member_id, member.member_name, member.member_type, now,
+                     pending["post_id"], member.member_id),
+                )
+
+            # Verify no other member holds an active open claim on this task_key.
+            open_row = conn.execute(
+                "SELECT member_id, member_name FROM posts "
+                "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' "
+                "AND COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) >= ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (hub_id, task_key, cutoff),
+            ).fetchone()
+            if open_row and open_row["member_id"] != member.member_id:
+                raise PermissionError(
+                    f"Task {task_key} is claimed by {open_row['member_name']}"
+                )
+
+            claim = conn.execute(
+                "SELECT member_id, status, created_at, "
+                "COALESCE(json_extract(metadata, '$.heartbeat_at'), created_at) AS last_touch "
+                "FROM posts WHERE hub_id = ? AND task_key = ? AND kind = 'claim' "
+                "AND status IN ('open', 'done', 'failed', 'blocked', 'stale') "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (hub_id, task_key),
+            ).fetchone()
+            if not claim or claim["member_id"] != member.member_id:
+                raise PermissionError(f"Claim task {task_key} before reporting it")
+            if claim["status"] != "open" and claim["last_touch"] < cutoff:
+                recent_result = conn.execute(
+                    "SELECT 1 FROM posts WHERE hub_id = ? AND task_key = ? AND member_id = ? "
+                    "AND status IN ('done', 'failed', 'blocked') AND created_at >= ? LIMIT 1",
+                    (hub_id, task_key, member.member_id, max(cutoff, claim["created_at"])),
+                ).fetchone()
+                if not recent_result:
+                    raise PermissionError(f"Reclaim task {task_key} before reporting it")
+
+            conn.execute(
+                "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+                "content, kind, task_key, status, priority, metadata, mentions, created_at, assignee_id, depends_on) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, NULL)",
+                (post_id, hub_id, channel, member.member_id, member.member_name, member.member_type,
+                 content, kind, task_key, status, metadata_json, mentions_json, now),
+            )
+            conn.execute(
                 "UPDATE posts SET status = ? WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
                 (status, hub_id, task_key, member.member_id),
             )
-            self.conn.commit()
+            conn.execute(
+                "UPDATE members SET last_active = ? WHERE hub_id = ? AND member_id = ?",
+                (now, hub_id, member.member_id),
+            )
 
-        if parent_id:
-            await self.reply(hub_id, member, parent_id, content)
+            if parent_id:
+                parent = conn.execute(
+                    "SELECT 1 FROM posts WHERE hub_id = ? AND post_id = ?",
+                    (hub_id, parent_id),
+                ).fetchone()
+                if not parent:
+                    raise KeyError(f"Post {parent_id} not found in hub {hub_id}")
+                conn.execute(
+                    "INSERT INTO replies (reply_id, post_id, hub_id, member_id, member_name, member_type, content, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (_uid(), parent_id, hub_id, member.member_id, member.member_name, member.member_type, content, now),
+                )
 
-        return post
+        return Post(
+            post_id=post_id, content=content, kind=kind, channel=channel,
+            member_id=member.member_id, member_name=member.member_name,
+            member_type=member.member_type, task_key=task_key, status=status,
+            metadata=final_meta, mentions=mention_ids or None, created_at=now,
+            display_id=_post_display_id(kind, post_id),
+        )
 
     async def touch_claim(self, hub_id: str, member_id: str, task_key: str) -> bool:
         """Refresh a claim's heartbeat to prevent stale expiry."""
         now = _utcnow()
-        with self._write_lock:
-            cur = self.conn.execute(
+        conn = self.conn
+        with self._write_lock, conn:
+            cur = conn.execute(
                 "UPDATE posts SET metadata = json_set(COALESCE(metadata, '{}'), '$.heartbeat_at', ?) "
                 "WHERE hub_id = ? AND task_key = ? AND kind = 'claim' AND status = 'open' AND member_id = ?",
                 (now, hub_id, task_key, member_id),
             )
-            self.conn.commit()
         return cur.rowcount > 0
 
     async def force_expire_claims(
@@ -1197,6 +1432,7 @@ class SQLiteBackend(SwarloBackend):
         limit: int = EXPIRE_CLAIM_BATCH_LIMIT,
     ) -> list[str]:
         """Expire all claims older than stale_minutes with no heartbeat. Returns expired task_keys."""
+        stale_minutes = max(1, min(int(stale_minutes), MAX_WINDOW_MINUTES))
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
         batch_limit = max(1, min(int(limit), EXPIRE_CLAIM_BATCH_LIMIT))
         query = (
@@ -1216,17 +1452,17 @@ class SQLiteBackend(SwarloBackend):
             "created_at ASC LIMIT ?"
         )
         params.append(batch_limit)
-        with self._write_lock:
-            rows = self.conn.execute(query, params).fetchall()
+        conn = self.conn
+        with self._write_lock, conn:
+            rows = conn.execute(query, params).fetchall()
             expired_keys = [r["task_key"] for r in rows]
             if rows:
                 post_ids = [r["post_id"] for r in rows]
                 placeholders = ",".join("?" for _ in post_ids)
-                self.conn.execute(
+                conn.execute(
                     f"UPDATE posts SET status = 'stale' WHERE post_id IN ({placeholders})",
                     post_ids,
                 )
-                self.conn.commit()
         return expired_keys
 
     async def get_ready_tasks(self, hub_id: str, member_id: str) -> list[Post]:
@@ -1353,15 +1589,11 @@ class SQLiteBackend(SwarloBackend):
         return bundled
 
     def _lookup_deps_for_task(self, hub_id: str, task_key: str) -> list[str]:
-        """Find depends_on for a task_key by scanning any post that recorded it.
-
-        The result post (kind=result) doesn't carry depends_on — that lives on
-        the claim/assign post. Take the most recent post for this task_key
-        with depends_on IS NOT NULL.
-        """
+        """Find depends_on for a task_key from authoritative claim/assign posts."""
         row = self.conn.execute(
-            "SELECT depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
-            "AND depends_on IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            f"SELECT depends_on FROM posts WHERE hub_id = ? AND task_key = ? "
+            f"AND depends_on IS NOT NULL AND {_AUTHORITATIVE_DEP_SQL} "
+            f"ORDER BY created_at DESC LIMIT 1",
             (hub_id, task_key),
         ).fetchone()
         if not row or not row["depends_on"]:
@@ -1380,7 +1612,8 @@ class SQLiteBackend(SwarloBackend):
         rows = self.conn.execute(
             f"SELECT task_key, depends_on FROM posts "
             f"WHERE hub_id = ? AND task_key IN ({placeholders}) "
-            f"AND depends_on IS NOT NULL ORDER BY task_key, created_at DESC",
+            f"AND depends_on IS NOT NULL AND {_AUTHORITATIVE_DEP_SQL} "
+            f"ORDER BY task_key, created_at DESC",
             (hub_id, *task_keys),
         ).fetchall()
         deps_by_key: dict[str, list[str]] = {}
@@ -1598,12 +1831,12 @@ class SQLiteBackend(SwarloBackend):
     def index_commit(self, hub_id: str, hash: str, parent_hash: str,
                      member_id: str, member_name: str, message: str) -> None:
         """Index a commit in the metadata store."""
-        with self._write_lock:
-            self.conn.execute(
+        conn = self.conn
+        with self._write_lock, conn:
+            conn.execute(
                 "INSERT OR IGNORE INTO commits (hash, parent_hash, hub_id, member_id, member_name, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (hash, parent_hash or None, hub_id, member_id, member_name, message, _utcnow()),
             )
-            self.conn.commit()
 
     def get_commit(self, hub_id: str, hash: str) -> dict | None:
         row = self.conn.execute(
@@ -1645,7 +1878,9 @@ class SQLiteBackend(SwarloBackend):
     def get_lineage(self, hub_id: str, hash: str) -> list[dict]:
         lineage = []
         current = hash
-        while current:
+        visited: set[str] = set()
+        while current and current not in visited:
+            visited.add(current)
             row = self.conn.execute(
                 "SELECT * FROM commits WHERE hash = ? AND hub_id = ?", (current, hub_id)
             ).fetchone()
