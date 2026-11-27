@@ -559,8 +559,7 @@ def _build_tower_state(
         }
         terminal_rows = conn.execute(
             "SELECT DISTINCT task_key FROM posts WHERE hub_id = ? AND task_key IS NOT NULL "
-            "AND task_key NOT LIKE 'file:%' AND (kind IN ('result', 'blocked') "
-            "OR status IN ('done', 'failed', 'blocked'))",
+            "AND task_key NOT LIKE 'file:%' AND status IN ('done', 'failed', 'blocked')",
             (hub_id,),
         ).fetchall()
         terminal_keys = {row["task_key"] for row in terminal_rows}
@@ -583,7 +582,7 @@ def _build_tower_state(
             for row in conn.execute(
                 "SELECT channel, task_key, member_name, content, created_at FROM posts "
                 "WHERE hub_id = ? AND task_key IS NOT NULL AND task_key NOT LIKE 'file:%' "
-                "AND (kind = 'blocked' OR status = 'blocked') "
+                "AND status = 'blocked' AND kind != 'claim' "
                 "ORDER BY created_at DESC LIMIT ?",
                 (hub_id, limit * 5),
             ).fetchall()
@@ -612,6 +611,10 @@ def _build_tower_state(
             task_key = event["task_key"]
             if task_key and str(task_key).startswith("file:"):
                 continue
+            kind = event["kind"]
+            status = event["status"]
+            if status is None:
+                continue
             member_id = event["member_id"] or "unknown"
             row = xp_by_member.setdefault(
                 member_id,
@@ -625,18 +628,16 @@ def _build_tower_state(
                     "blocked": 0,
                 },
             )
-            kind = event["kind"]
-            status = event["status"]
             if kind == "claim" and status != "retracted":
                 row["xp"] += 2
                 row["claims"] += 1
-            elif status == "blocked" or kind == "blocked":
+            elif kind != "claim" and status == "blocked":
                 row["xp"] -= 1
                 row["blocked"] += 1
-            elif status == "failed" or kind == "failed":
+            elif kind != "claim" and status == "failed":
                 row["xp"] -= 3
                 row["failed"] += 1
-            elif status == "done" or kind == "result":
+            elif kind != "claim" and status == "done":
                 row["xp"] += 10
                 row["shipped"] += 1
 

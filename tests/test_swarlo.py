@@ -602,8 +602,9 @@ class TestSSRF:
         from swarlo.server import _is_safe_webhook_url
         assert not _is_safe_webhook_url("http://evil.com/steal")
 
-    def test_allow_localhost(self):
+    def test_allow_localhost(self, monkeypatch):
         from swarlo.server import _is_safe_webhook_url
+        monkeypatch.setenv("SWARLO_ALLOW_LOCALHOST_WEBHOOKS", "1")
         assert _is_safe_webhook_url("http://localhost:3000/webhook")
 
     def test_block_private_ip_https(self):

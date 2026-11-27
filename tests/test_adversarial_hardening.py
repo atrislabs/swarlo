@@ -316,12 +316,13 @@ class TestBug2AuthOracleBoundsAndSSRF:
 
         # Non-loopback bind blocks localhost by default when env unset
         monkeypatch.delenv("SWARLO_ALLOW_LOCALHOST_WEBHOOKS", raising=False)
+        prev_host = server._server_bind_host
         server.set_bind_host("0.0.0.0")
         try:
             assert not _is_safe_webhook_url("http://127.0.0.1:8080/hook")
             assert not _is_safe_webhook_url("http://localhost:8080/hook")
         finally:
-            server.set_bind_host("127.0.0.1")
+            server.set_bind_host(prev_host)
 
     def test_webhook_dispatch_disables_redirects_and_uses_async_dns(self, fresh_env, monkeypatch):
         from swarlo import server
@@ -845,3 +846,524 @@ class TestBug6AtomicityJsonBoundsAndFileLocks:
             "SELECT COUNT(*) FROM posts WHERE hub_id = 'h1' AND task_key = 'task:atomic-rep' AND kind = 'result'"
         ).fetchone()[0]
         assert results == 0
+
+
+# ── Audit Follow-up: 8 MUST FIX Hardening Regressions ──────────────────────
+
+
+class TestAuditHardeningFixes:
+    def test_failed_dml_does_not_leak_transaction_or_brick_begin_immediate(self, client, fresh_env):
+        """Item 1: Any failed DML rolls back cleanly so subsequent BEGIN IMMEDIATE never bricks."""
+        op_key = _register(client, "op", "Op", hub="tx-hub", member_type="human")
+        worker_key = _register(client, "worker", "Worker", hub="tx-hub")
+        oh, wh = _auth(op_key), _auth(worker_key)
+
+        # Seed a claim + a post and warm up the ASGI worker thread's SQLite connection
+        assert client.post(
+            "/api/tx-hub/channels/ops/claim",
+            headers=wh,
+            json={"task_key": "task:tx1", "content": "working"},
+        ).status_code == 201
+        p = client.post(
+            "/api/tx-hub/channels/ops/posts",
+            headers=wh,
+            json={"content": "parent post"},
+        ).json()
+        assert client.get("/api/tx-hub/channels", headers=wh).status_code == 200
+
+        # Inject ABORT triggers on members UPDATE, scores INSERT, and replies INSERT
+        # to simulate mid-write DML failures across both HTTP and direct backend paths.
+        with fresh_env._write_lock, fresh_env.conn:
+            fresh_env.conn.execute(
+                "CREATE TRIGGER fail_members_upd BEFORE UPDATE ON members "
+                "BEGIN SELECT RAISE(ABORT, 'members update boom'); END"
+            )
+            fresh_env.conn.execute(
+                "CREATE TRIGGER fail_scores_ins BEFORE INSERT ON scores "
+                "BEGIN SELECT RAISE(ABORT, 'scores insert boom'); END"
+            )
+            fresh_env.conn.execute(
+                "CREATE TRIGGER fail_replies_ins BEFORE INSERT ON replies "
+                "BEGIN SELECT RAISE(ABORT, 'replies insert boom'); END"
+            )
+
+        try:
+            # 1. _get_member last_seen update fails (swallowed) on ASGI thread
+            assert client.get("/api/tx-hub/channels", headers=wh).status_code == 200
+
+            # 2. compute_score() insert fails (swallowed) on ASGI thread
+            assert client.post("/api/tx-hub/score", headers=wh).status_code == 200
+
+            # 3. Immediate HTTP /api/register (BEGIN IMMEDIATE) on ASGI thread MUST succeed!
+            reg_after_fail = client.post(
+                "/api/register",
+                headers=oh,
+                json={"hub_id": "tx-hub", "member_id": "post-fail-http", "member_type": "agent"},
+            )
+            assert reg_after_fail.status_code == 201, reg_after_fail.text
+
+            # 4. authenticate() legacy key upgrade fails (swallowed) -> must NOT leak tx
+            with fresh_env._write_lock, fresh_env.conn:
+                fresh_env.conn.execute(
+                    "INSERT INTO members (member_id, hub_id, member_type, member_name, api_key, created_at) "
+                    "VALUES ('legacy-tx', 'tx-hub', 'agent', 'LegacyTx', 'legacy-tx-secret', '2026-01-01T00:00:00Z')"
+                )
+            assert fresh_env.authenticate("legacy-tx-secret") is not None
+            assert not fresh_env.conn.in_transaction
+
+            # 5. create_post() inserts post then fails on UPDATE members.last_active -> MUST roll back BOTH!
+            m_worker = Member("worker", "agent", "Worker", "tx-hub")
+            with pytest.raises(sqlite3.IntegrityError):
+                asyncio.run(fresh_env.create_post("tx-hub", m_worker, "ops", "rolled back post"))
+            assert not fresh_env.conn.in_transaction
+            leaked_post = fresh_env.conn.execute(
+                "SELECT COUNT(*) FROM posts WHERE hub_id = 'tx-hub' AND content = 'rolled back post'"
+            ).fetchone()[0]
+            assert leaked_post == 0
+
+            # 6. reply() fails on insert -> must NOT leak tx
+            with pytest.raises(sqlite3.IntegrityError):
+                asyncio.run(fresh_env.reply("tx-hub", m_worker, p["post_id"], "will fail"))
+            assert not fresh_env.conn.in_transaction
+
+            # 7. rotate_member_key() fails on UPDATE members -> must NOT leak tx
+            with pytest.raises(sqlite3.IntegrityError):
+                fresh_env.rotate_member_key(m_worker, worker_key, "new-key-value")
+            assert not fresh_env.conn.in_transaction
+
+            # 8. Direct register_member (BEGIN IMMEDIATE) on main thread MUST succeed immediately!
+            fresh_env.register_member(Member("worker-2", "agent", "Worker 2", "tx-hub"), api_key="k-new-2")
+        finally:
+            with fresh_env._write_lock, fresh_env.conn:
+                fresh_env.conn.execute("DROP TRIGGER IF EXISTS fail_members_upd")
+                fresh_env.conn.execute("DROP TRIGGER IF EXISTS fail_scores_ins")
+                fresh_env.conn.execute("DROP TRIGGER IF EXISTS fail_replies_ins")
+
+        # Subsequent assign (BEGIN IMMEDIATE) MUST succeed cleanly!
+        assign_resp = client.post(
+            "/api/tx-hub/channels/ops/assign",
+            headers=oh,
+            json={"task_key": "task:tx2", "assignee_id": "worker-2", "content": "post-recovery work"},
+        )
+        assert assign_resp.status_code == 201, assign_resp.text
+
+    def test_failed_migration_closes_connection(self, tmp_path, monkeypatch):
+        """Item 1: A failure inside _run_migrations closes the newly opened SQLite connection."""
+        from swarlo import sqlite_backend
+
+        opened: list[sqlite3.Connection] = []
+        closed_flags: list[bool] = []
+        real_connect = sqlite3.connect
+
+        class TrackingConnection(sqlite3.Connection):
+            def close(self):
+                closed_flags.append(True)
+                super().close()
+
+        def spy_connect(*args, **kwargs):
+            kwargs["factory"] = TrackingConnection
+            c = real_connect(*args, **kwargs)
+            opened.append(c)
+            return c
+
+        monkeypatch.setattr(sqlite_backend.sqlite3, "connect", spy_connect)
+        monkeypatch.setattr(
+            SQLiteBackend,
+            "_run_migrations",
+            lambda _self, _conn: (_ for _ in ()).throw(RuntimeError("migration boom")),
+        )
+
+        be = SQLiteBackend(str(tmp_path / "broken_mig.db"))
+        with pytest.raises(RuntimeError, match="migration boom"):
+            _ = be.conn
+        assert len(opened) == 1
+        assert closed_flags == [True]
+        assert not be._connections
+
+    def test_webhook_dispatch_pins_validated_ip_once_and_disables_trust_env(self, fresh_env, monkeypatch):
+        """Item 2: _dispatch_webhooks resolves DNS once, pins validated IP with Host/SNI, and sets trust_env=False."""
+        from swarlo import server
+        from swarlo.types import Post
+
+        fresh_env.register_member(
+            Member(
+                "rebind-target",
+                "agent",
+                "RebindTarget",
+                "pin-hub",
+                webhook_url="https://rebind.example.com:8443/hook?token=abc",
+            ),
+            api_key="k-pin",
+        )
+        post = Post(
+            post_id="p-pin",
+            content="ping @RebindTarget",
+            kind="message",
+            channel="general",
+            member_id="sender",
+            member_name="Sender",
+            member_type="agent",
+            mentions=["rebind-target"],
+        )
+
+        # Simulate DNS rebinding: 1st lookup returns public IP, 2nd would return AWS metadata IP!
+        dns_calls: list[tuple] = []
+
+        def rebinding_getaddrinfo(host, port, *args, **kwargs):
+            dns_calls.append((host, port))
+            if len(dns_calls) == 1:
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port))]
+
+        client_kwargs: list[dict] = []
+        post_calls: list[dict] = []
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                client_kwargs.append(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, *, headers=None, extensions=None, json=None):
+                post_calls.append({
+                    "url": url,
+                    "headers": headers,
+                    "extensions": extensions,
+                    "json": json,
+                })
+
+        monkeypatch.setattr(server.socket, "getaddrinfo", rebinding_getaddrinfo)
+        monkeypatch.setattr(server.httpx, "AsyncClient", FakeAsyncClient)
+
+        asyncio.run(server._dispatch_webhooks("pin-hub", post))
+
+        assert len(dns_calls) == 1, f"Expected single DNS resolution, got {len(dns_calls)}"
+        assert client_kwargs and client_kwargs[0].get("trust_env") is False
+        assert client_kwargs[0].get("follow_redirects") is False
+        assert len(post_calls) == 1
+        assert post_calls[0]["url"] == "https://93.184.216.34:8443/hook?token=abc"
+        assert post_calls[0]["headers"] == {"Host": "rebind.example.com:8443"}
+        assert post_calls[0]["extensions"] == {"sni_hostname": "rebind.example.com"}
+
+        # Mixed global + private DNS answer must block delivery outright
+        post_calls.clear()
+        monkeypatch.setattr(
+            server.socket,
+            "getaddrinfo",
+            lambda host, port, *a, **kw: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", port)),
+            ],
+        )
+        asyncio.run(server._dispatch_webhooks("pin-hub", post))
+        assert post_calls == []
+
+    def test_default_asgi_bind_host_fails_closed_for_localhost_webhooks(self, client, monkeypatch):
+        """Item 3: Direct ASGI import leaves _server_bind_host='' and blocks localhost webhooks by default."""
+        from swarlo import server
+
+        # Verify fresh import default in a clean subprocess without SWARLO_ALLOW_LOCALHOST_WEBHOOKS
+        clean_env = {k: v for k, v in os.environ.items() if k != "SWARLO_ALLOW_LOCALHOST_WEBHOOKS"}
+        check = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from swarlo import server; "
+                    "assert server._server_bind_host == '', repr(server._server_bind_host); "
+                    "assert not server._is_safe_webhook_url('http://127.0.0.1:8080/hook'); "
+                    "assert not server._is_safe_webhook_url('http://localhost:8080/hook')"
+                ),
+            ],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+        )
+        assert check.returncode == 0, check.stderr
+
+        # Verify HTTP /api/register rejects localhost webhook under default fail-closed state
+        monkeypatch.delenv("SWARLO_ALLOW_LOCALHOST_WEBHOOKS", raising=False)
+        prev_host = server._server_bind_host
+        server.set_bind_host("")
+        try:
+            resp = client.post("/api/register", json={
+                "hub_id": "asgi-fail-closed",
+                "member_id": "u1",
+                "webhook_url": "http://127.0.0.1:9000/hook",
+            })
+            assert resp.status_code == 400
+            server.set_bind_host("127.0.0.1")
+            assert _is_safe_webhook_url("http://127.0.0.1:9000/hook")
+        finally:
+            server.set_bind_host(prev_host)
+
+    def test_webhook_blocks_6to4_teredo_ipv6_and_userinfo(self, monkeypatch):
+        """Item 4: Reject 6to4/Teredo IPv6 SSRF bypasses and URL userinfo."""
+        from swarlo import server
+
+        for blocked in (
+            "https://[2002:7f00:0001::]/hook",
+            "https://[2002:a9fe:a9fe::]/hook",
+            "https://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/hook",
+            "https://user:pass@93.184.216.34/hook",
+            "https://evil@93.184.216.34/hook",
+            "https://@93.184.216.34/hook",
+        ):
+            assert _is_safe_webhook_url(blocked) is False, f"Should reject {blocked}"
+
+        # Legitimate global IPv4 and IPv6 literals remain allowed
+        assert _is_safe_webhook_url("https://93.184.216.34/hook") is True
+        assert _is_safe_webhook_url("https://[2606:2800:220:1:248:1893:25c8:1946]/hook") is True
+
+        # DNS returning a 6to4 IPv6 address must also be rejected
+        monkeypatch.setattr(
+            server.socket,
+            "getaddrinfo",
+            lambda host, port, *a, **kw: [
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2002:7f00:0001::", port, 0, 0)),
+            ],
+        )
+        assert _is_safe_webhook_url("https://sixtofour.example.com/hook", at_dispatch=True) is False
+
+    def test_file_claim_normalization_across_claim_assign_report_touch_and_bad_paths(self, client):
+        """Item 5: Canonicalize file: paths across /claim, /assign, /report, /touch and reject drive/percent tricks."""
+        op_key = _register(client, "op", "Op", member_type="human")
+        k1 = _register(client, "ed1", "Ed1")
+        k2 = _register(client, "ed2", "Ed2")
+        oh, h1, h2 = _auth(op_key), _auth(k1), _auth(k2)
+
+        # Claim via /claim with unnormalized file: path
+        r1 = client.post(
+            "/api/atris/channels/ops/claim",
+            headers=h1,
+            json={"task_key": "file:./src//a.py", "content": "editing a.py"},
+        )
+        assert r1.status_code == 201
+
+        # Collides on /claim, /claim-file, and /assign using canonical or alternate forms
+        assert client.post(
+            "/api/atris/channels/ops/claim",
+            headers=h2,
+            json={"task_key": "file:src/a.py", "content": "dup"},
+        ).status_code == 409
+        assert client.post(
+            "/api/atris/channels/ops/claim-file",
+            headers=h2,
+            json={"file_path": "src/sub/../a.py"},
+        ).status_code == 409
+        assert client.post(
+            "/api/atris/channels/ops/assign",
+            headers=oh,
+            json={"task_key": "file:./src/a.py", "assignee_id": "ed2", "content": "edit"},
+        ).status_code == 409
+
+        # Touch and report using unnormalized aliases hit the canonical lock
+        touch_r = client.post(
+            "/api/atris/channels/ops/touch",
+            headers=h1,
+            json={"task_key": "file:./src/sub/../a.py"},
+        )
+        assert touch_r.status_code == 200
+        assert touch_r.json()["task_key"] == "file:src/a.py"
+
+        rep_r = client.post(
+            "/api/atris/channels/ops/report",
+            headers=h1,
+            json={"task_key": "file:src//a.py", "status": "done", "content": "finished"},
+        )
+        assert rep_r.status_code == 201
+        assert client.get("/api/atris/file-claims", headers=h1).json()["count"] == 0
+
+        # Assign normalizes file: path too
+        assign_r = client.post(
+            "/api/atris/channels/ops/assign",
+            headers=oh,
+            json={"task_key": "file:./src//b.py", "assignee_id": "ed2", "content": "edit b"},
+        )
+        assert assign_r.status_code == 201
+        files = client.get("/api/atris/file-claims", headers=oh).json()["files"]
+        assert [f["file_path"] for f in files] == ["src/b.py"]
+
+        # Invalid/traversal/drive-letter/percent-encoded/DEL paths return 400 across task routes and 422 on /claim-file
+        bad_paths = (
+            "../../etc/passwd",
+            "C:\\Windows\\win.ini",
+            "C:foo.py",
+            "C:/secret.py",
+            "%2e%2e%2fetc%2fpasswd",
+            "src%2fa.py",
+            "src%5ca.py",
+            "bad\x7f.py",
+        )
+        for bad in bad_paths:
+            key = f"file:{bad}"
+            assert client.post(
+                "/api/atris/channels/ops/claim",
+                headers=h2,
+                json={"task_key": key, "content": "bad"},
+            ).status_code == 400, f"/claim should reject {key!r}"
+            assert client.post(
+                "/api/atris/channels/ops/assign",
+                headers=oh,
+                json={"task_key": key, "assignee_id": "ed2", "content": "bad"},
+            ).status_code == 400, f"/assign should reject {key!r}"
+            assert client.post(
+                "/api/atris/channels/ops/report",
+                headers=h2,
+                json={"task_key": key, "status": "done", "content": "bad"},
+            ).status_code == 400, f"/report should reject {key!r}"
+            assert client.post(
+                "/api/atris/channels/ops/touch",
+                headers=h2,
+                json={"task_key": key},
+            ).status_code == 400, f"/touch should reject {key!r}"
+            assert client.post(
+                "/api/atris/channels/ops/claim-file",
+                headers=h2,
+                json={"file_path": bad},
+            ).status_code == 422, f"/claim-file should reject {bad!r}"
+
+    def test_tower_ignores_freeform_coordination_spoofing(self, tmp_path):
+        """Item 6: swarlo tower ignores freeform status=NULL posts and claim rows on terminal/blocked/XP views."""
+        from swarlo import __main__ as cli
+
+        db_path = tmp_path / "tower_spoof.db"
+        be = SQLiteBackend(str(db_path))
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            with be._write_lock, be.conn:
+                be.conn.execute(
+                    "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen, last_active) "
+                    "VALUES ('spoofer', 'tower-hub', 'agent', 'Spoofer', ?, ?, ?)",
+                    (now, now, now),
+                )
+                be.conn.execute(
+                    "INSERT INTO members (member_id, hub_id, member_type, member_name, created_at, last_seen, last_active) "
+                    "VALUES ('real-owner', 'tower-hub', 'agent', 'RealOwner', ?, ?, ?)",
+                    (now, now, now),
+                )
+                rows = [
+                    # Genuine unclaimed task
+                    ("m-open", "ops", "real-owner", "RealOwner", "needs owner", "message", "task:open-real", None, now),
+                    # Freeform spoofs (status=NULL) trying to hide task:open-real, inject fake blocked, and farm XP
+                    ("s-res", "ops", "spoofer", "Spoofer", "fake done", "result", "task:open-real", None, now),
+                    ("s-blk1", "ops", "spoofer", "Spoofer", "fake blocked", "blocked", "task:open-real", None, now),
+                    ("s-blk2", "ops", "spoofer", "Spoofer", "fake blocked 2", "blocked", "task:fake-blocked", None, now),
+                    ("s-clm", "ops", "spoofer", "Spoofer", "fake claim", "claim", "task:fake-xp", None, now),
+                    ("s-fail", "ops", "spoofer", "Spoofer", "fake fail", "failed", "task:fake-fail", None, now),
+                    # A claim row whose status became 'blocked' must NOT appear in blocked_rows or double-deduct XP
+                    ("c-blk", "ops", "real-owner", "RealOwner", "claim row blocked", "claim", "task:claim-blocked", "blocked", now),
+                ]
+                for row in rows:
+                    be.conn.execute(
+                        "INSERT INTO posts (post_id, hub_id, channel, member_id, member_name, member_type, "
+                        "content, kind, task_key, status, created_at) "
+                        "VALUES (?, 'tower-hub', ?, ?, ?, 'agent', ?, ?, ?, ?, ?)",
+                        row,
+                    )
+        finally:
+            be.close()
+
+        state = cli._build_tower_state(str(db_path), hub="tower-hub", limit=10)
+        unclaimed_keys = {t["task_key"] for t in state["unclaimed"]}
+        blocked_keys = {b["task_key"] for b in state["blocked"]}
+        leaderboard_by_id = {r["member_id"]: r for r in state["leaderboard"]}
+
+        assert "task:open-real" in unclaimed_keys
+        assert "task:fake-blocked" not in blocked_keys
+        assert "task:open-real" not in blocked_keys
+        assert "task:claim-blocked" not in blocked_keys
+        assert "spoofer" not in leaderboard_by_id
+        # real-owner has only 1 legitimate claim row (kind='claim', status='blocked' -> +2 claim XP, 0 blocked penalty)
+        assert leaderboard_by_id["real-owner"]["xp"] == 2
+        assert leaderboard_by_id["real-owner"]["blocked"] == 0
+
+    def test_get_dag_and_set_dag_are_thread_safe(self, tmp_path, monkeypatch):
+        """Item 7: Concurrent get_dag() / set_dag() calls under LRU eviction raise no race errors."""
+        from swarlo import server
+
+        root_dag = GitDAG(str(tmp_path / "concurrent.git"))
+        root_dag.init()
+        set_dag(root_dag)
+        monkeypatch.setattr(server, "MAX_HUB_DAGS", 16)
+
+        errors: list[BaseException] = []
+
+        def worker(idx: int):
+            try:
+                if idx % 29 == 0:
+                    set_dag(root_dag)
+                dag = get_dag(f"thread-hub-{idx % 40}")
+                assert dag is not None
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            list(pool.map(worker, range(160)))
+
+        assert errors == []
+        assert len(_hub_dags) <= 16
+
+    def test_task_key_max_length_and_whitespace_normalization_before_dedupe_and_ratelimit(self, client):
+        """Item 8: Enforce MAX_TASK_KEY_LENGTH and normalize task_key + depends_on before dedupe/rate-limit."""
+        op_key = _register(client, "op", "Op", member_type="human")
+        _register(client, "w", "W")
+        oh = _auth(op_key)
+
+        too_long = "t" * 257
+        assert client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "hi", "task_key": too_long,
+        }).status_code == 422
+        assert client.post("/api/atris/channels/ops/claim", headers=oh, json={
+            "content": "hi", "task_key": too_long,
+        }).status_code == 422
+        assert client.post("/api/atris/channels/ops/assign", headers=oh, json={
+            "content": "hi", "task_key": too_long, "assignee_id": "w",
+        }).status_code == 422
+        assert client.post("/api/atris/channels/ops/report", headers=oh, json={
+            "content": "hi", "task_key": too_long, "status": "done",
+        }).status_code == 422
+        assert client.post("/api/atris/channels/ops/touch", headers=oh, json={
+            "task_key": too_long,
+        }).status_code == 422
+
+        # Whitespace-padded task_key shares the same per-task rate limit bucket (2/min)
+        r1 = client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "status one", "kind": "status", "task_key": "task:rl",
+        })
+        r2 = client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "status two", "kind": "status", "task_key": "  task:rl  ",
+        })
+        r3 = client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "status three", "kind": "status", "task_key": " task:rl",
+        })
+        assert r1.status_code == 201
+        assert r2.status_code == 201
+        assert r3.status_code == 429
+
+        # Dedupe matches normalized task_key and normalized depends_on
+        d1 = client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "dep post", "task_key": "task:dup", "depends_on": ["task:dep1"],
+        })
+        d2 = client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "dep post", "task_key": "  task:dup  ", "depends_on": ["  task:dep1  "],
+        })
+        assert d1.status_code == 201
+        assert d2.status_code == 200
+        assert d2.json()["post_id"] == d1.json()["post_id"]
+
+        # Whitespace-only task_key normalizes to None before dedupe and storage
+        w1 = client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "blank key", "task_key": "   ",
+        })
+        w2 = client.post("/api/atris/channels/ops/posts", headers=oh, json={
+            "content": "blank key", "task_key": None,
+        })
+        assert w1.status_code == 201
+        assert w1.json()["task_key"] is None
+        assert w2.status_code == 200
+        assert w2.json()["post_id"] == w1.json()["post_id"]

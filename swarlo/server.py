@@ -20,27 +20,31 @@ import secrets
 import socket
 import sqlite3
 import subprocess
+import threading
 import time
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, StringConstraints, field_validator
 
+from . import gc
+from .sqlite_backend import SQLiteBackend
+from .git_dag import GitDAG
+from .types import MAX_TASK_KEY_LENGTH, Member
+
 # A task identifier that must be non-empty. Leading/trailing whitespace is
 # stripped so "task:foo " and "task:foo" name the same lock, and a
 # whitespace-only key is rejected (422) instead of creating a phantom
 # shared claim that every empty-key claimant collides on.
-TaskKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-
-from . import gc
-from .sqlite_backend import SQLiteBackend
-from .git_dag import GitDAG
-from .types import Member
+TaskKey = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_TASK_KEY_LENGTH),
+]
 
 logger = logging.getLogger("swarlo.server")
 
@@ -125,6 +129,7 @@ def get_backend() -> SQLiteBackend:
 
 
 _hub_dags: OrderedDict[str, GitDAG] = OrderedDict()
+_hub_dags_lock = threading.Lock()
 
 
 def get_dag(hub_id: str | None = None) -> GitDAG:
@@ -136,23 +141,24 @@ def get_dag(hub_id: str | None = None) -> GitDAG:
     hash of the hub id, so a hub id never becomes a path.
     """
     global _git_dag
-    if _git_dag is None:
-        _git_dag = GitDAG("swarlo.git")
-        _git_dag.init()
-    if hub_id is None:
-        return _git_dag
-    key = f"{_git_dag.path}\0{hub_id}"
-    dag = _hub_dags.get(key)
-    if dag is not None:
-        _hub_dags.move_to_end(key)
+    with _hub_dags_lock:
+        if _git_dag is None:
+            _git_dag = GitDAG("swarlo.git")
+            _git_dag.init()
+        if hub_id is None:
+            return _git_dag
+        key = f"{_git_dag.path}\0{hub_id}"
+        dag = _hub_dags.get(key)
+        if dag is not None:
+            _hub_dags.move_to_end(key)
+            return dag
+        name = hashlib.sha256(hub_id.encode("utf-8")).hexdigest()[:32]
+        dag = GitDAG(str(_git_dag.path / "hubs" / f"{name}.git"))
+        dag.init()
+        _hub_dags[key] = dag
+        while len(_hub_dags) > MAX_HUB_DAGS:
+            _hub_dags.popitem(last=False)
         return dag
-    name = hashlib.sha256(hub_id.encode("utf-8")).hexdigest()[:32]
-    dag = GitDAG(str(_git_dag.path / "hubs" / f"{name}.git"))
-    dag.init()
-    _hub_dags[key] = dag
-    while len(_hub_dags) > MAX_HUB_DAGS:
-        _hub_dags.popitem(last=False)
-    return dag
 
 
 def set_backend(backend: SQLiteBackend):
@@ -169,8 +175,9 @@ def set_backend(backend: SQLiteBackend):
 def set_dag(dag: GitDAG):
     """Set the global GitDAG instance for commit tracking."""
     global _git_dag
-    _git_dag = dag
-    _hub_dags.clear()
+    with _hub_dags_lock:
+        _git_dag = dag
+        _hub_dags.clear()
 
 
 # Daily self-prune of the live hub (~/.swarlo). Only runs when this server
@@ -212,12 +219,12 @@ def _get_member(request: Request, hub_id: str) -> Member:
         raise HTTPException(403, "Member does not belong to this hub")
     # Bump last_seen on every authenticated call
     try:
-        with be._write_lock:
-            be.conn.execute(
+        conn = be.conn
+        with be._write_lock, conn:
+            conn.execute(
                 "UPDATE members SET last_seen = ? WHERE member_id = ? AND hub_id = ?",
                 (datetime.now(timezone.utc).isoformat(), member.member_id, member.hub_id),
             )
-            be.conn.commit()
     except Exception:
         pass  # best-effort, don't break auth
     return member
@@ -381,7 +388,7 @@ class PostRequest(_ClaimedIdentity):
 
     content: str
     kind: str = "message"
-    task_key: Optional[str] = None
+    task_key: Optional[str] = Field(default=None, max_length=MAX_TASK_KEY_LENGTH)
     priority: int = 0
     depends_on: Optional[list[str]] = None
     metadata: Optional[dict] = None
@@ -534,13 +541,14 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
         validate_post_content(body.content)
         validate_post_kind(body.kind)
         validate_metadata(body.metadata)
-        validate_depends_on(body.depends_on)
+        depends_on = validate_depends_on(body.depends_on)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
+    task_key = body.task_key.strip() or None if body.task_key is not None else None
     be = get_backend()
     existing = be.find_duplicate_post(
-        hub_id, member.member_id, channel, body.content, body.kind, body.task_key,
-        priority=body.priority, metadata=body.metadata, depends_on=body.depends_on,
+        hub_id, member.member_id, channel, body.content, body.kind, task_key,
+        priority=body.priority, metadata=body.metadata, depends_on=depends_on,
         within_seconds=POST_DEDUPE_WINDOW_SECONDS,
     )
     if existing is not None:
@@ -549,7 +557,7 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
             existing.warning = warning
         response.status_code = 200
         return existing.to_dict()
-    _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, body.kind)
+    _enforce_post_rate_limit(hub_id, member.member_id, task_key, body.kind)
     try:
         post = await be.create_post(
             hub_id,
@@ -557,10 +565,10 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
             channel,
             body.content,
             body.kind,
-            body.task_key,
+            task_key,
             metadata=body.metadata,
             priority=body.priority,
-            depends_on=body.depends_on,
+            depends_on=depends_on,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
@@ -571,6 +579,47 @@ async def create_post(hub_id: str, channel: str, body: PostRequest, request: Req
 
 # ── Claim ───────────────────────────────────────────────────
 
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+_ENCODED_PATH_SYNTAX_RE = re.compile(r"%(?:2[eEfF]|5[cC]|00)")
+
+
+def _normalize_file_path(value: str) -> str:
+    """Validate and canonicalize a relative repository file path for file locks."""
+    raw = value.strip()
+    if not raw or len(raw) > 512 or any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        raise ValueError("file_path must be a non-empty relative path without control characters")
+    if _DRIVE_PREFIX_RE.match(raw):
+        raise ValueError("file_path must be relative, not a drive-qualified path")
+    if _ENCODED_PATH_SYNTAX_RE.search(raw):
+        raise ValueError("file_path must not contain percent-encoded path separators, dots, or null bytes")
+    decoded = unquote(raw)
+    if unquote(decoded) != decoded:
+        raise ValueError("file_path must not contain nested percent-encoding")
+    if any(ord(c) < 32 or ord(c) == 127 for c in decoded):
+        raise ValueError("file_path must not contain control characters")
+    if _DRIVE_PREFIX_RE.match(decoded):
+        raise ValueError("file_path must be relative, not a drive-qualified path")
+    normalized = decoded.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise ValueError("file_path must be relative, not absolute")
+    norm = posixpath.normpath(normalized)
+    if norm in (".", "..", "/") or norm.startswith("../") or norm.startswith("/"):
+        raise ValueError("file_path must not escape the repository root or be '.'")
+    if _DRIVE_PREFIX_RE.match(norm):
+        raise ValueError("file_path must be relative, not a drive-qualified path")
+    if len(norm) > 512:
+        raise ValueError("file_path must be at most 512 characters")
+    return norm
+
+
+def _normalize_task_key(task_key: str) -> str:
+    """Canonicalize file:<path> task keys so lock aliases always collide."""
+    key = task_key.strip()
+    if key.startswith("file:"):
+        return f"file:{_normalize_file_path(key[5:])}"
+    return key
+
+
 @app.post("/api/{hub_id}/channels/{channel}/claim", status_code=201)
 async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Request):
     """Claim a task to prevent duplicate work. Returns 409 if already claimed."""
@@ -579,15 +628,16 @@ async def claim_task(hub_id: str, channel: str, body: ClaimRequest, request: Req
     _enforce_test_bot_channel(member, channel)
     from .types import validate_depends_on, validate_post_content
     try:
+        task_key = _normalize_task_key(body.task_key)
         validate_post_content(body.content)
-        validate_depends_on(body.depends_on)
+        depends_on = validate_depends_on(body.depends_on)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
-    _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, "claim")
+    _enforce_post_rate_limit(hub_id, member.member_id, task_key, "claim")
     try:
         result = await get_backend().claim(
-            hub_id, member, channel, body.task_key, body.content,
-            depends_on=body.depends_on,
+            hub_id, member, channel, task_key, body.content,
+            depends_on=depends_on,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
@@ -606,17 +656,8 @@ class FileClaimRequest(_ClaimedIdentity):
 
     @field_validator("file_path")
     @classmethod
-    def _normalize_file_path(cls, value: str) -> str:
-        raw = value.strip()
-        if not raw or len(raw) > 512 or any(ord(c) < 32 for c in raw):
-            raise ValueError("file_path must be a non-empty relative path without control characters")
-        raw = raw.replace("\\", "/")
-        if raw.startswith("/"):
-            raise ValueError("file_path must be relative, not absolute")
-        norm = posixpath.normpath(raw)
-        if norm in (".", "..", "/") or norm.startswith("../") or norm.startswith("/"):
-            raise ValueError("file_path must not escape the repository root or be '.'")
-        return norm
+    def _validate_file_path(cls, value: str) -> str:
+        return _normalize_file_path(value)
 
 
 @app.post("/api/{hub_id}/channels/{channel}/claim-file", status_code=201)
@@ -675,15 +716,16 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
     _enforce_test_bot_channel(assigner, channel)
     from .types import validate_depends_on, validate_post_content
     try:
+        task_key = _normalize_task_key(body.task_key)
         validate_post_content(body.content)
-        validate_depends_on(body.depends_on)
+        depends_on = validate_depends_on(body.depends_on)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
-    _enforce_post_rate_limit(hub_id, assigner.member_id, body.task_key, "assign")
+    _enforce_post_rate_limit(hub_id, assigner.member_id, task_key, "assign")
     be = get_backend()
     try:
-        result = await be.assign(hub_id, assigner, channel, body.task_key, body.assignee_id, body.content,
-                                 depends_on=body.depends_on, priority=body.priority)
+        result = await be.assign(hub_id, assigner, channel, task_key, body.assignee_id, body.content,
+                                 depends_on=depends_on, priority=body.priority)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
     if not result.claimed:
@@ -698,7 +740,7 @@ async def assign_task(hub_id: str, channel: str, body: AssignRequest, request: R
         notify_post = Post(
             post_id=result.post_id or "", content=body.content, kind="assign",
             channel=channel, member_id=assigner.member_id, member_name=assigner.member_name,
-            member_type=assigner.member_type, task_key=body.task_key, status="open",
+            member_type=assigner.member_type, task_key=task_key, status="open",
             metadata={"assigned_by": assigner.member_id, "assignee_id": body.assignee_id},
             mentions=[body.assignee_id],
         )
@@ -723,15 +765,16 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
     _enforce_test_bot_channel(member, channel)
     from .types import validate_metadata, validate_post_content
     try:
+        task_key = _normalize_task_key(body.task_key)
         validate_post_content(body.content)
         validate_metadata(body.metadata)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
     report_kind = "result" if body.status == "done" else "failed" if body.status == "failed" else body.status
-    _enforce_post_rate_limit(hub_id, member.member_id, body.task_key, report_kind)
+    _enforce_post_rate_limit(hub_id, member.member_id, task_key, report_kind)
     try:
         post = await get_backend().report(
-            hub_id, member, channel, body.task_key, body.status, body.content,
+            hub_id, member, channel, task_key, body.status, body.content,
             affected_files=body.affected_files,
             metadata=body.metadata,
         )
@@ -769,14 +812,17 @@ async def report_result(hub_id: str, channel: str, body: ReportRequest, request:
 class TouchRequest(BaseModel):
     """Request to send a keepalive for an active claim."""
 
-    task_key: str
+    task_key: TaskKey
 
 
 @app.post("/api/{hub_id}/channels/{channel}/touch")
 async def touch_claim(hub_id: str, channel: str, body: TouchRequest, request: Request):
     """Touch a claim to refresh its timestamp and prevent expiration."""
     member = _get_member(request, hub_id)
-    task_key = body.task_key
+    try:
+        task_key = _normalize_task_key(body.task_key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     ok = await get_backend().touch_claim(hub_id, member.member_id, task_key)
     if not ok:
         raise HTTPException(404, f"No open claim for {task_key}")
@@ -1340,7 +1386,9 @@ async def create_reply(hub_id: str, post_id: str, body: ReplyRequest, request: R
 
 _LOCALHOST = frozenset({"localhost", "127.0.0.1", "::1"})
 _LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-_server_bind_host: str = "127.0.0.1"
+# Fail closed by default so direct ASGI deployment (`uvicorn swarlo.server:app`)
+# does not expose localhost webhooks unless `set_bind_host()` or env opts in.
+_server_bind_host: str = ""
 
 
 def set_bind_host(host: str) -> None:
@@ -1361,8 +1409,13 @@ def _is_global_ip(raw_ip: str) -> bool:
         ip = ipaddress.ip_address(raw_ip)
     except ValueError:
         return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        # Reject deprecated 6to4 (2002::/16) and Teredo (2001::/32) transition
+        # addresses which can embed private/loopback/metadata IPv4 destinations.
+        if ip.sixtofour is not None or ip.teredo is not None:
+            return False
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
     return bool(
         ip.is_global
         and not ip.is_private
@@ -1375,11 +1428,11 @@ def _is_global_ip(raw_ip: str) -> bool:
 
 
 def _classify_webhook_url(url: str) -> tuple[str, str | None, int | None]:
-    """Validate URL syntax, port, scheme, and literal IPs.
+    """Validate URL syntax, port, scheme, userinfo, and literal IPs.
 
     Returns ("allow", None, None), ("deny", None, None), or ("resolve", hostname, port).
     """
-    if not isinstance(url, str) or not url or any(ord(c) < 32 for c in url):
+    if not isinstance(url, str) or not url or any(ord(c) < 32 or ord(c) == 127 for c in url):
         return ("deny", None, None)
     try:
         parsed = urlparse(url)
@@ -1389,6 +1442,8 @@ def _classify_webhook_url(url: str) -> tuple[str, str | None, int | None]:
     if not parsed.scheme or not parsed.hostname:
         return ("deny", None, None)
     if parsed.scheme not in ("http", "https"):
+        return ("deny", None, None)
+    if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
         return ("deny", None, None)
 
     try:
@@ -1430,9 +1485,9 @@ def _is_safe_webhook_url(url: str, at_dispatch: bool = False) -> bool:
     """Validate webhook URL against SSRF.
 
     Rules:
-    - Invalid ports/schemes are always rejected (at registration and dispatch).
+    - Invalid ports/schemes/userinfo are always rejected (at registration and dispatch).
     - Localhost is allowed only when SWARLO_ALLOW_LOCALHOST_WEBHOOKS is enabled
-      (defaults to enabled only for loopback/testclient binds, disabled otherwise).
+      or the server bind host was explicitly set to loopback via set_bind_host().
     - External: must be HTTPS and resolve exclusively to globally-routable IPs.
     - at_dispatch=True: DNS must resolve (blocks rebinding attacks).
     """
@@ -1466,24 +1521,101 @@ async def _is_safe_webhook_url_async(url: str, at_dispatch: bool = False) -> boo
         return False
 
 
+def _build_pinned_webhook_request(
+    url: str, hostname: str, pinned_ip: str
+) -> tuple[str, dict[str, str], dict[str, str]]:
+    parsed = urlparse(url)
+    default_port = 443 if parsed.scheme == "https" else 80
+    host_header = (
+        f"{hostname}:{parsed.port}"
+        if parsed.port is not None and parsed.port != default_port
+        else hostname
+    )
+    dial_url = str(httpx.URL(url).copy_with(host=pinned_ip))
+    headers = {"Host": host_header}
+    extensions = {"sni_hostname": hostname} if parsed.scheme == "https" else {}
+    return dial_url, headers, extensions
+
+
+async def _resolve_webhook_target_async(
+    url: str,
+) -> tuple[str, dict[str, str], dict[str, str]] | None:
+    """Resolve DNS once, validate all returned IPs, and return a pinned target.
+
+    Pinning the validated IP (with original Host header and TLS SNI hostname)
+    prevents DNS rebinding TOCTOU between validation and connection dial.
+    """
+    action, hostname, port = _classify_webhook_url(url)
+    if action == "deny":
+        return None
+    if action == "allow":
+        parsed = urlparse(url)
+        raw_host = (parsed.hostname or "").rstrip(".").lower()
+        if raw_host == "localhost":
+            try:
+                resolved = await asyncio.to_thread(
+                    socket.getaddrinfo,
+                    raw_host,
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                )
+            except (socket.gaierror, ValueError, OSError):
+                return None
+            if not resolved:
+                return None
+            loopback_ips: list[str] = []
+            for _, _, _, _, addr in resolved:
+                if not addr:
+                    return None
+                try:
+                    ip = ipaddress.ip_address(addr[0])
+                except ValueError:
+                    return None
+                if not ip.is_loopback:
+                    return None
+                loopback_ips.append(addr[0])
+            pinned_ip = "127.0.0.1" if "127.0.0.1" in loopback_ips else loopback_ips[0]
+            return _build_pinned_webhook_request(url, raw_host, pinned_ip)
+        return (url, {}, {})
+    try:
+        resolved = await asyncio.to_thread(socket.getaddrinfo, hostname, port)
+    except (socket.gaierror, ValueError, OSError):
+        return None
+    if not _resolved_addrs_are_global(resolved):
+        return None
+    pinned_ip = resolved[0][4][0]
+    return _build_pinned_webhook_request(url, hostname, pinned_ip)
+
+
 async def _dispatch_webhooks(hub_id: str, post):
     """Fire webhook callbacks for @mentioned members. Best-effort, no retries."""
     backend = get_backend()
     members = backend.get_members_by_ids(hub_id, post.mentions)
-    async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=10,
+        follow_redirects=False,
+        trust_env=False,
+        limits=httpx.Limits(max_keepalive_connections=0),
+    ) as client:
         for m in members:
             if not m.webhook_url:
                 continue
-            if not await _is_safe_webhook_url_async(m.webhook_url, at_dispatch=True):
+            target = await _resolve_webhook_target_async(m.webhook_url)
+            if target is None:
                 logger.warning(f"Blocked unsafe webhook for member {m.member_id}")
                 continue
+            dial_url, headers, extensions = target
             try:
-                await client.post(m.webhook_url, json={
-                    "event": "mention",
-                    "hub_id": hub_id,
-                    "post": post.to_dict(),
-                    "mentioned_member_id": m.member_id,
-                })
+                await client.post(
+                    dial_url,
+                    headers=headers or None,
+                    extensions=extensions or None,
+                    json={
+                        "event": "mention",
+                        "hub_id": hub_id,
+                        "post": post.to_dict(),
+                        "mentioned_member_id": m.member_id,
+                    },
+                )
             except Exception as e:
                 logger.debug(f"Webhook to {m.member_id} failed: {e}")
 
@@ -1774,13 +1906,13 @@ async def compute_score(hub_id: str, request: Request):
     # the SCHEMA block at startup (sqlite_backend.py) — no need to
     # CREATE TABLE IF NOT EXISTS on every request.
     try:
-        with be._write_lock:
-            be.conn.execute(
+        conn = be.conn
+        with be._write_lock, conn:
+            conn.execute(
                 "INSERT INTO scores (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, computed_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (hub_id, agents_active, tasks_claimed, tasks_shipped, avg_time_to_claim, file_conflicts, files_with_multi_editors, coord_score, now),
             )
-            be.conn.commit()
     except Exception:
         pass  # Non-critical
 
